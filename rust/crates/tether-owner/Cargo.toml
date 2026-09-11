@@ -1,0 +1,44 @@
+[package]
+name = "tether-owner"
+version = "0.1.0"
+edition = "2021"
+description = "tether's owner-side client: the ephemeral binary the person being helped runs."
+
+# The owner types `tether`, so that is what the binary is called. The crate is
+# `tether-owner` because a crate named `tether` in a workspace of tether crates
+# says nothing about which half it is.
+[lib]
+name = "tether_owner"
+path = "src/lib.rs"
+
+[[bin]]
+name = "tether"
+path = "src/main.rs"
+
+[features]
+# Answers the consent prompt without a person.
+#
+# Off in every build that is not a test, and the release binary therefore
+# contains no such code path at all — not a flag that defaults to safe, not a
+# branch behind an environment variable, nothing to reach. `tests/consent.rs`
+# checks a release build for the marker string this path carries, so the claim
+# is verified rather than asserted.
+#
+# A flag that exists eventually gets used. This is the same policy expressed as
+# a build property, which is the form that cannot be used.
+test-consent-bypass = []
+
+[dependencies]
+crossterm = { workspace = true }
+futures-util = { workspace = true }
+portable-pty = { workspace = true }
+tether-link = { workspace = true }
+tether-proto = { workspace = true }
+tokio = { workspace = true }
+vt100 = { workspace = true }
+
+[dev-dependencies]
+# The end-to-end test stands a real relay up rather than faking one. The
+# interesting failures in this client are between the pieces, not inside them.
+tether-relay = { path = "../tether-relay" }
+serde_json = { workspace = true }

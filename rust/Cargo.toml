@@ -1,25 +1,36 @@
 [workspace]
 resolver = "2"
-members = ["crates/tether-proto", "crates/tether-relay"]
+members = [
+    "crates/tether-link",
+    "crates/tether-owner",
+    "crates/tether-proto",
+    "crates/tether-relay",
+]
 
 # Pinned in one place so the three binaries cannot disagree about the wire.
 [workspace.dependencies]
+tether-link = { path = "crates/tether-link" }
 tether-proto = { path = "crates/tether-proto" }
 
 anyhow = "1"
 axum = { version = "0.8", features = ["ws"] }
 chacha20poly1305 = "0.10"
+crossterm = "0.29"
 futures-util = { version = "0.3", default-features = false, features = ["std", "sink"] }
 getrandom = "0.2"
 hex = "0.4"
 hkdf = "0.12"
+portable-pty = "0.9"
 rmp-serde = "1"
+rustls-pki-types = "1"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 sha2 = "0.10"
 spake2 = "0.4"
 subtle = "2"
 thiserror = "2"
+vt100 = "0.16"
+webpki-roots = "1"
 tokio = { version = "1", features = [
     "rt-multi-thread",
     "net",
@@ -28,9 +39,20 @@ tokio = { version = "1", features = [
     "sync",
     "signal",
     "io-util",
+    "process",
 ] }
 # Matched to the version axum's `ws` feature already pulls in, so the test
 # client and the server under test share one tungstenite rather than two.
+# `ring` rather than the default aws-lc-rs. aws-lc-sys wants cmake and a C
+# toolchain for each target, and this client has to cross-compile to whatever
+# the owner is sitting at — a Mac included, where that build dependency is the
+# difference between one toolchain and two. Nothing else in the workspace picks
+# a rustls provider, so this line is what decides it for tokio-tungstenite too.
+tokio-rustls = { version = "0.26", default-features = false, features = [
+    "ring",
+    "tls12",
+    "logging",
+] }
 tokio-tungstenite = "0.29"
 
 [profile.release]

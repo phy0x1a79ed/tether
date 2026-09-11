@@ -11,6 +11,15 @@
 //! screen depends on it: a transcript that showed a command's exit status above
 //! its own output would be lying about what happened on the owner's machine.
 //!
+//! # The other ordering rule: consent comes first
+//!
+//! The operator sends its `Hello` and then waits. The owner's `Hello` is sent
+//! **only after the person at that keyboard has said yes**, so receiving it is
+//! how the operator learns consent was given. Until then the only frames the
+//! owner will accept are `Hello`, `Say` and `Cut`; an `Open` arriving early
+//! ends the session rather than being ignored, because a peer that sends one is
+//! not the peer this protocol describes.
+//!
 //! The rule is cheap to honour and easy to break. It holds because the executor
 //! writes a task's frames from one place in one order, and because the socket
 //! underneath is ordered. Anything that moves output onto a second path — a
@@ -111,6 +120,12 @@ pub enum Frame {
         rows: u16,
     },
     /// Keystrokes, or standard input for a command.
+    ///
+    /// **An empty `data` means end of input.** A command that reads until its
+    /// input runs out — `cat`, `sort`, anything fed through a pipe — has no
+    /// other way to be told, and `Close` cannot serve: `Close` means stop, and
+    /// stopping a program that is still working is a different instruction from
+    /// telling it there is no more to read.
     Input {
         task: TaskId,
         data: Vec<u8>,
@@ -130,7 +145,9 @@ pub enum Frame {
         task: TaskId,
         ended: Ended,
     },
-    /// Ask for a task to stop. The peer answers with `Exit`, never silence.
+    /// Stop a task. The peer answers with `Exit`, never silence.
+    ///
+    /// This kills. To say "there is no more input", send an empty `Input`.
     Close {
         task: TaskId,
     },

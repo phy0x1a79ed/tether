@@ -1,0 +1,15 @@
+[package]
+name = "tether-link"
+version = "0.1.0"
+edition = "2021"
+description = "tether's transport: reaching the relay, and the sealed channel that runs over it."
+
+[dependencies]
+futures-util = { workspace = true }
+rustls-pki-types = { workspace = true }
+serde_json = { workspace = true }
+tether-proto = { workspace = true }
+tokio = { workspace = true }
+tokio-rustls = { workspace = true }
+tokio-tungstenite = { workspace = true, features = ["rustls-tls-webpki-roots"] }
+webpki-roots = { workspace = true }
