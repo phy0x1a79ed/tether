@@ -1,0 +1,25 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "awm-tether"
+version = "0.1.0"
+requires-python = ">=3.11"
+description = "AWM tether service: consent-gated remote assistance."
+dependencies = [
+    "awm-gatewayclient",
+]
+
+# PEP 420 namespace package: no top-level awm/__init__.py; the namespace dir is awm/tether/.
+[tool.setuptools.packages.find]
+include = ["awm.tether*"]
+namespaces = true
+
+[tool.pytest.ini_options]
+asyncio_mode = "auto"
+markers = [
+    "smoke: fast unit tests; target <30s",
+    "unit: pure unit tests, no network or subprocesses",
+    "integration: shells out to another toolchain; slower",
+]

@@ -1,0 +1,5 @@
+# install.sh sidecar (absolute interpreter path; host-specific)
+.runtime-env
+
+# cargo build tree and the binaries it produces
+rust/target/
