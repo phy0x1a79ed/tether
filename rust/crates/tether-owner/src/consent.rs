@@ -3,15 +3,16 @@
 //! Three properties matter more than anything else in this crate, and all three
 //! are structural rather than careful:
 //!
-//! **It reads from the controlling terminal, not from standard input.** The
-//! launcher arrives through a pipe, so standard input is the tail of a shell
-//! script. A prompt that read from it would be answered by whatever the pipe
-//! had left, which is to say answered by the operator. Opening `/dev/tty` is
-//! what makes the answer come from the keyboard.
+//! **It reads from the keyboard, not from standard input.** The launcher
+//! arrives through a pipe, so standard input is the tail of a launcher script.
+//! A prompt that read from it would be answered by whatever the pipe had left,
+//! which is to say answered by the operator. Opening the keyboard directly is
+//! what makes the answer come from the person. Two systems spell it two ways
+//! and [`keyboard`] holds both: `/dev/tty` on Unix, `CONIN$` on Windows.
 //!
-//! **No terminal means no.** If `/dev/tty` cannot be opened there is nobody
-//! here to ask, and the answer to a question nobody heard is no. This is why
-//! the failure direction is stated as a rule and not left to a default.
+//! **No keyboard means no.** If it cannot be opened there is nobody here to
+//! ask, and the answer to a question nobody heard is no. This is why the
+//! failure direction is stated as a rule and not left to a default.
 //!
 //! **The bypass is a build feature, not a flag.** A flag that exists eventually
 //! gets used, and an unattended connect path is the one thing this tool refuses
@@ -96,15 +97,14 @@ pub fn ask(ask: &Ask<'_>) -> Answer {
 
     #[cfg(not(feature = "test-consent-bypass"))]
     {
-        use std::fs::File;
         use std::io::{BufRead, BufReader, Write};
 
         let mut err = std::io::stderr();
         let _ = write!(err, "{ask}");
         let _ = err.flush();
 
-        // The controlling terminal, never standard input: see the module docs.
-        let Ok(tty) = File::open("/dev/tty") else {
+        // The keyboard, never standard input: see the module docs.
+        let Ok(tty) = keyboard() else {
             let _ = writeln!(
                 err,
                 "\n  There is no terminal here to ask, so the answer is no."
@@ -122,6 +122,41 @@ pub fn ask(ask: &Ask<'_>) -> Answer {
             Answer::Refused("the owner said no")
         }
     }
+}
+
+/// The keyboard of the person at this machine, opened directly.
+///
+/// Unix opens the controlling terminal. Windows has no such path and names the
+/// same thing `CONIN$`, the console attached to this process — which is a
+/// different handle from standard input and is not redirected when standard
+/// input is. It has to be opened for writing as well as reading, and a
+/// read-only open of it fails, which is the one detail here that is not
+/// obvious from the name.
+///
+/// A machine that is neither refuses, which is the same answer it would give
+/// with nobody at the keyboard.
+#[cfg(unix)]
+#[allow(dead_code)] // unused under `test-consent-bypass`, where nothing asks
+fn keyboard() -> std::io::Result<std::fs::File> {
+    std::fs::File::open("/dev/tty")
+}
+
+#[cfg(windows)]
+#[allow(dead_code)] // unused under `test-consent-bypass`, where nothing asks
+fn keyboard() -> std::io::Result<std::fs::File> {
+    std::fs::OpenOptions::new()
+        .read(true)
+        .write(true)
+        .open("CONIN$")
+}
+
+#[cfg(not(any(unix, windows)))]
+#[allow(dead_code)] // unused under `test-consent-bypass`, where nothing asks
+fn keyboard() -> std::io::Result<std::fs::File> {
+    Err(std::io::Error::new(
+        std::io::ErrorKind::Unsupported,
+        "no keyboard on this system",
+    ))
 }
 
 /// Only an explicit yes is a yes.

@@ -3,3 +3,9 @@
 
 # cargo build tree and the binaries it produces
 rust/target/
+
+# the staged artifacts build-clients.sh writes, and ship-binaries.sh ships.
+# Never version-controlled and never DVC-pinned: a pinned binary is checked out
+# read-only, which costs it the executable bit. Share the compilation, not the
+# artifact.
+dist/

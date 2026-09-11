@@ -3,11 +3,13 @@
 #
 #   ./build-macos.sh [host]        default: sirius
 #
-# This is the one command an owner's Mac needs, and it is separate from
-# ship-binaries.sh for a reason that is not going away: producing a macOS
-# binary needs Apple's SDK, and a Linux box cross-compiling to Darwin needs
-# that same SDK copied onto it. The tool ships rarely enough that building on
-# the machine it is for costs less than keeping a cross toolchain honest.
+# # When to reach for this
+#
+# Not usually. `./build-clients.sh` cross-compiles both Apple targets in a
+# container that carries Apple's SDK, so a Mac client ships from the Linux box
+# with every other client, stamped the same and gated the same. This script is
+# the fallback for a session where that container cannot produce a Darwin
+# binary, and the proof that a Mac alone is still enough.
 #
 # What this box needs first:
 #   - a checkout of this repository
@@ -16,19 +18,17 @@
 # It builds only the owner's client. The relay and the operator daemon are
 # Linux-only and ship from a Linux box.
 #
-# CAUTION: this refuses to ship a binary carrying the consent bypass. That
-# check is the last gate before a build reaches the address people are read
-# out, and it is cheap enough to run every time.
+# CAUTION: this ships one artifact and leaves the rest of the stage alone, so
+# the stage stops being one coherent set. It writes that into BUILD_KIND, and
+# ship-binaries.sh refuses to ship a set marked that way.
 set -euo pipefail
 HOST=${1:-sirius}
 HERE="$(cd "$(dirname "$0")" && pwd)"
+. "$HERE/artifacts.sh"
 MANIFEST="$HERE/rust/Cargo.toml"
 TARGET="$HERE/rust/target/release"
 REMOTE="/var/lib/awm/state/services/tether"
-# The same bytes as `consent::BYPASS_MARKER` in tether-owner. Three files
-# spell this string and they must agree: the source that defines it, the
-# Rust test that checks both directions, and this last gate.
-BYPASS_MARKER="tether-consent-bypass-compiled-into-this-build"
+PUBLIC="https://nexus.tony-xy-liu.com/tether"
 
 step() { echo; echo "== $*"; }
 as_awm() { ssh "$HOST" "sudo -n -u awm bash -s" <<<"$*"; }
@@ -39,14 +39,9 @@ command -v cargo >/dev/null 2>&1 \
     || { echo "no cargo on this Mac; install a toolchain from https://rustup.rs" >&2; exit 1; }
 
 step "the build stamp"
-# The same stamp ship-binaries.sh writes, so the two ends of a session report
+# The same stamp build-clients.sh writes, so the two ends of a session report
 # their builds in one vocabulary and a stale download is a fact on the screen.
-DESC="$(git -C "$HERE" describe --tags --always --dirty)"
-SHA="$(git -C "$HERE" rev-parse --short=9 HEAD)"
-BUILD="$DESC ($SHA)"
-if [ -n "$(git -C "$HERE" status --porcelain -- "$HERE")" ]; then
-    echo "   WARNING: the tether tree is dirty; the stamp says so and nothing else will" >&2
-fi
+BUILD="$(tether_stamp)"
 echo "   $BUILD"
 
 step "build"
@@ -61,19 +56,19 @@ case "$(uname -m)" in
     x86_64) CLIENT=tether-macos-x86_64 ;;
     *) echo "this Mac is $(uname -m), which the launcher has no name for" >&2; exit 1 ;;
 esac
-echo "   $(wc -c < "$TARGET/tether") bytes as $CLIENT"
 
-step "the consent gate"
-# Absence of the marker is what "a release build has no way past the prompt"
-# means. The Rust suite makes the same check against a Linux build; this one
-# covers the binary that actually reaches a Mac, which no test on a build box
-# can see.
-if LC_ALL=C grep -qa "$BYPASS_MARKER" "$TARGET/tether"; then
-    echo "REFUSING: this build carries the consent bypass" >&2
-    echo "Run a plain 'cargo build --release', with no --features." >&2
-    exit 1
-fi
-echo "   no bypass in the binary"
+step "stage"
+mkdir -p "$TETHER_DIST"
+cp "$TARGET/tether" "$TETHER_DIST/$CLIENT"
+chmod 755 "$TETHER_DIST/$CLIENT"
+echo "mac-only" > "$TETHER_DIST/BUILD_KIND"
+echo "$BUILD" > "$TETHER_DIST/BUILD_STAMP"
+echo "   $CLIENT"
+
+step "the gate"
+# The same gate every other artifact passes, including the check that a shipped
+# build carries no way past the consent prompt.
+tether_gate "$CLIENT" || exit 1
 
 step "ship"
 as_awm "mkdir -p $REMOTE/assets/bin" \
@@ -81,19 +76,18 @@ as_awm "mkdir -p $REMOTE/assets/bin" \
 # Written beside the live name and moved into place, so a download that lands
 # mid-transfer gets one whole file or the other.
 rsync -a --rsync-path='sudo -n -u awm rsync' \
-    "$TARGET/tether" "$HOST:$REMOTE/assets/bin/$CLIENT.incoming"
+    "$TETHER_DIST/$CLIENT" "$HOST:$REMOTE/assets/bin/$CLIENT.incoming"
 as_awm "mv $REMOTE/assets/bin/$CLIENT.incoming $REMOTE/assets/bin/$CLIENT"
 as_awm "chmod 755 $REMOTE/assets/bin/$CLIENT"
 
 step "verify"
 # Fetched the way an owner would fetch it, over the public address. Asking the
 # box would prove only that a file is on disk.
-SIZE="$(curl -fsS -o /dev/null -w '%{size_download}' \
-    "https://nexus.tony-xy-liu.com/tether/bin/$CLIENT")"
-[ "$SIZE" -gt 1000000 ] || { echo "the client download is $SIZE bytes" >&2; exit 1; }
+SIZE="$(curl -fsS -o /dev/null -w '%{size_download}' "$PUBLIC/bin/$CLIENT")"
+[ "$SIZE" -gt "$TETHER_MIN_BYTES" ] || { echo "the client download is $SIZE bytes" >&2; exit 1; }
 echo "   $SIZE bytes served at /tether/bin/$CLIENT"
 
 echo
 echo "shipped $BUILD as $CLIENT"
 echo "a Mac owner's line is unchanged:"
-echo "  curl -fsSL https://nexus.tony-xy-liu.com/tether | bash -s <code>"
+echo "  curl -fsSL $PUBLIC | bash -s <code>"

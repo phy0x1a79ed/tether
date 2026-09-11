@@ -18,8 +18,9 @@ A consent-gated remote-assistance session between an **operator** and an
 The operator mints an invite code. The owner reads it into one piped command,
 answers a prompt, and watches the session until either side cuts it.
 
-The folder holds a thin Python adapter and, under `rust/`, the three binaries
-that do the work.
+The folder holds a thin Python adapter, under `rust/` the three binaries that
+do the work, and under `build/` the container that builds them for every
+machine an owner might be sitting at.
 
 ## Two roles, one folder
 
@@ -46,26 +47,48 @@ is absent. It then builds the Rust binaries when `cargo` is present, and says
 so plainly when it is not. A host without a toolchain still installs, and
 reports the missing binaries through `awm tether status`.
 
+## Building the clients
+
+    ./build-clients.sh --image       # once per machine, and on a base bump
+    ./build-clients.sh               # every client, every machine
+
+The owner downloads this binary onto a machine nobody chose in advance, so a
+client built against this box's C library is a client that runs only on
+machines no older than this box. Every client is therefore built in one
+container that pins its toolchains: musl for Linux, which links statically,
+osxcross for the two Apple targets, and mingw-w64 for Windows. The relay binary
+is built the same way, because the box it runs on is not the box it is built
+on.
+
+`artifacts.sh` is the one table of what is produced. The names in it are
+the names the launchers ask for, so a target is added in one place.
+
+The build stages into `dist/`, which is gitignored and never DVC-pinned. A
+pinned binary is checked out read-only, which costs it the executable bit.
+
+`./build-clients.sh --host` is the inner loop: this machine's toolchain, this
+machine's target, seconds rather than minutes. It marks the stage `local`, and
+`ship-binaries.sh` refuses to ship a stage marked anything but `cross`.
+
 ## Shipping binaries to a host that cannot build
 
     ./ship-binaries.sh [host]        # default: sirius
 
-One trip carries three artifacts: the relay binary the host runs, the launcher
-the owner pipes into a shell, and the Linux client the owner downloads. Read
-the script's own header for the layout and the checks it runs.
+One trip carries the relay binary the host runs, both launchers, and one client
+per machine an owner might be sitting at. Every artifact passes one gate first:
+magic bytes, a floor on size, the executable bit, and the absence of the
+consent bypass. Read the script's own header for the layout.
 
-The macOS client is not built by that script and cannot be. Producing one
-needs Apple's SDK, and a Linux box cross-compiling to Darwin needs that same
-SDK copied onto it. Build it on the Mac instead:
+**CAUTION** A missing client is visible rather than silent. That owner's
+launcher asks the relay for a name it does not have, and says so.
+
+### The fallback, when the container cannot produce a Mac client
 
     ./build-macos.sh [host]        # default: sirius
 
-That script builds only the owner's client, refuses to ship a build carrying
-the consent bypass, and ships into the same assets directory. The Mac needs a
-checkout of this repository and a Rust toolchain, and nothing else.
-
-**CAUTION** A missing macOS client is visible rather than silent. A Mac owner's
-launcher asks the relay for a name it does not have, and says so.
+Run on the Mac itself. It builds only the owner's client, passes the same gate,
+and ships into the same assets directory. The Mac needs a checkout of this
+repository and a Rust toolchain, and nothing else.
 
 ## Environment
 
@@ -82,10 +105,13 @@ the public host.
 | `AWM_TETHER_BIN` | adapter | where the built binaries live, when not the cargo target tree |
 | `AWM_TETHER_ISSUE_TOKEN` | both roles | the bearer that makes a session operator-only |
 | `AWM_TETHER_PORT` | relay | the loopback port it binds (default 12520) |
-| `AWM_TETHER_ASSETS` | relay | the directory holding the launcher and the client downloads |
+| `AWM_TETHER_ASSETS` | relay | the directory holding both launchers and the client downloads |
 | `AWM_TETHER_MAX_SESSIONS` | relay | cap on live sessions |
 | `AWM_TETHER_CLIENT_IP_HEADER` | relay | which header carries the owner's address (default `cf-connecting-ip`) |
 | `AWM_EDGE_TETHER` | httpsfront | set `1` to mount the relay at `/tether` on the public edge |
+| `TETHER_BUILD_CACHE` | build-clients.sh | cargo's shared build directory (default `~/.cache/tether`) |
+| `TETHER_DOCKER_DNS` | build-clients.sh | a resolver for the build container, when the default one stalls |
+| `TETHER_SHELL` | owner's client | the shell a task runs in, when the machine's own is somewhere else |
 
 The relay's port is declared once in `awm.config`, because two processes must
 agree on it and neither owns it.
@@ -125,6 +151,11 @@ merging whatever the daemon says, and `logs` reads the file.
 The owner runs one line and holds no key material:
 
     curl -fsSL https://nexus.tony-xy-liu.com/tether | bash -s 7 anchor kettle
+
+Windows has no shell that can run that script, so it has its own launcher at
+its own address:
+
+    & ([scriptblock]::Create((irm https://nexus.tony-xy-liu.com/tether/win))) 7 anchor kettle
 
 The launcher fetches the client for that machine, runs it, and stops. It sets
 up no PATH entry, no login item, no launch agent, no service, and no cron. The

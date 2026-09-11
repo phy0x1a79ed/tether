@@ -28,6 +28,8 @@
 use std::collections::HashMap;
 
 use portable_pty::{CommandBuilder, MasterPty, PtySize};
+
+use crate::platform::{command_flag, default_shell, home_dir};
 use tether_proto::frame::{Ended, Frame, Kind, Stream, TaskId};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::sync::mpsc;
@@ -65,7 +67,7 @@ impl Runner {
         Self {
             tasks: HashMap::new(),
             out,
-            shell: std::env::var("SHELL").unwrap_or_else(|_| "/bin/sh".into()),
+            shell: default_shell(),
         }
     }
 
@@ -139,7 +141,7 @@ async fn run_command(
     mut control: mpsc::Receiver<Control>,
 ) {
     let mut child = match tokio::process::Command::new(&shell)
-        .arg("-c")
+        .arg(command_flag(&shell))
         .arg(&line)
         .stdin(std::process::Stdio::piped())
         .stdout(std::process::Stdio::piped())
@@ -318,7 +320,7 @@ async fn run_shell(
         "TERM",
         std::env::var("TERM").unwrap_or_else(|_| "xterm-256color".into()),
     );
-    if let Ok(home) = std::env::var("HOME") {
+    if let Some(home) = home_dir() {
         builder.cwd(home);
     }
 
@@ -405,11 +407,17 @@ async fn run_shell(
     });
 
     let status = tokio::task::spawn_blocking(move || child.wait()).await;
+    // The driver is stopped first, which drops the master end of the pty. On
+    // Unix that changes nothing — the shell has exited, the slave was dropped
+    // at spawn, and the reader has already seen end-of-file. On Windows it is
+    // what *delivers* end-of-file: a console pty holds its output pipe open
+    // until the pty itself is closed, so a reader joined before this waits for
+    // a program that is already gone.
+    driver.abort();
     // The screen reader is joined before the exit goes out, for the same reason
     // a command's readers are: the last thing drawn must arrive before the note
     // saying the program is gone.
     let _ = screen.await;
-    driver.abort();
 
     let ended = match status {
         Ok(Ok(status)) => Ended::Code(status.exit_code() as i32),

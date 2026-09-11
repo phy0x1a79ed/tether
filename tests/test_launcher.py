@@ -1,9 +1,9 @@
-"""The name the owner's launcher asks for, and the name the shipper writes.
+"""The name the owner's launcher asks for, and the name the build writes.
 
-These are two shell scripts that run on two different machines — the launcher
-on whatever the owner is sitting at, the shipper on a box with a toolchain —
-so they cannot share the expression that builds a client's file name. They
-agree by being written to agree, and this is what says so.
+Three scripts, on three kinds of machine: two launchers on whatever the owner
+is sitting at, and the build on a box with a toolchain. They cannot share an
+expression, so they agree by naming one table — ``artifacts.sh`` — and this is
+what says they do.
 
 The failure they prevent is quiet and badly timed: the relay answers 404 for a
 name it does not have, and the owner, who is asking for help with something
@@ -26,7 +26,20 @@ from awm.tether import paths
 pytestmark = pytest.mark.integration
 
 LAUNCHER = paths.SERVICE_DIR / "launcher.sh"
+LAUNCHER_PS1 = paths.SERVICE_DIR / "launcher.ps1"
 SHIPPER = paths.SERVICE_DIR / "ship-binaries.sh"
+ARTIFACTS = paths.SERVICE_DIR / "artifacts.sh"
+RELAY_ROUTES = (
+    paths.SERVICE_DIR / "rust" / "crates" / "tether-relay" / "src" / "lib.rs"
+)
+
+
+def client_names() -> list[str]:
+    """Every client name the build stages, read from the one table that holds
+    them."""
+    block = re.search(r'TETHER_CLIENTS="(.*?)"', ARTIFACTS.read_text(), re.S)
+    assert block, "artifacts.sh no longer carries a client table"
+    return [line.split(":")[0] for line in block.group(1).split() if line.strip()]
 
 
 class _Recorder(http.server.BaseHTTPRequestHandler):
@@ -55,7 +68,7 @@ def relay():
         server.server_close()
 
 
-def test_the_launcher_asks_for_the_name_the_shipper_writes(relay):
+def test_the_launcher_asks_for_a_name_the_build_stages(relay):
     base, recorder = relay
     # The launcher, run exactly as `curl … | bash -s` runs it. It gets a 404,
     # which is the point: what is under test is the name in the request.
@@ -68,25 +81,37 @@ def test_the_launcher_asks_for_the_name_the_shipper_writes(relay):
     assert "could not download" in done.stderr, done.stderr
     assert recorder.asked, "the launcher asked for nothing"
 
-    # And the shipper's own expression for the same name, evaluated the same
-    # way it is on a build box.
-    shipped = subprocess.run(
-        ["bash", "-c", 'echo "tether-linux-$(uname -m)"'],
-        capture_output=True, text=True, timeout=30,
-    ).stdout.strip()
-
-    assert recorder.asked[0] == f"/bin/{shipped}"
+    asked = recorder.asked[0]
+    assert asked.startswith("/bin/")
+    assert asked[len("/bin/"):] in client_names(), f"nothing staged is called {asked}"
     # Written out so the assertion above cannot pass by both sides being wrong
     # in the same way.
-    assert shipped == f"tether-linux-{platform.machine()}"
+    assert asked == f"/bin/tether-linux-{platform.machine()}"
 
 
-def test_the_shipper_ships_the_launcher_to_the_mount_root():
-    """The address a person is read out is the mount itself, so the launcher
-    has to land at the asset the relay serves there, named `tether`."""
-    text = SHIPPER.read_text()
-    assert "launcher.sh" in text
-    assert re.search(r"assets/tether\b", text), "the launcher does not land at the mount root"
+def test_every_staged_client_has_a_launcher_that_can_ask_for_it():
+    """A name nothing asks for is a name nobody can download."""
+    asking = LAUNCHER.read_text() + LAUNCHER_PS1.read_text()
+    for name in client_names():
+        # Each launcher builds its names from parts, so what is checked is that
+        # each part appears where a name is assembled.
+        system, machine = name.replace(".exe", "").split("-")[1:3]
+        assert system in asking, f"no launcher mentions {system}"
+        assert machine in asking, f"no launcher mentions {machine}"
+
+
+def test_the_shipper_ships_both_launchers_where_the_relay_looks():
+    """The address a person is read out is the mount itself, so each launcher
+    has to land at the asset the relay serves there."""
+    shipped = SHIPPER.read_text()
+    served = RELAY_ROUTES.read_text()
+    assert "launcher.sh" in shipped
+    assert "launcher.ps1" in shipped
+    assert re.search(r"assets/tether\b", shipped), "the shell launcher misses the mount root"
+    assert re.search(r"assets/tether\.ps1\b", shipped), "the PowerShell launcher is not shipped"
+    # And the names the relay reads out of its asset directory.
+    assert '&["tether"]' in served
+    assert '&["tether.ps1"]' in served
 
 
 def test_the_launcher_installs_nothing_and_says_where_it_left_the_one_file():
@@ -99,4 +124,17 @@ def test_the_launcher_installs_nothing_and_says_where_it_left_the_one_file():
     # It runs the client in place of itself, so the terminal reaches the
     # consent prompt directly rather than through a wrapper.
     assert re.search(r'^exec "\$bin" "\$@"$', text, re.M)
+    assert "delete it when you are done" in text
+
+
+def test_the_powershell_launcher_installs_nothing_either():
+    """The same four promises, in the places Windows would break them."""
+    text = LAUNCHER_PS1.read_text()
+    for forbidden in ("schtasks", "New-Service", "Register-ScheduledTask",
+                      "CurrentVersion\\Run", "Startup", "$PROFILE", "setx"):
+        assert forbidden not in text, f"the PowerShell launcher mentions {forbidden}"
+    # It runs the client and hands back whatever the client said, so a refused
+    # session is a non-zero exit on Windows as it is everywhere else.
+    assert re.search(r"^& \$bin @code$", text, re.M)
+    assert re.search(r"^exit \$LASTEXITCODE$", text, re.M)
     assert "delete it when you are done" in text

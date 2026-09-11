@@ -49,8 +49,9 @@ rather than as a version mismatch.
    except to the person reading it out.
 3. The daemon opens `/join/{slot}/{operator token}` and waits. Waiting costs
    the slot nothing.
-4. The owner runs the launcher with the code. The client posts to
-   `/claim/{slot}` and gets the owner's single-use ticket.
+4. The owner runs the launcher with the code — the shell one, or the PowerShell
+   one at `/win`. The client posts to `/claim/{slot}` and gets the owner's
+   single-use ticket.
 5. The client opens `/join/{slot}/{ticket}`. The relay now has both chairs and
    starts moving bytes.
 6. Both ends run the handshake. A wrong phrase fails here, at the peer.
@@ -122,6 +123,12 @@ The grammar therefore lives in two places that must match exactly.
 | --- | --- | --- |
 | the door | `awm/services/httpsfront/awm/httpsfront/tether.py` | which paths the edge forwards |
 | the parser | `tether-proto/src/invite.rs`, `tether-relay/src/token.rs` | which slots and tokens the relay accepts |
+
+A third name joins that family whenever a client is added. The launcher builds
+the name it asks for, `artifacts.sh` names what is built, and the edge's
+asset shape decides whether the name may be asked for at all. The Windows
+launcher has a route of its own, `/win`, because PowerShell interprets what
+comes back and `/bin` serves opaque bytes.
 
 A door looser than the parser forwards malformed input the door exists to
 refuse. A door tighter than the parser turns a legitimate invite into a `404`
@@ -199,10 +206,15 @@ with the feature and checks the marker is present, because absence proves
 nothing about a string that could never appear.
 
 Two properties of the prompt are structural rather than careful. It reads from
-`/dev/tty` rather than standard input, because the launcher arrives through a
+the keyboard rather than standard input, because the launcher arrives through a
 pipe and a prompt reading from that pipe would be answered by the operator. No
-terminal means no, because the answer to a question nobody heard is no.
+keyboard means no, because the answer to a question nobody heard is no.
 `tether-owner/src/consent.rs` owns this subject.
+
+The keyboard has two spellings and one meaning. Unix opens `/dev/tty`, the
+controlling terminal. Windows opens `CONIN$`, the console attached to this
+process, which is a different handle from standard input and is not redirected
+when standard input is. Both are the person, and neither is the pipe.
 
 ## What the relay keeps
 

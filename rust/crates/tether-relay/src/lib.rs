@@ -127,6 +127,11 @@ pub fn router(relay: Arc<Relay>) -> Router {
         // strips its prefix, not something the owner's line should depend on.
         .route("/", get(launcher))
         .route("/tether", get(launcher))
+        // Windows has no shell that can run the launcher above, so it gets its
+        // own script at its own address. A route rather than a name under
+        // `/bin`, because PowerShell is about to interpret what comes back and
+        // `/bin` serves opaque bytes.
+        .route("/win", get(launcher_windows))
         .route("/bin/{name}", get(binary))
         .with_state(relay)
 }
@@ -235,6 +240,15 @@ async fn launcher(State(relay): State<Arc<Relay>>, headers: HeaderMap) -> Respon
         &headers,
         &["tether"],
         "text/x-shellscript; charset=utf-8",
+    )
+}
+
+async fn launcher_windows(State(relay): State<Arc<Relay>>, headers: HeaderMap) -> Response {
+    serve_asset(
+        &relay,
+        &headers,
+        &["tether.ps1"],
+        "text/plain; charset=utf-8",
     )
 }
 

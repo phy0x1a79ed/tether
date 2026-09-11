@@ -98,8 +98,12 @@ fn me() -> Hello {
     Hello {
         version: PROTOCOL_VERSION,
         role: Role::Owner,
+        // Three names for one thing. Unix sets the first two and Windows sets
+        // the third, so the list is the portability rather than a fallback
+        // chain within one system.
         who: std::env::var("USER")
             .or_else(|_| std::env::var("LOGNAME"))
+            .or_else(|_| std::env::var("USERNAME"))
             .unwrap_or_else(|_| "someone".into()),
         host: hostname(),
         os: std::env::consts::OS.to_string(),
@@ -123,7 +127,16 @@ fn build() -> String {
 /// A subprocess rather than a crate: `hostname` is on every system this runs
 /// on, it is asked once, and the alternative is a dependency carried into the
 /// owner's download for one string.
+///
+/// Windows answers it from the environment instead, which is the same name and
+/// costs no process at all. Unix does not set that variable, so the check is
+/// free there.
 fn hostname() -> String {
+    if let Ok(name) = std::env::var("COMPUTERNAME") {
+        if !name.trim().is_empty() {
+            return name.trim().to_string();
+        }
+    }
     std::process::Command::new("hostname")
         .output()
         .ok()
