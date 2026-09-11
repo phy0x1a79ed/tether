@@ -292,6 +292,58 @@ async fn two_ends_that_meet_at_a_slot_exchange_bytes_unchanged() {
 }
 
 #[tokio::test]
+async fn a_socket_that_speaks_before_its_peer_arrives_is_heard_afterwards() {
+    let r = relay(Limits::default()).await;
+    let (slot, token) = issue(r.addr).await;
+    let mut operator = join(r.addr, slot, &token).await.expect("the operator");
+
+    // The operator's client sends its half of the handshake the instant the
+    // socket opens, minutes before anybody redeems the invite. Those bytes have
+    // nowhere to go yet and the relay holds them rather than dropping them.
+    let first: Vec<u8> = vec![0x00, 0xff, 0x1b, 0x0a];
+    operator
+        .send(Message::Binary(first.clone().into()))
+        .await
+        .unwrap();
+
+    let ticket = claim(r.addr, slot).await;
+    let mut owner = join(r.addr, slot, &ticket).await.expect("the owner");
+    let got = next_data(&mut owner, Duration::from_secs(5)).await.unwrap();
+    assert_eq!(got, Message::Binary(first.into()));
+    r.stop();
+}
+
+#[tokio::test]
+async fn a_waiting_socket_answers_a_ping() {
+    let r = relay(Limits::default()).await;
+    let (slot, token) = issue(r.addr).await;
+    let mut operator = join(r.addr, slot, &token).await.expect("the operator");
+
+    // The edge in front of this relay pings its upstream and closes a leg that
+    // does not answer. An unread socket cannot answer, which cut every invite
+    // short at around forty seconds against the five minutes a slot is good
+    // for. Reading the socket while it waits is what makes the pong happen.
+    operator
+        .send(Message::Ping(b"are you there".as_slice().into()))
+        .await
+        .unwrap();
+
+    let pong = tokio::time::timeout(Duration::from_secs(5), async {
+        loop {
+            match operator.next().await {
+                Some(Ok(Message::Pong(bytes))) => return Some(bytes),
+                Some(Ok(_)) => continue,
+                _ => return None,
+            }
+        }
+    })
+    .await
+    .expect("a pong should have arrived well inside the deadline");
+    assert_eq!(pong.as_deref(), Some(&b"are you there"[..]));
+    r.stop();
+}
+
+#[tokio::test]
 async fn when_one_end_goes_the_other_notices() {
     let r = relay(Limits::default()).await;
     let (slot, token) = issue(r.addr).await;

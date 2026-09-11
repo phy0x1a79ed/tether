@@ -43,6 +43,14 @@ use crate::session::{Join, Outbound, Seat, Sessions};
 /// backpressure on the socket, which is where it belongs.
 const QUEUE: usize = 32;
 
+/// How many messages a socket may say before its peer exists.
+///
+/// The operator's client sends its half of the handshake the instant the socket
+/// opens, which is usually minutes before anybody redeems the invite, so those
+/// bytes are held here until there is somewhere to put them. The protocol sends
+/// one. Anything past this allowance is a caller this service does not have.
+const EARLY: usize = 4;
+
 /// Frees a chair however this socket ends — including when the WebSocket
 /// upgrade itself fails and the handler body never runs.
 ///
@@ -114,42 +122,48 @@ pub async fn run(seated: Seated, socket: WebSocket) {
         sessions,
     } = seated;
     let limits = sessions.limits().clone();
-    let (sink, stream) = socket.split();
+    let (sink, mut stream) = socket.split();
 
     // The writer starts before the pairing resolves, because an operator's
     // socket may wait minutes for the owner to run the launcher and nothing
-    // else on the path will keep it open that long. The cost is that a client's
-    // own pings go unanswered until pairing, which no client of ours minds.
+    // else on the path will keep it open that long.
     let mut writer = tokio::spawn(write_leg(sink, rx, limits.keepalive));
 
-    let peer = match outcome {
+    let (peer, early) = match outcome {
         Join::Paired { peer, .. } => {
             log::info(format_args!(
                 "slot {slot} paired, {} joined last",
                 seat.as_str()
             ));
-            Some(peer)
+            (Some(peer), Vec::new())
         }
         Join::Waiting { peer, .. } => {
             log::info(format_args!(
                 "slot {slot} waiting, {} is seated",
                 seat.as_str()
             ));
-            match timeout(limits.unpaired_timeout, peer).await {
-                Ok(Ok(peer)) => Some(peer),
-                _ => {
+            match wait_for_peer(&mut stream, peer, limits.unpaired_timeout).await {
+                Wait::Paired(peer, early) => (Some(peer), early),
+                Wait::Nobody => {
                     log::info(format_args!(
                         "slot {slot} dropped the {} leg: nobody arrived",
                         seat.as_str()
                     ));
-                    None
+                    (None, Vec::new())
+                }
+                Wait::Gone => {
+                    log::info(format_args!(
+                        "slot {slot} lost the {} leg before pairing",
+                        seat.as_str()
+                    ));
+                    (None, Vec::new())
                 }
             }
         }
     };
 
     if let Some(peer) = peer {
-        read_leg(stream, peer, &limits, slot, seat).await;
+        read_leg(stream, peer, &limits, slot, seat, early).await;
     }
 
     // Release the chair before waiting on the writer: the writer cannot finish
@@ -157,6 +171,55 @@ pub async fn run(seated: Seated, socket: WebSocket) {
     drop(guard);
     if timeout(limits.drain_grace, &mut writer).await.is_err() {
         writer.abort();
+    }
+}
+
+/// How a socket's wait for its peer finished.
+enum Wait {
+    Paired(Outbound, Vec<Bytes>),
+    /// The invite's whole unpaired budget passed with the other chair empty.
+    Nobody,
+    /// The socket closed, failed, or said more than a client of ours says.
+    Gone,
+}
+
+/// Hold a seated socket until its peer arrives, reading it while it waits.
+///
+/// Reading during the wait is not an optimisation and the frames are not the
+/// reason for it. A socket nobody reads cannot answer a keepalive ping, and the
+/// edge in front of this relay closes a leg whose pings go unanswered — which
+/// cut every invite short at around forty seconds, against the five minutes the
+/// slot is good for. Reading is what makes the automatic pong happen.
+///
+/// Holding what the socket says is then forced: the operator speaks first, so
+/// dropping those bytes would break the handshake the pairing exists to carry.
+async fn wait_for_peer(
+    stream: &mut SplitStream<WebSocket>,
+    mut peer: tokio::sync::oneshot::Receiver<Outbound>,
+    budget: std::time::Duration,
+) -> Wait {
+    let mut early: Vec<Bytes> = Vec::new();
+    let deadline = tokio::time::sleep(budget);
+    tokio::pin!(deadline);
+
+    loop {
+        tokio::select! {
+            paired = &mut peer => return match paired {
+                Ok(peer) => Wait::Paired(peer, early),
+                Err(_) => Wait::Gone,
+            },
+            _ = &mut deadline => return Wait::Nobody,
+            message = stream.next() => match message {
+                Some(Ok(Message::Binary(bytes))) => {
+                    if early.len() >= EARLY {
+                        return Wait::Gone;
+                    }
+                    early.push(bytes);
+                }
+                Some(Ok(Message::Ping(_))) | Some(Ok(Message::Pong(_))) => {}
+                _ => return Wait::Gone,
+            },
+        }
     }
 }
 
@@ -194,8 +257,17 @@ async fn read_leg(
     limits: &crate::config::Limits,
     slot: Slot,
     seat: Seat,
+    early: Vec<Bytes>,
 ) {
     let mut spoken = false;
+    // Whatever this socket said before its peer existed, in the order it said
+    // it and ahead of anything it says next.
+    for bytes in early {
+        spoken = true;
+        if peer.send(bytes).await.is_err() {
+            return;
+        }
+    }
     loop {
         // Until this socket has passed a real message it is on the short
         // deadline. A keepalive does not satisfy it: a socket that pairs and
