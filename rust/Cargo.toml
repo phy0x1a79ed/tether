@@ -1,22 +1,37 @@
 [workspace]
 resolver = "2"
-members = ["crates/tether-proto"]
+members = ["crates/tether-proto", "crates/tether-relay"]
 
 # Pinned in one place so the three binaries cannot disagree about the wire.
 [workspace.dependencies]
 tether-proto = { path = "crates/tether-proto" }
 
 anyhow = "1"
+axum = { version = "0.8", features = ["ws"] }
 chacha20poly1305 = "0.10"
+futures-util = { version = "0.3", default-features = false, features = ["std", "sink"] }
 getrandom = "0.2"
 hex = "0.4"
 hkdf = "0.12"
 rmp-serde = "1"
 serde = { version = "1", features = ["derive"] }
+serde_json = "1"
 sha2 = "0.10"
 spake2 = "0.4"
 subtle = "2"
 thiserror = "2"
+tokio = { version = "1", features = [
+    "rt-multi-thread",
+    "net",
+    "time",
+    "macros",
+    "sync",
+    "signal",
+    "io-util",
+] }
+# Matched to the version axum's `ws` feature already pulls in, so the test
+# client and the server under test share one tungstenite rather than two.
+tokio-tungstenite = "0.29"
 
 [profile.release]
 # The owner downloads this over their own connection and runs it once, so size
@@ -25,4 +40,8 @@ opt-level = "z"
 lto = true
 codegen-units = 1
 strip = true
-panic = "abort"
+# `panic = "abort"` is deliberately absent, and it is the relay that decides it.
+# A panic in one async task must not reach the other sessions the same process
+# is carrying, and only unwinding keeps it contained. Cargo has no per-package
+# override for this key, so the owner's client pays a few tens of kilobytes for
+# the relay's isolation.

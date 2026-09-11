@@ -111,31 +111,51 @@ pub enum Frame {
         rows: u16,
     },
     /// Keystrokes, or standard input for a command.
-    Input { task: TaskId, data: Vec<u8> },
-    Resize { task: TaskId, cols: u16, rows: u16 },
+    Input {
+        task: TaskId,
+        data: Vec<u8>,
+    },
+    Resize {
+        task: TaskId,
+        cols: u16,
+        rows: u16,
+    },
     Output {
         task: TaskId,
         stream: Stream,
         data: Vec<u8>,
     },
     /// Last frame for this task. See the ordering rule in the module docs.
-    Exit { task: TaskId, ended: Ended },
+    Exit {
+        task: TaskId,
+        ended: Ended,
+    },
     /// Ask for a task to stop. The peer answers with `Exit`, never silence.
-    Close { task: TaskId },
+    Close {
+        task: TaskId,
+    },
 
     /// A line from one person to the other, shown on their screen. This is how
     /// the operator says what they are about to do before doing it.
-    Say { text: String },
+    Say {
+        text: String,
+    },
 
     /// End the session. Either end may send it, at any time, and the other end
     /// exits. It carries a reason because "the session ended" on a screen with
     /// no explanation is the thing that makes people distrust a tool.
-    Cut { reason: String },
+    Cut {
+        reason: String,
+    },
 
     /// Keepalives. The path holds idle sockets open for an hour at nginx and
     /// less at the CDN, so a quiet session dies unless something is flowing.
-    Ping { nonce: u64 },
-    Pong { nonce: u64 },
+    Ping {
+        nonce: u64,
+    },
+    Pong {
+        nonce: u64,
+    },
 }
 
 #[derive(Debug, thiserror::Error)]

@@ -131,7 +131,10 @@ impl Pending {
         let slot = self.slot;
         let ours = self.ours.clone();
         let role = self.role;
-        let key = self.state.finish(theirs).map_err(|_| HandshakeError::Malformed)?;
+        let key = self
+            .state
+            .finish(theirs)
+            .map_err(|_| HandshakeError::Malformed)?;
 
         // Both ends must salt with the same bytes, and symmetric SPAKE2 gives
         // them no agreed order, so the two messages are sorted rather than
@@ -151,7 +154,8 @@ impl Pending {
         let hk = Hkdf::<Sha256>::new(Some(&salt), &key);
         let derive = |info: &[u8]| {
             let mut out = [0u8; 32];
-            hk.expand(info, &mut out).expect("32 bytes is a valid HKDF length");
+            hk.expand(info, &mut out)
+                .expect("32 bytes is a valid HKDF length");
             out
         };
 
@@ -302,7 +306,9 @@ impl Channel {
                 HandshakeError::OutOfStep
             })?;
         self.received += 1;
-        Frame::decode(&plain).inspect_err(|_| self.broken = true).map_err(Into::into)
+        Frame::decode(&plain)
+            .inspect_err(|_| self.broken = true)
+            .map_err(Into::into)
     }
 }
 
@@ -316,7 +322,11 @@ mod tests {
     }
 
     /// Run both ends against each other and return their channels.
-    fn pair(slot: u32, operator: &Phrase, owner: &Phrase) -> Result<(Channel, Channel), HandshakeError> {
+    fn pair(
+        slot: u32,
+        operator: &Phrase,
+        owner: &Phrase,
+    ) -> Result<(Channel, Channel), HandshakeError> {
         let slot = Slot::new(slot).unwrap();
         let (op, op_msg) = start(Role::Operator, slot, operator);
         let (ow, ow_msg) = start(Role::Owner, slot, owner);
@@ -345,8 +355,12 @@ mod tests {
 
     #[test]
     fn a_wrong_phrase_is_refused_at_confirmation_not_at_the_relay() {
-        let err = pair(7, &phrase(&["anchor", "kettle"]), &phrase(&["anchor", "orchid"]))
-            .unwrap_err();
+        let err = pair(
+            7,
+            &phrase(&["anchor", "kettle"]),
+            &phrase(&["anchor", "orchid"]),
+        )
+        .unwrap_err();
         assert!(matches!(err, HandshakeError::WrongCode), "{err:?}");
     }
 

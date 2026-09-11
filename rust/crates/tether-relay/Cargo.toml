@@ -1,0 +1,27 @@
+[package]
+name = "tether-relay"
+version = "0.1.0"
+edition = "2021"
+description = "tether's relay: pairs two sockets by slot and pumps bytes it cannot read."
+
+[lib]
+name = "tether_relay"
+path = "src/lib.rs"
+
+[[bin]]
+name = "tether-relay"
+path = "src/main.rs"
+
+[dependencies]
+axum = { workspace = true }
+futures-util = { workspace = true }
+getrandom = { workspace = true }
+hex = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+subtle = { workspace = true }
+tether-proto = { workspace = true }
+tokio = { workspace = true }
+
+[dev-dependencies]
+tokio-tungstenite = { workspace = true }
