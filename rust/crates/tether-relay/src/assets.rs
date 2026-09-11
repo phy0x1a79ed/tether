@@ -69,12 +69,32 @@ pub fn read(root: Option<&Path>, segments: &[&str]) -> Result<Vec<u8>, AssetErro
 mod tests {
     use super::*;
 
+    /// An asset directory of this test's own, with something next to it that
+    /// the traversal test is trying to reach.
+    ///
+    /// One directory per *call*, not one per process. Cargo runs these tests on
+    /// concurrent threads, and a shared scratch made one test's `fs::write`
+    /// truncate a file another was reading — which surfaced as
+    /// `a_named_asset_is_read` failing about once in twenty runs, on an
+    /// assertion about content that had nothing to do with the bug.
+    ///
+    /// The wrapper directory also gives `..` somewhere private to point, so
+    /// `tether-secret` is genuinely a sibling of the asset root rather than a
+    /// file loose in the temporary directory.
     fn scratch() -> PathBuf {
-        let dir = std::env::temp_dir().join(format!("tether-assets-{}", std::process::id()));
-        let _ = fs::create_dir_all(dir.join("bin"));
+        use std::sync::atomic::{AtomicU32, Ordering};
+        static NEXT: AtomicU32 = AtomicU32::new(0);
+
+        let wrapper = std::env::temp_dir().join(format!(
+            "tether-assets-{}-{}",
+            std::process::id(),
+            NEXT.fetch_add(1, Ordering::Relaxed)
+        ));
+        let dir = wrapper.join("root");
+        fs::create_dir_all(dir.join("bin")).unwrap();
         fs::write(dir.join("tether"), b"#!/bin/sh\n").unwrap();
         fs::write(dir.join("bin").join("tether-linux-x86_64"), b"ELF").unwrap();
-        fs::write(dir.parent().unwrap().join("tether-secret"), b"no").unwrap();
+        fs::write(wrapper.join("tether-secret"), b"no").unwrap();
         dir
     }
 
