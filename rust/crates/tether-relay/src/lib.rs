@@ -121,6 +121,11 @@ pub fn router(relay: Arc<Relay>) -> Router {
         .route("/issue", post(issue))
         .route("/claim/{slot}", post(claim))
         .route("/join/{slot}/{token}", get(join))
+        // Twice on purpose. The address the owner is read out is the mount
+        // itself — `https://…/tether` — and whether the edge hands that to
+        // this router as `/` or as `/tether` is a property of how the mount
+        // strips its prefix, not something the owner's line should depend on.
+        .route("/", get(launcher))
         .route("/tether", get(launcher))
         .route("/bin/{name}", get(binary))
         .with_state(relay)

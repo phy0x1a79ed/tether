@@ -130,6 +130,28 @@ impl Relay {
         format!("{}/claim/{}", self.prefix, slot)
     }
 
+    /// The path the operator asks for a slot on. Authenticated, and the only
+    /// action at the relay that allocates anything.
+    pub fn issue_path(&self) -> String {
+        format!("{}/issue", self.prefix)
+    }
+
+    /// The URL the owner pipes into a shell.
+    ///
+    /// The mount root itself, so the whole address is the one thing already
+    /// written on every page about this tool. That is why the relay answers
+    /// the launcher at its root as well as at `/tether`: whether the edge
+    /// hands it `/` or `/tether` depends on how the mount strips its prefix,
+    /// and the owner's line should not.
+    pub fn launcher_url(&self) -> String {
+        let scheme = if self.tls { "https" } else { "http" };
+        if self.prefix.is_empty() {
+            format!("{scheme}://{}/tether", self.authority)
+        } else {
+            format!("{scheme}://{}{}", self.authority, self.prefix)
+        }
+    }
+
     /// The socket URL, with the ticket in the path.
     ///
     /// The path is where a ticket has to ride: the edge forwards only three
@@ -170,6 +192,15 @@ mod tests {
             r.join_url(slot(7), "abc"),
             "wss://nexus.tony-xy-liu.com/tether/join/7/abc"
         );
+    }
+
+    #[test]
+    fn the_launcher_url_is_the_mount_itself() {
+        let r = Relay::parse(DEFAULT_BASE).unwrap();
+        assert_eq!(r.launcher_url(), "https://nexus.tony-xy-liu.com/tether");
+        // With no mount to name, the route's own path is the address.
+        let bare = Relay::parse("http://127.0.0.1:12520").unwrap();
+        assert_eq!(bare.launcher_url(), "http://127.0.0.1:12520/tether");
     }
 
     #[test]

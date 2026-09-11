@@ -1,0 +1,533 @@
+//! The daemon against a real relay, with a stand-in at the owner's end.
+//!
+//! The owner's end here is written out rather than being the shipped client,
+//! and that is deliberate twice over. It keeps the operator's contract under
+//! test on its own terms — what this side puts on the wire and in what order —
+//! and it keeps `tether-owner`'s consent-bypass feature out of this crate's
+//! dependency graph, because a feature enabled for a test is a feature the
+//! workspace build unifies, and the test that proves a shipped binary has no
+//! way past its prompt would then be proving it about a binary that does.
+//!
+//! The relay is real, the handshake is real, and neither end here can see the
+//! other's traffic through it.
+
+use std::sync::Arc;
+use std::time::Duration;
+
+use serde_json::{json, Value};
+use tether_link::{Link, Relay};
+use tether_operator::config::Config;
+use tether_operator::Operator;
+use tether_proto::frame::{Ended, Frame, Hello, Role, Stream, PROTOCOL_VERSION};
+use tether_proto::invite::InviteCode;
+use tether_relay::config::{Config as RelayConfig, Limits};
+use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
+
+const BEARER: &str = "a-test-bearer";
+
+struct Rig {
+    relay: tether_relay::Running,
+    operator: Arc<Operator>,
+    address: Relay,
+}
+
+impl Rig {
+    fn stop(self) {
+        self.relay.stop();
+    }
+}
+
+async fn rig(limits: Limits) -> Rig {
+    let relay = tether_relay::start(RelayConfig {
+        port: 0,
+        issue_token: BEARER.into(),
+        assets: None,
+        max_sessions: 8,
+        client_ip_header: "cf-connecting-ip".into(),
+        build: "test".into(),
+        limits,
+    })
+    .await
+    .expect("the relay should bind");
+
+    let address = Relay::parse(&format!("http://{}", relay.addr)).unwrap();
+    let operator = Operator::new(Config {
+        relay: address.clone(),
+        issue_token: Some(BEARER.into()),
+        socket: socket_path(),
+        who: "awm as tony".into(),
+        host: "altair".into(),
+        build: "test".into(),
+    });
+    Rig {
+        relay,
+        operator,
+        address,
+    }
+}
+
+/// A socket path nothing else in this run will pick.
+fn socket_path() -> std::path::PathBuf {
+    use std::sync::atomic::{AtomicU32, Ordering};
+    static NEXT: AtomicU32 = AtomicU32::new(0);
+    std::env::temp_dir().join(format!(
+        "tether-test-{}-{}.sock",
+        std::process::id(),
+        NEXT.fetch_add(1, Ordering::Relaxed)
+    ))
+}
+
+/// What the owner's end saw, and what it did about it.
+#[derive(Default, Debug)]
+struct Seen {
+    /// Frames that arrived before this end consented. Anything but a greeting
+    /// or a spoken line in here is the operator breaking the one rule it is
+    /// asked to keep.
+    before_consent: Vec<String>,
+    operator: Option<Hello>,
+    opened: Vec<String>,
+    /// Every `Input` for the first task, in order. An empty one is end-of-file.
+    input: Vec<Vec<u8>>,
+    said: Vec<String>,
+    cut: Option<String>,
+}
+
+/// How the stand-in answers a task it is asked to open.
+#[derive(Clone, Copy)]
+enum Owner {
+    /// Report some output and a status, as a real executor would.
+    Report(i32),
+    /// Say nothing at all, so the operator's own deadline is what ends it.
+    Ignore,
+}
+
+/// The owner's end: consent, then answer whatever is asked for.
+async fn own(address: Relay, code: InviteCode, how: Owner) -> Seen {
+    let mut link = Link::dial_owner(&address, &code)
+        .await
+        .expect("the owner's end should reach the relay");
+    let mut seen = Seen::default();
+
+    // Everything before the consent below, recorded rather than acted on.
+    loop {
+        match link.recv().await {
+            Ok(Frame::Hello(operator)) => {
+                seen.operator = Some(operator);
+                break;
+            }
+            Ok(Frame::Say { text }) => {
+                seen.before_consent.push("say".into());
+                seen.said.push(text);
+            }
+            Ok(Frame::Cut { reason }) => {
+                seen.cut = Some(reason);
+                return seen;
+            }
+            Ok(other) => seen.before_consent.push(name(&other)),
+            Err(_) => return seen,
+        }
+    }
+
+    // This is the consent. Nothing has run at this end before it.
+    link.send(&Frame::Hello(Hello {
+        version: PROTOCOL_VERSION,
+        role: Role::Owner,
+        who: "the owner".into(),
+        host: "a mac".into(),
+        os: "macos".into(),
+        build: "test".into(),
+    }))
+    .await
+    .unwrap();
+
+    loop {
+        match link.recv().await {
+            Ok(Frame::Open { task, command, .. }) => {
+                seen.opened.push(command.unwrap_or_default());
+                if let Owner::Report(code) = how {
+                    link.send(&Frame::Output {
+                        task,
+                        stream: Stream::Stdout,
+                        data: b"from the owner's machine\n".to_vec(),
+                    })
+                    .await
+                    .unwrap();
+                    link.send(&Frame::Output {
+                        task,
+                        stream: Stream::Stderr,
+                        data: b"a note\n".to_vec(),
+                    })
+                    .await
+                    .unwrap();
+                    link.send(&Frame::Exit {
+                        task,
+                        ended: Ended::Code(code),
+                    })
+                    .await
+                    .unwrap();
+                }
+            }
+            Ok(Frame::Input { data, .. }) => seen.input.push(data),
+            Ok(Frame::Say { text }) => seen.said.push(text),
+            Ok(Frame::Ping { nonce }) => link.send(&Frame::Pong { nonce }).await.unwrap(),
+            Ok(Frame::Cut { reason }) => {
+                seen.cut = Some(reason);
+                return seen;
+            }
+            Ok(_) => {}
+            Err(_) => return seen,
+        }
+    }
+}
+
+fn name(frame: &Frame) -> String {
+    match frame {
+        Frame::Hello(_) => "hello",
+        Frame::Open { .. } => "open",
+        Frame::Input { .. } => "input",
+        Frame::Resize { .. } => "resize",
+        Frame::Output { .. } => "output",
+        Frame::Exit { .. } => "exit",
+        Frame::Close { .. } => "close",
+        Frame::Say { .. } => "say",
+        Frame::Cut { .. } => "cut",
+        Frame::Ping { .. } => "ping",
+        Frame::Pong { .. } => "pong",
+    }
+    .into()
+}
+
+/// Mint an invite and put an owner on the other end of it.
+async fn invited(rig: &Rig, how: Owner) -> (Value, tokio::task::JoinHandle<Seen>) {
+    let invite = rig
+        .operator
+        .handle("invite", &json!({}))
+        .await
+        .expect("the operator should be able to mint an invite");
+    let code = InviteCode::parse(
+        &invite["code"]
+            .as_str()
+            .unwrap()
+            .split(' ')
+            .collect::<Vec<_>>(),
+    )
+    .expect("the minted code should parse as one");
+    let owner = tokio::spawn(own(rig.address.clone(), code, how));
+    (invite, owner)
+}
+
+/// Wait for a session to reach a phase, so a test never races the dial.
+async fn until(rig: &Rig, slot: u64, phase: &str) {
+    for _ in 0..300 {
+        let status = rig.operator.handle("status", &json!({})).await.unwrap();
+        let found = status["sessions"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|s| s["slot"] == json!(slot));
+        if found.is_some_and(|s| s["phase"] == json!(phase)) {
+            return;
+        }
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+    panic!("session {slot} never reached {phase}");
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn an_invite_is_a_slot_from_the_relay_and_words_the_relay_never_sees() {
+    let rig = rig(Limits::default()).await;
+    let invite = rig.operator.handle("invite", &json!({})).await.unwrap();
+
+    let slot = invite["slot"].as_u64().unwrap();
+    assert!((1..=999).contains(&slot), "{slot} is not a spoken slot");
+    assert_eq!(invite["words"].as_array().unwrap().len(), 2);
+
+    // The line the owner is read out: plain tokens after `bash -s`, nothing to
+    // quote and nothing to punctuate.
+    let line = invite["command"].as_str().unwrap();
+    let tail = line.split(" -s ").nth(1).unwrap();
+    assert_eq!(
+        tail,
+        format!(
+            "{slot} {}",
+            invite["words"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .map(|w| w.as_str().unwrap())
+                .collect::<Vec<_>>()
+                .join(" ")
+        )
+    );
+
+    // The relay allocated the slot and knows nothing else: its own status
+    // counts a session and has no field in which a phrase could sit.
+    assert_eq!(rig.relay.relay.sessions.live(), 1);
+    rig.stop();
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn nothing_is_asked_for_before_the_owner_says_yes() {
+    let rig = rig(Limits::default()).await;
+    let (invite, owner) = invited(&rig, Owner::Report(0)).await;
+    let slot = invite["slot"].as_u64().unwrap();
+    until(&rig, slot, "open").await;
+
+    let ran = rig
+        .operator
+        .handle("run", &json!({"command": "echo hello"}))
+        .await
+        .unwrap();
+    assert_eq!(ran["exit_code"], json!(0));
+
+    rig.operator
+        .handle("cut", &json!({"reason": "done"}))
+        .await
+        .unwrap();
+    let seen = owner.await.unwrap();
+
+    assert!(
+        seen.before_consent.is_empty(),
+        "the operator asked for something before consent: {:?}",
+        seen.before_consent
+    );
+    assert_eq!(seen.operator.unwrap().who, "awm as tony");
+    rig.stop();
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_command_goes_out_with_its_input_already_closed_and_comes_back_whole() {
+    let rig = rig(Limits::default()).await;
+    let (invite, owner) = invited(&rig, Owner::Report(3)).await;
+    until(&rig, invite["slot"].as_u64().unwrap(), "open").await;
+
+    let ran = rig
+        .operator
+        .handle("run", &json!({"command": "cat /etc/hostname"}))
+        .await
+        .unwrap();
+    assert_eq!(ran["ok"], json!(false), "a non-zero exit is not ok");
+    assert_eq!(ran["exit_code"], json!(3));
+    assert_eq!(ran["stdout"], json!("from the owner's machine\n"));
+    assert_eq!(ran["stderr"], json!("a note\n"));
+    assert_eq!(ran["truncated"], json!(false));
+
+    rig.operator.handle("cut", &json!({})).await.unwrap();
+    let seen = owner.await.unwrap();
+
+    assert_eq!(seen.opened, vec!["cat /etc/hostname".to_string()]);
+    // An empty Input is end-of-file. Nothing here will ever type at a command,
+    // so saying so up front is what stops `cat` waiting for a keyboard.
+    assert_eq!(
+        seen.input,
+        vec![Vec::<u8>::new()],
+        "the command was not told its input was over"
+    );
+    rig.stop();
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_second_command_is_refused_rather_than_interleaved() {
+    let rig = rig(Limits::default()).await;
+    let (invite, owner) = invited(&rig, Owner::Ignore).await;
+    until(&rig, invite["slot"].as_u64().unwrap(), "open").await;
+
+    // The stand-in never answers this one, so it is still in flight below.
+    let first = {
+        let operator = Arc::clone(&rig.operator);
+        tokio::spawn(async move { operator.handle("run", &json!({"command": "sleep"})).await })
+    };
+    tokio::time::sleep(Duration::from_millis(200)).await;
+
+    let err = rig
+        .operator
+        .handle("run", &json!({"command": "another"}))
+        .await
+        .expect_err("one task at a time");
+    assert!(err.contains("already running"), "{err}");
+
+    rig.operator.handle("cut", &json!({})).await.unwrap();
+    // The abandoned command reports what it had, rather than never returning.
+    assert!(first.await.unwrap().is_err());
+    let _ = owner.await;
+    rig.stop();
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn cutting_tells_the_owner_why_and_leaves_the_session_explained() {
+    let rig = rig(Limits::default()).await;
+    let (invite, owner) = invited(&rig, Owner::Report(0)).await;
+    let slot = invite["slot"].as_u64().unwrap();
+    until(&rig, slot, "open").await;
+
+    rig.operator
+        .handle("cut", &json!({"reason": "the backup is finished"}))
+        .await
+        .unwrap();
+
+    let seen = owner.await.unwrap();
+    assert_eq!(seen.cut.as_deref(), Some("the backup is finished"));
+
+    // The session stays in the table long enough to say what happened to it.
+    let status = rig.operator.handle("status", &json!({})).await.unwrap();
+    let session = &status["sessions"].as_array().unwrap()[0];
+    assert_eq!(session["phase"], json!("ended"));
+    assert_eq!(session["ended"], json!("the backup is finished"));
+    assert_eq!(session["tasks"], json!(0));
+
+    // And a verb aimed at it is refused with that reason rather than silence.
+    let err = rig
+        .operator
+        .handle("run", &json!({"command": "true", "code": slot.to_string()}))
+        .await
+        .unwrap_err();
+    assert!(err.contains("the backup is finished"), "{err}");
+    rig.stop();
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_spoken_line_reaches_the_owner_while_they_are_still_deciding() {
+    let rig = rig(Limits::default()).await;
+    let invite = rig.operator.handle("invite", &json!({})).await.unwrap();
+    let slot = invite["slot"].as_u64().unwrap();
+    let code = InviteCode::parse(
+        &invite["code"]
+            .as_str()
+            .unwrap()
+            .split(' ')
+            .collect::<Vec<_>>(),
+    )
+    .unwrap();
+
+    // An owner that pairs and then sits on the prompt, as a person would.
+    let address = rig.address.clone();
+    let owner = tokio::spawn(async move {
+        let mut link = Link::dial_owner(&address, &code).await.unwrap();
+        let mut said = Vec::new();
+        loop {
+            match link.recv().await {
+                Ok(Frame::Say { text }) => said.push(text),
+                Ok(Frame::Cut { .. }) | Err(_) => return said,
+                Ok(_) => {}
+            }
+        }
+    });
+    until(&rig, slot, "greeting").await;
+
+    rig.operator
+        .handle(
+            "send",
+            &json!({"text": "it's tony — about to start the backup"}),
+        )
+        .await
+        .unwrap();
+    tokio::time::sleep(Duration::from_millis(200)).await;
+    rig.operator.handle("cut", &json!({})).await.unwrap();
+
+    let said = owner.await.unwrap();
+    assert_eq!(
+        said,
+        vec!["it's tony — about to start the backup".to_string()]
+    );
+    rig.stop();
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn an_invite_nobody_redeems_ends_as_expired_rather_than_lingering() {
+    let rig = rig(Limits {
+        issue_ttl: Duration::from_secs(2),
+        ..Limits::default()
+    })
+    .await;
+    let invite = rig.operator.handle("invite", &json!({})).await.unwrap();
+    assert_eq!(invite["expires_in"], json!(2));
+
+    until(&rig, invite["slot"].as_u64().unwrap(), "ended").await;
+    let status = rig.operator.handle("status", &json!({})).await.unwrap();
+    let ended = status["sessions"].as_array().unwrap()[0]["ended"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    assert!(ended.contains("expired"), "{ended}");
+    rig.stop();
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn the_control_socket_answers_one_line_of_json_per_connection() {
+    let rig = rig(Limits::default()).await;
+    let running = tether_operator::start(Config {
+        relay: rig.address.clone(),
+        issue_token: Some(BEARER.into()),
+        socket: socket_path(),
+        who: "awm as tony".into(),
+        host: "altair".into(),
+        build: "test".into(),
+    })
+    .await
+    .expect("the daemon should bind its socket");
+
+    let answer = ask(running.socket(), json!({"verb": "status", "args": {}})).await;
+    assert_eq!(answer["ok"], json!(true));
+    assert_eq!(answer["role"], json!("operator"));
+    assert_eq!(answer["can_invite"], json!(true));
+
+    // An error is an answer too — the adapter must never have to read a
+    // closed socket as a verdict.
+    let answer = ask(running.socket(), json!({"verb": "reboot", "args": {}})).await;
+    assert_eq!(answer["ok"], json!(false));
+    assert!(answer["error"].as_str().unwrap().contains("invite"));
+
+    // And the socket is this user's alone.
+    let mode = std::fs::metadata(running.socket()).unwrap().permissions();
+    assert_eq!(
+        std::os::unix::fs::PermissionsExt::mode(&mode) & 0o777,
+        0o600
+    );
+
+    let path = running.socket().to_path_buf();
+    running.stop();
+    assert!(!path.exists(), "a stopped daemon left its socket behind");
+    rig.stop();
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_second_daemon_will_not_unlink_a_socket_that_is_being_served() {
+    let rig = rig(Limits::default()).await;
+    let path = socket_path();
+    let config = Config {
+        relay: rig.address.clone(),
+        issue_token: Some(BEARER.into()),
+        socket: path.clone(),
+        who: "awm as tony".into(),
+        host: "altair".into(),
+        build: "test".into(),
+    };
+    let first = tether_operator::start(config.clone()).await.unwrap();
+
+    match tether_operator::start(config.clone()).await {
+        Err(tether_operator::control::BindError::Taken(taken)) => assert_eq!(taken, path),
+        Ok(_) => panic!("two daemons took the same socket"),
+        Err(e) => panic!("{e}"),
+    }
+
+    // A socket left by a daemon that was killed is a corpse, and taking it is
+    // the whole reason the guard asks rather than looks.
+    first.stop();
+    std::fs::write(&path, b"").unwrap();
+    let third = tether_operator::start(config).await.unwrap();
+    third.stop();
+    rig.stop();
+}
+
+async fn ask(socket: &std::path::Path, request: Value) -> Value {
+    let stream = tokio::net::UnixStream::connect(socket).await.unwrap();
+    let (read, mut write) = stream.into_split();
+    let mut line = serde_json::to_vec(&request).unwrap();
+    line.push(b'\n');
+    write.write_all(&line).await.unwrap();
+    write.flush().await.unwrap();
+
+    let mut reply = String::new();
+    BufReader::new(read).read_line(&mut reply).await.unwrap();
+    serde_json::from_str(&reply).expect("the daemon should answer with JSON")
+}

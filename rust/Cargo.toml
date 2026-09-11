@@ -2,6 +2,7 @@
 resolver = "2"
 members = [
     "crates/tether-link",
+    "crates/tether-operator",
     "crates/tether-owner",
     "crates/tether-proto",
     "crates/tether-relay",

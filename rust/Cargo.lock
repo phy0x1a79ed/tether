@@ -1143,6 +1143,18 @@ dependencies = [
 ]
 
 [[package]]
+name = "tether-operator"
+version = "0.1.0"
+dependencies = [
+ "serde",
+ "serde_json",
+ "tether-link",
+ "tether-proto",
+ "tether-relay",
+ "tokio",
+]
+
+[[package]]
 name = "tether-owner"
 version = "0.1.0"
 dependencies = [

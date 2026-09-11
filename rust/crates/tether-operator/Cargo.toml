@@ -1,0 +1,26 @@
+[package]
+name = "tether-operator"
+version = "0.1.0"
+edition = "2021"
+publish = false
+
+# A library beside the binary, so the tests can drive the daemon in-process
+# against a relay they started themselves rather than asserting against a
+# socket somebody had to remember to launch.
+[lib]
+name = "tether_operator"
+path = "src/lib.rs"
+
+[[bin]]
+name = "tether-operator"
+path = "src/main.rs"
+
+[dependencies]
+serde = { workspace = true }
+serde_json = { workspace = true }
+tether-link = { workspace = true }
+tether-proto = { workspace = true }
+tokio = { workspace = true }
+
+[dev-dependencies]
+tether-relay = { path = "../tether-relay" }
