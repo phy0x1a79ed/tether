@@ -54,10 +54,18 @@ One trip carries three artifacts: the relay binary the host runs, the launcher
 the owner pipes into a shell, and the Linux client the owner downloads. Read
 the script's own header for the layout and the checks it runs.
 
-**CAUTION** The macOS client is not built by that script and cannot be. Build
-it on a Mac and ship it into the same assets directory. Its absence is visible
-rather than silent: a Mac owner's launcher asks the relay for a name it does
-not have, and says so.
+The macOS client is not built by that script and cannot be. Producing one
+needs Apple's SDK, and a Linux box cross-compiling to Darwin needs that same
+SDK copied onto it. Build it on the Mac instead:
+
+    ./build-macos.sh [host]        # default: sirius
+
+That script builds only the owner's client, refuses to ship a build carrying
+the consent bypass, and ships into the same assets directory. The Mac needs a
+checkout of this repository and a Rust toolchain, and nothing else.
+
+**CAUTION** A missing macOS client is visible rather than silent. A Mac owner's
+launcher asks the relay for a name it does not have, and says so.
 
 ## Environment
 
