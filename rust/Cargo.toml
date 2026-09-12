@@ -16,7 +16,7 @@ tether-proto = { path = "crates/tether-proto" }
 anyhow = "1"
 axum = { version = "0.8", features = ["ws"] }
 chacha20poly1305 = "0.10"
-crossterm = "0.29"
+crossterm = { version = "0.29", features = ["event-stream"] }
 futures-util = { version = "0.3", default-features = false, features = ["std", "sink"] }
 getrandom = "0.2"
 hex = "0.4"
@@ -55,6 +55,9 @@ tokio-rustls = { version = "0.26", default-features = false, features = [
     "logging",
 ] }
 tokio-tungstenite = "0.29"
+# Already in the lock via vt100. Measuring display width rather than counting
+# characters matters the moment the screen has two columns and a rule between.
+unicode-width = "0.2"
 
 [profile.release]
 # The owner downloads this over their own connection and runs it once, so size

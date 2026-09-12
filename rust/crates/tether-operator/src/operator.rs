@@ -81,14 +81,15 @@ impl Operator {
                 self.put(args, What::Run { command, limit_s }).await
             }
             "shell" => {
-                let cols = size(args, "cols", 120)?;
-                let rows = size(args, "rows", 40)?;
+                // Left unset when the caller does not say, so the session can
+                // use the size the owner advertised instead of a number chosen
+                // here that they may not be able to see all of.
                 self.put(
                     args,
                     What::Shell {
                         command: optional(args, "command"),
-                        cols,
-                        rows,
+                        cols: maybe_size(args, "cols")?,
+                        rows: maybe_size(args, "rows")?,
                     },
                 )
                 .await
@@ -333,6 +334,18 @@ fn optional(args: &Value, key: &str) -> Option<String> {
         .and_then(|v| v.as_str())
         .map(|v| v.trim().to_string())
         .filter(|v| !v.is_empty())
+}
+
+/// The same, when not saying is a meaningful answer.
+fn maybe_size(args: &Value, key: &str) -> Result<Option<u16>, String> {
+    match args.get(key) {
+        None | Some(Value::Null) => Ok(None),
+        Some(v) => v
+            .as_u64()
+            .and_then(|n| u16::try_from(n).ok())
+            .map(Some)
+            .ok_or_else(|| format!("`{key}` must be a whole number")),
+    }
 }
 
 /// A whole number that fits a terminal dimension or a task id.

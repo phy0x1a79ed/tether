@@ -35,6 +35,7 @@ portable-pty = { workspace = true }
 tether-link = { workspace = true }
 tether-proto = { workspace = true }
 tokio = { workspace = true }
+unicode-width = { workspace = true }
 vt100 = { workspace = true }
 
 [dev-dependencies]

@@ -196,6 +196,23 @@ for each one. Three rules are worth stating where both ends can see them.
    early ends the session rather than being ignored.
 3. **An empty `Input` is end of input. `Close` kills.** They were one frame
    once, and `cat` hung, which is how it was found.
+4. **A `Resize` for task 0 is the owner's pane, not a task.** It is the owner
+   saying how big a terminal they can see, and it travels one way only: the
+   operator has no pane, so the owner refuses one carrying it.
+
+Task 0 is a reserved name rather than a new frame, and the difference matters.
+The operator mints task ids from one and always has, so the number named
+nothing. An operator that does not know about it drops the frame like any other
+it has no arm for and behaves exactly as it did before, which is what lets this
+be added without a version bump. A new variant would instead be a decode failure
+at every client already downloaded — and the owner's client is re-fetched every
+session while the operator's daemon is the half that goes stale, so the cost
+would land on exactly the wrong side.
+
+Before this, the operator picked a size and the owner clipped whatever arrived,
+silently. The owner's pane is now the authority: a grid they cannot see all of
+breaks the sentence they consented to, and the operator is the end that can
+afford to be letterboxed.
 
 Frames are encoded with field names rather than positions. The two ends are
 separate downloads and need not be the same build, so a field added mid-struct

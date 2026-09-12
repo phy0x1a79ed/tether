@@ -32,10 +32,21 @@ use std::time::Instant;
 use crossterm::{cursor, event, execute, queue, style, terminal};
 use tether_proto::frame::{Ended, Hello, Kind, Stream, TaskId};
 
+use crate::layout;
 use crate::log::Log;
+use crate::screen;
 
 /// How much scrollback the transcript keeps.
 const SCROLLBACK: usize = 2000;
+
+/// How many spoken lines the conversation pane keeps.
+const CHAT_SCROLLBACK: usize = 200;
+
+/// The longest spoken line that will be drawn.
+///
+/// A frame may carry a megabyte. One line of conversation is not a megabyte,
+/// and a display that tried to render one would stop being a display.
+const MAX_SAID: usize = 4096;
 
 /// What the display is told. Nothing here names the wire.
 #[derive(Debug, Clone)]
@@ -115,6 +126,18 @@ pub struct Ui {
     /// the wire, so "what is in the log is what you saw" is true because there
     /// is one funnel, not because somebody checked.
     log: Option<Log>,
+    /// The line the owner is typing.
+    compose: Compose,
+    /// The conversation, as its own list. Every line here is also in the
+    /// transcript and the record, so a display too narrow to carry this pane
+    /// loses nothing — which is what lets the layout collapse freely.
+    chat: VecDeque<Chat>,
+}
+
+/// One thing somebody said.
+struct Chat {
+    from_operator: bool,
+    text: String,
 }
 
 impl Ui {
@@ -131,6 +154,8 @@ impl Ui {
             cols,
             rows,
             log,
+            compose: Compose::default(),
+            chat: VecDeque::new(),
         };
         if tty {
             terminal::enable_raw_mode()?;
@@ -153,8 +178,16 @@ impl Ui {
                 from_operator,
                 text,
             } => {
+                let text = say_text(&text);
                 let who = if from_operator { "them" } else { "you" };
                 self.line(format!("{who}: {text}"));
+                self.chat.push_back(Chat {
+                    from_operator,
+                    text,
+                });
+                while self.chat.len() > CHAT_SCROLLBACK {
+                    self.chat.pop_front();
+                }
             }
             Event::Started {
                 task,
@@ -212,9 +245,27 @@ impl Ui {
         }
     }
 
-    /// Tell the far end how big a terminal it is drawing into.
-    pub fn screen_size(&self) -> (u16, u16) {
-        (self.cols, self.body_rows())
+    /// How big a terminal the far end should draw into.
+    ///
+    /// The work pane, less the row the transcript keeps. This had no callers
+    /// for the whole life of the tool: the operator hardcoded a size and the
+    /// owner clipped whatever arrived, so a grid wider than their window was
+    /// silently cut and nobody was told.
+    ///
+    /// **The owner's pane is the authority, and that is a reversal.** The
+    /// display used to refuse to resize the emulator when this window changed,
+    /// on the grounds that the grid models the operator's terminal rather than
+    /// the owner's. That reasoning held while nothing was negotiated. Now that
+    /// the size is asked for, the owner's pane is what the operator is told to
+    /// draw into — because a grid the owner cannot see all of breaks the
+    /// sentence they consented to, and the operator is the one who can afford
+    /// to be letterboxed.
+    pub fn viewport(&self) -> (u16, u16) {
+        let plan = layout::split(self.cols, self.rows);
+        (
+            plan.work.cols.max(20),
+            plan.work.rows.saturating_sub(1).max(5),
+        )
     }
 
     /// The owner's own window changed size.
@@ -225,10 +276,6 @@ impl Ui {
     pub fn resized(&mut self, cols: u16, rows: u16) {
         self.cols = cols;
         self.rows = rows;
-    }
-
-    fn body_rows(&self) -> u16 {
-        self.rows.saturating_sub(2).max(1)
     }
 
     fn line(&mut self, text: String) {
@@ -288,73 +335,152 @@ impl Ui {
                 self.resized(cols, rows);
             }
         }
+        let plan = layout::split(self.cols, self.rows);
         let mut out = io::stdout();
-        let body = self.body_rows();
+        // Hidden for the whole repaint, so the caret does not skate across the
+        // screen once a second on its way to the line being typed.
+        queue!(out, cursor::Hide)?;
 
-        queue!(
-            out,
-            cursor::MoveTo(0, 0),
-            terminal::Clear(terminal::ClearType::CurrentLine)
-        )?;
-        queue!(
-            out,
-            style::SetAttribute(style::Attribute::Reverse),
-            style::Print(self.header()),
-            style::SetAttribute(style::Attribute::Reset)
-        )?;
+        let header = self.header();
+        region(&mut out, plan.header, 0, &header, true)?;
 
-        match self.live.as_ref() {
-            Some(live) => {
-                // Only the parsed grid is drawn. Nothing the far end sent is
-                // handed to the owner's terminal to interpret.
-                for (i, row) in live
-                    .parser
-                    .screen()
-                    .rows_formatted(0, self.cols)
-                    .enumerate()
-                {
-                    if i as u16 >= body {
-                        break;
-                    }
-                    queue!(
-                        out,
-                        cursor::MoveTo(0, 1 + i as u16),
-                        terminal::Clear(terminal::ClearType::CurrentLine)
-                    )?;
-                    out.write_all(&row)?;
-                    queue!(out, style::SetAttribute(style::Attribute::Reset))?;
-                }
-            }
-            None => {
-                let start = self.transcript.len().saturating_sub(body as usize);
-                for i in 0..body {
-                    let text = self
-                        .transcript
-                        .get(start + i as usize)
-                        .map(|l| fit(l, self.cols))
-                        .unwrap_or_default();
-                    queue!(
-                        out,
-                        cursor::MoveTo(0, 1 + i),
-                        terminal::Clear(terminal::ClearType::CurrentLine),
-                        style::Print(text)
-                    )?;
-                }
+        self.draw_work(&mut out, plan.work)?;
+
+        if let Some(rule) = plan.rule {
+            for y in plan.work.y..plan.work.y + plan.work.rows {
+                queue!(
+                    out,
+                    cursor::MoveTo(rule, y),
+                    style::SetAttribute(style::Attribute::Dim),
+                    style::Print("|"),
+                    style::SetAttribute(style::Attribute::Reset)
+                )?;
             }
         }
 
-        queue!(
-            out,
-            cursor::MoveTo(0, self.rows.saturating_sub(1)),
-            terminal::Clear(terminal::ClearType::CurrentLine),
-            style::SetAttribute(style::Attribute::Reverse),
-            style::Print(fit(
-                " ctrl-c cuts the session and ends everything running in it ",
-                self.cols
-            )),
-            style::SetAttribute(style::Attribute::Reset)
-        )?;
+        if let Some(pane) = plan.chat {
+            self.draw_chat(&mut out, pane)?;
+        }
+
+        let footer = fit(
+            match plan.shape {
+                layout::Shape::NoChat => " ctrl-c cuts the session and ends everything running in it ",
+                _ => " type to reply · enter sends · esc clears · ctrl-c cuts the session ",
+            },
+            self.cols,
+        );
+        region(&mut out, plan.footer, 0, &footer, true)?;
+
+        // Last, so the caret is left where the owner is typing.
+        if let Some(input) = plan.input {
+            let caret = self.draw_input(&mut out, input)?;
+            queue!(out, cursor::MoveTo(caret, input.y), cursor::Show)?;
+        }
         out.flush()
+    }
+
+    /// The pane the operator's work is in.
+    ///
+    /// When a terminal is live it takes its own height at the top, and the
+    /// transcript fills whatever rows are left. That last row matters: it is
+    /// what stops a command's output going invisible while a terminal is open,
+    /// which is what the display used to do.
+    fn draw_work(&self, out: &mut impl Write, pane: layout::Rect) -> io::Result<()> {
+        let grid_rows = match self.live.as_ref() {
+            Some(live) => {
+                let (rows, _) = live.parser.screen().size();
+                let top = rows.min(pane.rows);
+                screen::draw(
+                    live.parser.screen(),
+                    layout::Rect { rows: top, ..pane },
+                    out,
+                )?;
+                top
+            }
+            None => 0,
+        };
+
+        let rows = pane.rows.saturating_sub(grid_rows);
+        if rows == 0 {
+            return Ok(());
+        }
+        let start = self.transcript.len().saturating_sub(rows as usize);
+        for i in 0..rows {
+            let text = self
+                .transcript
+                .get(start + i as usize)
+                .map(|l| l.as_str())
+                .unwrap_or("");
+            region(
+                out,
+                layout::Rect { y: pane.y + grid_rows + i, rows: 1, ..pane },
+                0,
+                &fit(text, pane.cols),
+                false,
+            )?;
+        }
+        Ok(())
+    }
+
+    fn draw_chat(&self, out: &mut impl Write, pane: layout::Rect) -> io::Result<()> {
+        let lines = self.chat_lines(pane.cols);
+        let start = lines.len().saturating_sub(pane.rows as usize);
+        for i in 0..pane.rows {
+            let text = lines
+                .get(start + i as usize)
+                .map(|l| l.as_str())
+                .unwrap_or("");
+            region(
+                out,
+                layout::Rect { y: pane.y + i, rows: 1, ..pane },
+                0,
+                &fit(text, pane.cols),
+                false,
+            )?;
+        }
+        Ok(())
+    }
+
+    /// The line being typed, and where the caret sits in it.
+    ///
+    /// A window on the composed line rather than the whole of it, always
+    /// containing the caret, so a long reply scrolls sideways rather than
+    /// spilling into the pane above.
+    fn draw_input(&self, out: &mut impl Write, pane: layout::Rect) -> io::Result<u16> {
+        const PROMPT: &str = "> ";
+        let room = pane.cols.saturating_sub(PROMPT.len() as u16 + 1) as usize;
+        let before: String = self.compose.text[..self.compose.caret].to_string();
+        let shown_before = tail_of_width(&before, room);
+        let rest = &self.compose.text[self.compose.caret..];
+        let mut line = String::from(PROMPT);
+        line.push_str(shown_before);
+        line.push_str(&fit(rest, room.saturating_sub(width_of(shown_before)) as u16));
+
+        region(out, pane, 0, &fit(&line, pane.cols), false)?;
+        Ok(pane.x + PROMPT.len() as u16 + width_of(shown_before) as u16)
+    }
+
+    /// The conversation, wrapped to a width, oldest first.
+    fn chat_lines(&self, cols: u16) -> Vec<String> {
+        let width = cols.max(4) as usize;
+        let mut out = Vec::new();
+        for said in &self.chat {
+            let who = if said.from_operator { "them: " } else { "you: " };
+            let mut first = true;
+            let mut rest = said.text.as_str();
+            while !rest.is_empty() || first {
+                let lead = if first { who } else { "  " };
+                let room = width.saturating_sub(width_of(lead)).max(1);
+                let take = tail_split(rest, room);
+                out.push(format!("{lead}{}", &rest[..take]));
+                rest = rest[take..].trim_start_matches(' ');
+                first = false;
+                if take == 0 {
+                    break;
+                }
+            }
+        }
+        out
     }
 
     /// Put the terminal back exactly as it was found.
@@ -394,38 +520,279 @@ impl Drop for Ui {
     }
 }
 
-/// What the owner pressed, reduced to the only thing this client acts on.
-pub enum Key {
-    Cut,
+/// The line the owner is typing.
+///
+/// Never logged and never sent until they press enter. Half a typed line is not
+/// something either person said, and a half-typed password is exactly the kind
+/// of thing that ends up in one.
+#[derive(Default)]
+struct Compose {
+    text: String,
+    /// Where the caret is, as a byte index into `text`.
+    caret: usize,
 }
 
-/// Watch the keyboard on a thread, because crossterm's reader blocks.
-pub fn watch_keys(tx: tokio::sync::mpsc::Sender<Key>) {
-    std::thread::spawn(move || loop {
-        match event::poll(std::time::Duration::from_millis(200)) {
-            Ok(true) => {}
-            Ok(false) => continue,
-            Err(_) => break,
+impl Compose {
+    fn insert(&mut self, c: char) {
+        if self.text.chars().count() >= 2000 {
+            return;
         }
-        let Ok(event::Event::Key(key)) = event::read() else {
-            continue;
+        self.text.insert(self.caret, c);
+        self.caret += c.len_utf8();
+    }
+
+    fn backspace(&mut self) {
+        let Some(prev) = self.text[..self.caret].chars().next_back() else {
+            return;
         };
-        let cut = matches!(key.code, event::KeyCode::Char('c'))
-            && key.modifiers.contains(event::KeyModifiers::CONTROL);
-        if cut && tx.blocking_send(Key::Cut).is_err() {
-            break;
+        self.caret -= prev.len_utf8();
+        self.text.remove(self.caret);
+    }
+
+    fn delete(&mut self) {
+        if self.caret < self.text.len() {
+            self.text.remove(self.caret);
         }
-    });
+    }
+
+    fn left(&mut self) {
+        if let Some(prev) = self.text[..self.caret].chars().next_back() {
+            self.caret -= prev.len_utf8();
+        }
+    }
+
+    fn right(&mut self) {
+        if let Some(next) = self.text[self.caret..].chars().next() {
+            self.caret += next.len_utf8();
+        }
+    }
+
+    /// Delete back to the start of the word before the caret.
+    fn rub_word(&mut self) {
+        let head = &self.text[..self.caret];
+        let trimmed = head.trim_end_matches(' ');
+        let cut = trimmed.rfind(' ').map(|i| i + 1).unwrap_or(0);
+        self.text.replace_range(cut..self.caret, "");
+        self.caret = cut;
+    }
+
+    fn take(&mut self) -> String {
+        self.caret = 0;
+        std::mem::take(&mut self.text)
+    }
+
+    fn clear(&mut self) {
+        self.caret = 0;
+        self.text.clear();
+    }
+}
+
+/// What one keystroke meant to this client.
+pub enum Typed {
+    /// Nothing worth redrawing for.
+    Nothing,
+    /// The composed line changed; the screen should be repainted.
+    Changed,
+    /// End the session, now.
+    Cut,
+    /// Send this to the other person.
+    Send(String),
+}
+
+/// The owner's keyboard, as a stream this side can stop reading.
+///
+/// It used to be a detached thread that polled, recognised the one key that
+/// cuts a session and discarded every other. That thread was never joined and
+/// had no way to be stopped, so it went on consuming keystrokes after the
+/// display had torn down — taking them from the shell the owner was handed
+/// back. Dropping a stream ends it, which is the whole reason for the change.
+pub fn keys() -> event::EventStream {
+    event::EventStream::new()
+}
+
+impl Ui {
+    /// What one terminal event meant.
+    pub fn typed(&mut self, ev: event::Event) -> Typed {
+        let event::Event::Key(key) = ev else {
+            return Typed::Nothing;
+        };
+        // Windows reports a press and a release for every key. Without this,
+        // every character the owner types appears twice — and it appears once
+        // on the machine this was written on, which is how it would have been
+        // missed.
+        if key.kind != event::KeyEventKind::Press {
+            return Typed::Nothing;
+        }
+        let control = key.modifiers.contains(event::KeyModifiers::CONTROL);
+
+        // Unconditional, whatever is half-typed. The tempting alternative is
+        // for the first press to clear the line and the second to cut, which
+        // trades this tool's panic button for a small convenience. The panic
+        // button is a safety property; `esc` clears the line instead.
+        if control && matches!(key.code, event::KeyCode::Char('c')) {
+            return Typed::Cut;
+        }
+
+        match key.code {
+            event::KeyCode::Char('u') if control => {
+                self.compose.clear();
+                Typed::Changed
+            }
+            event::KeyCode::Char('w') if control => {
+                self.compose.rub_word();
+                Typed::Changed
+            }
+            event::KeyCode::Char(c) if !control => {
+                self.compose.insert(c);
+                Typed::Changed
+            }
+            event::KeyCode::Backspace => {
+                self.compose.backspace();
+                Typed::Changed
+            }
+            event::KeyCode::Delete => {
+                self.compose.delete();
+                Typed::Changed
+            }
+            event::KeyCode::Left => {
+                self.compose.left();
+                Typed::Changed
+            }
+            event::KeyCode::Right => {
+                self.compose.right();
+                Typed::Changed
+            }
+            event::KeyCode::Home => {
+                self.compose.caret = 0;
+                Typed::Changed
+            }
+            event::KeyCode::End => {
+                self.compose.caret = self.compose.text.len();
+                Typed::Changed
+            }
+            event::KeyCode::Esc => {
+                self.compose.clear();
+                Typed::Changed
+            }
+            event::KeyCode::Enter => {
+                let line = self.compose.take();
+                if line.trim().is_empty() {
+                    Typed::Changed
+                } else {
+                    Typed::Send(line)
+                }
+            }
+            _ => Typed::Nothing,
+        }
+    }
 }
 
 /// Pad or cut a line to the terminal's width.
-fn fit(text: &str, cols: u16) -> String {
-    let cols = cols as usize;
-    let mut out: String = text.chars().take(cols).collect();
-    let len = out.chars().count();
-    if len < cols {
-        out.push_str(&" ".repeat(cols - len));
+/// Write one line into one region, and put the terminal back afterwards.
+///
+/// The only way anything but the grid reaches the screen. A region pads itself
+/// to its exact width rather than clearing the line, because clearing spans the
+/// whole physical row and would erase whatever is beside it.
+fn region(
+    out: &mut impl Write,
+    rect: layout::Rect,
+    row: u16,
+    text: &str,
+    reversed: bool,
+) -> io::Result<()> {
+    queue!(out, cursor::MoveTo(rect.x, rect.y + row))?;
+    if reversed {
+        queue!(out, style::SetAttribute(style::Attribute::Reverse))?;
     }
+    queue!(
+        out,
+        style::Print(text),
+        style::SetAttribute(style::Attribute::Reset)
+    )
+}
+
+/// How many columns a string occupies on screen.
+fn width_of(text: &str) -> usize {
+    use unicode_width::UnicodeWidthStr;
+    text.width()
+}
+
+/// The longest tail of `text` that fits in `room` columns, on a char boundary.
+fn tail_of_width(text: &str, room: usize) -> &str {
+    use unicode_width::UnicodeWidthChar;
+    let mut used = 0;
+    let mut start = text.len();
+    for (i, c) in text.char_indices().rev() {
+        let w = c.width().unwrap_or(0);
+        if used + w > room {
+            break;
+        }
+        used += w;
+        start = i;
+    }
+    &text[start..]
+}
+
+/// How many bytes of `text` fit in `room` columns, preferring a word boundary.
+fn tail_split(text: &str, room: usize) -> usize {
+    use unicode_width::UnicodeWidthChar;
+    let mut used = 0;
+    let mut end = 0;
+    for (i, c) in text.char_indices() {
+        let w = c.width().unwrap_or(0);
+        if used + w > room {
+            // Back up to the last space, unless that would take everything.
+            if let Some(space) = text[..i].rfind(' ') {
+                if space > 0 {
+                    return space;
+                }
+            }
+            return end;
+        }
+        used += w;
+        end = i + c.len_utf8();
+    }
+    end
+}
+
+/// One spoken line, safe to print and bounded.
+///
+/// Everything else arriving from the far end already goes through `sanitize`
+/// before it reaches the screen, and this did not: a `Say` was printed as it
+/// arrived. So the operator could clear the owner's screen, move their cursor
+/// or redraw it as something else, in a client whose own documentation says
+/// nothing from the far end is ever executed by the owner's terminal.
+///
+/// Applied in both directions, because the owner pasting a control character
+/// must not be able to corrupt their own display either.
+fn say_text(text: &str) -> String {
+    let mut out = sanitize(text.as_bytes());
+    out = out.replace(['\n', '\t'], " ");
+    out.truncate(MAX_SAID);
+    out
+}
+
+fn fit(text: &str, cols: u16) -> String {
+    use unicode_width::UnicodeWidthChar;
+    let cols = cols as usize;
+    let (mut out, mut used) = (String::new(), 0usize);
+    for c in text.chars() {
+        let w = c.width().unwrap_or(0);
+        if used + w > cols {
+            // A double-width character that would straddle the edge becomes a
+            // space, so the region's width stays exact and whatever is drawn
+            // beside it does not move. Counting characters instead of columns
+            // is what made that shift before there was anything beside it.
+            if used < cols {
+                out.push(' ');
+                used += 1;
+            }
+            break;
+        }
+        out.push(c);
+        used += w;
+    }
+    out.push_str(&" ".repeat(cols.saturating_sub(used)));
     out
 }
 
@@ -474,5 +841,149 @@ mod tests {
         assert_eq!(fit("ab", 5), "ab   ");
         assert_eq!(fit("abcdef", 3), "abc");
         assert_eq!(fit("", 0), "");
+    }
+
+    /// Measured in columns rather than characters. Counting characters put the
+    /// rule and the pane beside it in a different place on every row that had
+    /// a wide glyph in it.
+    #[test]
+    fn a_wide_character_costs_two_columns_and_never_straddles_the_edge() {
+        assert_eq!(width_of("ab"), 2);
+        assert_eq!(width_of("日本"), 4);
+
+        assert_eq!(fit("日本", 4), "日本");
+        // Three columns cannot hold two double-width glyphs. The second becomes
+        // a space so the width is still exactly three.
+        assert_eq!(fit("日本", 3), "日 ");
+        assert_eq!(width_of(&fit("日本", 3)), 3);
+        // A combining mark attaches to what came before and costs nothing.
+        assert_eq!(width_of("e\u{301}"), 1);
+    }
+
+    /// The defect this found in shipped code: a spoken line went to the screen
+    /// unsanitised, in a client whose own documentation says nothing from the
+    /// far end is ever obeyed by the owner's terminal.
+    #[test]
+    fn a_spoken_line_is_shown_rather_than_obeyed() {
+        let attack = "\x1b[2Jgone\x1b[1;1H";
+        let shown = say_text(attack);
+        assert!(!shown.contains('\x1b'), "{shown:?}");
+        assert!(shown.contains("gone"));
+        // One line, whatever arrived. A newline in the middle of a message
+        // would push everything below it down by a row.
+        assert!(!say_text("two\nlines").contains('\n'));
+        // And bounded, because a frame may carry a megabyte and a line of
+        // conversation is not a megabyte.
+        assert!(say_text(&"x".repeat(100_000)).len() <= MAX_SAID);
+    }
+
+    fn press(code: event::KeyCode) -> event::Event {
+        event::Event::Key(event::KeyEvent::new(code, event::KeyModifiers::NONE))
+    }
+
+    fn control(c: char) -> event::Event {
+        event::Event::Key(event::KeyEvent::new(
+            event::KeyCode::Char(c),
+            event::KeyModifiers::CONTROL,
+        ))
+    }
+
+    fn typing() -> Ui {
+        Ui {
+            facts: Facts {
+                operator: "awm as tony on altair".into(),
+                relay: "example/tether".into(),
+                code: "7 anchor kettle".into(),
+            },
+            started: Instant::now(),
+            transcript: VecDeque::new(),
+            pending: String::new(),
+            live: None,
+            tty: false,
+            cols: 100,
+            rows: 30,
+            log: None,
+            compose: Compose::default(),
+            chat: VecDeque::new(),
+        }
+    }
+
+    #[test]
+    fn a_line_is_composed_and_sent_on_enter() {
+        let mut ui = typing();
+        for c in "hello".chars() {
+            assert!(matches!(ui.typed(press(event::KeyCode::Char(c))), Typed::Changed));
+        }
+        match ui.typed(press(event::KeyCode::Enter)) {
+            Typed::Send(line) => assert_eq!(line, "hello"),
+            _ => panic!("enter should send"),
+        }
+        // And the line is gone, rather than sent twice.
+        assert!(matches!(ui.typed(press(event::KeyCode::Enter)), Typed::Changed));
+    }
+
+    #[test]
+    fn editing_a_line_works_the_way_a_line_works() {
+        let mut ui = typing();
+        for c in "helo".chars() {
+            ui.typed(press(event::KeyCode::Char(c)));
+        }
+        ui.typed(press(event::KeyCode::Left));
+        ui.typed(press(event::KeyCode::Char('l')));
+        assert_eq!(ui.compose.text, "hello");
+
+        ui.typed(press(event::KeyCode::End));
+        ui.typed(press(event::KeyCode::Backspace));
+        assert_eq!(ui.compose.text, "hell");
+
+        ui.typed(press(event::KeyCode::Esc));
+        assert_eq!(ui.compose.text, "");
+    }
+
+    /// Whatever is half-typed. The tempting alternative is for the first press
+    /// to clear the line, which trades this tool's panic button for a
+    /// convenience — and the panic button is a safety property.
+    #[test]
+    fn ctrl_c_cuts_the_session_even_mid_sentence() {
+        let mut ui = typing();
+        for c in "wait no".chars() {
+            ui.typed(press(event::KeyCode::Char(c)));
+        }
+        assert!(matches!(ui.typed(control('c')), Typed::Cut));
+    }
+
+    /// Windows reports a press and a release for every key, and this runs on
+    /// Linux, so without the filter every character would double in the field
+    /// and nowhere else.
+    #[test]
+    fn a_key_being_released_is_not_a_key_being_typed() {
+        let mut ui = typing();
+        let mut release = event::KeyEvent::new(event::KeyCode::Char('a'), event::KeyModifiers::NONE);
+        release.kind = event::KeyEventKind::Release;
+        ui.typed(event::Event::Key(release));
+        assert_eq!(ui.compose.text, "", "a release typed a character");
+    }
+
+    #[test]
+    fn the_conversation_wraps_into_its_pane_and_says_who_spoke() {
+        let mut ui = typing();
+        ui.apply(Event::Said {
+            from_operator: true,
+            text: "going to look at the disk now".into(),
+        });
+        ui.apply(Event::Said {
+            from_operator: false,
+            text: "go ahead".into(),
+        });
+
+        let lines = ui.chat_lines(20);
+        assert!(lines[0].starts_with("them: "), "{lines:?}");
+        assert!(lines.iter().any(|l| l.starts_with("you: ")), "{lines:?}");
+        for line in &lines {
+            assert!(width_of(line) <= 20, "{line:?} is wider than the pane");
+        }
+        // Nothing is only in this pane: it is in the transcript too, which is
+        // what lets the pane collapse on a narrow window without losing a word.
+        assert!(ui.transcript.iter().any(|l| l.contains("go ahead")));
     }
 }

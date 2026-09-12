@@ -30,7 +30,7 @@ use std::time::{Duration, Instant};
 use serde_json::{json, Value};
 use tether_link::http::HttpError;
 use tether_link::{release, Link, LinkError};
-use tether_proto::frame::{Ended, Frame, Hello, Kind, Stream, TaskId};
+use tether_proto::frame::{Ended, Frame, Hello, Kind, Stream, TaskId, VIEWPORT};
 use tether_proto::invite::{InviteCode, Phrase, Slot};
 use tokio::sync::{mpsc, oneshot};
 
@@ -76,8 +76,11 @@ pub enum What {
     /// to them at all.
     Shell {
         command: Option<String>,
-        cols: u16,
-        rows: u16,
+        /// Unset means "whatever the owner said they can see". Their pane is
+        /// the authority: a terminal bigger than it would be clipped at their
+        /// end, and they are the one who consented to watching.
+        cols: Option<u16>,
+        rows: Option<u16>,
     },
     /// Type at a task. Talks to the program, not to the person — see `Say`.
     Keys { task: TaskId, data: Vec<u8> },
@@ -136,6 +139,9 @@ pub struct State {
     /// Handshakes that did not check out — in practice, a mistyped phrase.
     /// Each one spends from the relay's pairing budget for this slot.
     pub misses: u32,
+    /// How big a terminal the owner says they can see, if they have said.
+    /// Older clients never send this and get the fallback below.
+    pub viewport: Option<(u16, u16)>,
     /// Lines the owner has said, and the most recent one. A summary only: the
     /// conversation itself lives on the stream. This exists so that `status`,
     /// the verb that answers when everything else is broken, can still show
@@ -157,6 +163,7 @@ impl State {
             opened: None,
             tasks: 0,
             misses: 0,
+            viewport: None,
             heard: 0,
             last_said: None,
             ended: None,
@@ -173,6 +180,7 @@ impl State {
             "open_s": self.opened.map(|t| t.elapsed().as_secs()),
             "tasks": self.tasks,
             "misses": self.misses,
+            "viewport": self.viewport.map(|(c, r)| json!({"cols": c, "rows": r})),
             "heard": self.heard,
             "last_said": self.last_said,
             "ended": self.ended,
@@ -570,6 +578,14 @@ async fn carry(link: &mut Link, track: &Track, rx: &mut mpsc::Receiver<Command>)
                             st.last_said = Some(text);
                         }
                     }
+                    // Not a task. The owner saying how big a terminal they
+                    // can see, which is the one thing about a session that is
+                    // theirs to decide.
+                    Ok(Frame::Resize { task, cols, rows }) if task == VIEWPORT => {
+                        if let Ok(mut st) = track.state.lock() {
+                            st.viewport = Some((cols, rows));
+                        }
+                    }
                     Ok(Frame::Ping { nonce }) => {
                         if link.send(&Frame::Pong { nonce }).await.is_err() {
                             break;
@@ -744,6 +760,12 @@ async fn run_verb(
         }
 
         What::Shell { command, cols, rows } => {
+            // The owner's pane if they have advertised one, the caller's
+            // number if they insisted, and a guess only when neither exists —
+            // which now means an older client that does not say.
+            let seen = track.state.lock().ok().and_then(|s| s.viewport);
+            let cols = cols.or(seen.map(|(c, _)| c)).unwrap_or(120);
+            let rows = rows.or(seen.map(|(_, r)| r)).unwrap_or(40);
             // One terminal per session, and this is policy rather than
             // protocol. The owner has one screen, and a second terminal is a
             // second thing happening on their machine that they cannot watch.

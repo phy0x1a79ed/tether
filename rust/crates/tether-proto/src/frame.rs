@@ -87,6 +87,23 @@ pub enum Ended {
 /// Names one task within a session. Minted by the operator, monotonic.
 pub type TaskId = u32;
 
+/// The task id that means "the pane the owner is watching in".
+///
+/// Not a task. A [`Frame::Resize`] carrying it is the owner telling the
+/// operator how big a terminal to open, which is the one thing about a session
+/// the owner gets to decide.
+///
+/// Zero, because the operator mints task ids from one and always has, so this
+/// number was never going to name anything. That is what makes it not a
+/// protocol change: an operator that does not know about it drops the frame
+/// like any other it has no arm for, and behaves exactly as it did before.
+/// Adding a frame variant instead would have been a permanent decode failure
+/// at every client already downloaded.
+///
+/// It travels one way. The operator has no pane and nothing to say about this
+/// one, so the owner refuses a `Resize` carrying it.
+pub const VIEWPORT: TaskId = 0;
+
 /// The opening exchange: who is on the other end, and on what.
 ///
 /// The owner's client prints this before asking for consent, which is the whole

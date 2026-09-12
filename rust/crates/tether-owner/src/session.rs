@@ -17,14 +17,14 @@
 use std::time::Duration;
 
 use tether_link::{Link, LinkError};
-use tether_proto::frame::{Frame, Hello, Role, PROTOCOL_VERSION};
+use tether_proto::frame::{Frame, Hello, Role, PROTOCOL_VERSION, VIEWPORT};
 use tether_proto::invite::InviteCode;
 use tokio::sync::mpsc;
 
 use crate::consent::{self, Answer, Ask};
 use crate::log::Log;
 use crate::exec::Runner;
-use crate::ui::{self, Event, Facts, Key, Ui};
+use crate::ui::{self, Event, Facts, Typed, Ui};
 
 /// How often the header's clock is redrawn.
 const TICK: Duration = Duration::from_secs(1);
@@ -166,20 +166,35 @@ pub async fn run(
     let (out_tx, mut out_rx) = mpsc::channel::<Frame>(256);
     let mut runner = Runner::new(out_tx);
 
-    let (key_tx, mut key_rx) = mpsc::channel::<Key>(8);
-    if ui.tty() {
-        ui::watch_keys(key_tx);
-    }
+    // Only on a terminal. Under `setsid`, in a pipe or in a test there is no
+    // console to attach to, and the session still runs and is still visible.
+    let mut keys = ui.tty().then(ui::keys);
 
     let mut tick = tokio::time::interval(TICK);
     tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
     let _ = ui.draw();
 
+    // How big a terminal this end is offering to draw. Sent before anything
+    // can be opened, and again whenever it changes, so the operator sizes a
+    // terminal to what the owner can actually see rather than to a guess.
+    let mut advertised = ui.viewport();
+    if link
+        .send(&Frame::Resize {
+            task: VIEWPORT,
+            cols: advertised.0,
+            rows: advertised.1,
+        })
+        .await
+        .is_err()
+    {
+        return Outcome::PeerLeft;
+    }
+
     let outcome = loop {
         enum Next {
             In(Result<Frame, LinkError>),
             Out(Frame),
-            Cut,
+            Term(crossterm::event::Event),
             Tick,
         }
 
@@ -188,7 +203,7 @@ pub async fn run(
         let next = tokio::select! {
             incoming = link.recv() => Next::In(incoming),
             Some(frame) = out_rx.recv() => Next::Out(frame),
-            Some(Key::Cut) = key_rx.recv() => Next::Cut,
+            Some(Ok(ev)) = next_key(&mut keys) => Next::Term(ev),
             _ = tick.tick() => Next::Tick,
         };
 
@@ -204,17 +219,53 @@ pub async fn run(
                     break Outcome::PeerLeft;
                 }
             }
-            Next::Cut => {
-                let why = "the owner ended it".to_string();
-                runner.shutdown().await;
-                ui.apply(Event::Cut {
-                    reason: why.clone(),
-                });
-                let _ = ui.draw();
-                link.cut(&why).await;
-                break Outcome::Cut(why);
+            Next::Term(ev) => match ui.typed(ev) {
+                Typed::Nothing => {}
+                Typed::Changed => {}
+                // The owner answering, which is the half of `Say` that has
+                // always been on the wire and never had anything to send it.
+                Typed::Send(text) => {
+                    ui.apply(Event::Said {
+                        from_operator: false,
+                        text: text.clone(),
+                    });
+                    if link.send(&Frame::Say { text }).await.is_err() {
+                        break Outcome::PeerLeft;
+                    }
+                }
+                Typed::Cut => {
+                    let why = "the owner ended it".to_string();
+                    runner.shutdown().await;
+                    ui.apply(Event::Cut {
+                        reason: why.clone(),
+                    });
+                    let _ = ui.draw();
+                    link.cut(&why).await;
+                    break Outcome::Cut(why);
+                }
+            },
+            Next::Tick => {
+                ui.apply(Event::Tick);
+                // Compared on the tick rather than sent on the event. Dragging
+                // a window corner produces dozens of resizes a second, and
+                // shrinking a console pseudo-terminal that often is the
+                // flakiest thing this tool can ask Windows to do.
+                let now = ui.viewport();
+                if now != advertised {
+                    advertised = now;
+                    if link
+                        .send(&Frame::Resize {
+                            task: VIEWPORT,
+                            cols: now.0,
+                            rows: now.1,
+                        })
+                        .await
+                        .is_err()
+                    {
+                        break Outcome::PeerLeft;
+                    }
+                }
             }
-            Next::Tick => ui.apply(Event::Tick),
             Next::In(Err(LinkError::Closed)) => {
                 runner.shutdown().await;
                 break Outcome::PeerLeft;
@@ -241,6 +292,16 @@ pub async fn run(
                     runner.open(task, kind, command, cols, rows);
                 }
                 Frame::Input { task, data } => runner.input(task, data).await,
+                // Task zero is this end's to speak about, not the operator's.
+                // Treated like any other frame only one side may send, which
+                // the owner's side already does for output from a program the
+                // operator is not running.
+                Frame::Resize { task, .. } if task == VIEWPORT => {
+                    let why = "the other end tried to resize the pane it is being shown in";
+                    runner.shutdown().await;
+                    link.cut(why).await;
+                    break Outcome::Failed(why.into());
+                }
                 Frame::Resize { task, cols, rows } => {
                     ui.apply(Event::Resized { task, cols, rows });
                     runner.resize(task, cols, rows).await;
@@ -297,5 +358,20 @@ fn to_event(frame: &Frame) -> Option<Event> {
             ended: *ended,
         }),
         _ => None,
+    }
+}
+
+/// The next key, or nothing at all when there is no keyboard to read.
+///
+/// A branch of the select above needs a future either way. Without the pending
+/// arm, a client with no terminal would have one `select!` leg that resolves
+/// immediately and forever, spinning the loop.
+async fn next_key(
+    keys: &mut Option<crossterm::event::EventStream>,
+) -> Option<Result<crossterm::event::Event, std::io::Error>> {
+    use futures_util::StreamExt;
+    match keys {
+        Some(stream) => stream.next().await,
+        None => std::future::pending().await,
     }
 }

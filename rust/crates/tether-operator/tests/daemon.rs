@@ -195,6 +195,16 @@ async fn own(address: Relay, code: InviteCode, how: Owner) -> Seen {
     .await
     .unwrap();
 
+    // And how big a terminal this end can actually show, which the real client
+    // sends before anything can be opened.
+    link.send(&Frame::Resize {
+        task: tether_proto::frame::VIEWPORT,
+        cols: 96,
+        rows: 28,
+    })
+    .await
+    .unwrap();
+
     loop {
         match link.recv().await {
             Ok(Frame::Open { task, command, .. }) => {
@@ -855,5 +865,54 @@ async fn a_watcher_is_placed_in_the_stream_and_then_kept_up_to_date() {
     assert!(seen.get("command").is_none(), "nor is the line that carries it");
 
     running.stop();
+    rig.stop();
+}
+
+/// The size the owner can see wins over the number this side would have picked.
+///
+/// A terminal wider than the owner's pane is clipped at their end and nobody is
+/// told, which is exactly the sentence they consented to being broken quietly.
+/// So they say, and the operator draws into what they said.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_terminal_is_opened_at_the_size_the_owner_says_they_can_see() {
+    let rig = rig(Limits::default()).await;
+    let (invite, owner) = invited(&rig, Owner::Ignore).await;
+    let slot = invite["slot"].as_u64().unwrap();
+    until(&rig, slot, "open").await;
+
+    // Wait for the advertisement to arrive before asking for anything.
+    let seen = tokio::time::timeout(Duration::from_secs(5), async {
+        loop {
+            let status = rig.operator.handle("status", &json!({})).await.unwrap();
+            let session = status["sessions"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .find(|s| s["slot"] == slot)
+                .cloned()
+                .unwrap();
+            if !session["viewport"].is_null() {
+                return session["viewport"].clone();
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+    })
+    .await
+    .expect("the owner's pane size should reach the operator");
+    assert_eq!(seen["cols"], 96);
+    assert_eq!(seen["rows"], 28);
+
+    // Asked for with no size at all, which is the ordinary case.
+    let opened = rig.operator.handle("shell", &json!({})).await.unwrap();
+    assert_eq!(opened["cols"], 96, "not the 120 this side used to hardcode");
+    assert_eq!(opened["rows"], 28);
+
+    // And a caller that insists is still obeyed.
+    rig.operator
+        .handle("close", &json!({"task": opened["task"]}))
+        .await
+        .unwrap();
+    rig.operator.handle("cut", &json!({})).await.unwrap();
+    let _ = owner.await;
     rig.stop();
 }
