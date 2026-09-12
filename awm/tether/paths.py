@@ -37,6 +37,16 @@ CONTROL_SOCKET = STATE_DIR / "operator.sock"
 
 DAEMON_LOG = STATE_DIR / "daemon.log"
 
+#: One file per session: what was run, what came back, and what the two people
+#: said to each other. Beside this service's own state rather than inside a git
+#: worktree, which is where every other service keeps its content and which
+#: keeps a credential-adjacent record out of version control.
+#:
+#: Written only in the operator role. The relay promises to keep nothing about a
+#: session and that promise stays literally true, because the relay role never
+#: opens one of these.
+SESSIONS_DIR = STATE_DIR / "sessions"
+
 ROLE = os.environ.get("AWM_TETHER_ROLE", "operator").strip().lower()
 
 OPERATOR = "operator"

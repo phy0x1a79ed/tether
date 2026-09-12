@@ -18,10 +18,20 @@ pytestmark = [pytest.mark.unit, pytest.mark.smoke]
 
 
 def test_the_verbs_that_must_work_without_a_daemon_are_not_forwards():
-    """`status` says why the daemon is missing and `logs` shows it. Forwarding
-    either would make both unanswerable in the one case they exist for."""
+    """`status` says why the daemon is missing, `logs` shows it, and `drain`
+    says what the session managed to do before it went. Forwarding any of the
+    three would make them unanswerable in the one case they exist for."""
     assert hub_adapter.HANDLERS["status"] is hub_adapter.status
     assert hub_adapter.HANDLERS["logs"] is hub_adapter.logs
+    assert hub_adapter.HANDLERS["drain"] is hub_adapter.drain
+
+
+async def test_drain_answers_an_empty_buffer_rather_than_failing():
+    """A host that has seen nothing has an answer, not an error."""
+    answer = await hub_adapter.drain({}, "nobody-in-particular")
+    assert answer["ok"] is True
+    assert answer["events"] == []
+    assert answer["gap"] is None
 
 
 async def test_status_answers_with_no_daemon_running(tmp_path, monkeypatch):
@@ -67,6 +77,8 @@ async def test_startup_schedules_the_child_rather_than_waiting_for_it(monkeypatc
         assert ticks, "the child was never reconciled"
     finally:
         hub_adapter.SUPERVISION.cancel()
+        if hub_adapter.WATCHING is not None:
+            hub_adapter.WATCHING.cancel()
 
 
 async def test_the_relay_host_refuses_the_verbs_that_mint_sessions(monkeypatch):

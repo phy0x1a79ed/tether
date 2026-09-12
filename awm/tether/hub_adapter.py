@@ -32,9 +32,24 @@ from typing import Any
 
 from awm.gatewayclient import ServiceAdapter, spawn_supervised
 
-from awm.tether import control, daemon, paths
+from awm.tether import control, daemon, paths, stream
 
 log = logging.getLogger("awm.tether.hub_adapter")
+
+#: What the daemon has told us, and where it went. Held at module level because
+#: the watch task, the drain verb and ``status`` all read the same one.
+JOURNAL = stream.Journal()
+SESSION_LOGS = stream.SessionLogs()
+
+#: Set once the adapter exists, so the watch task can reach ``emit``. The
+#: adapter is constructed in ``main`` and the task is started from ``on_start``,
+#: which runs inside it.
+ADAPTER: ServiceAdapter | None = None
+
+#: Where each caller last drained to, so the bare verb means "what is new" and
+#: nobody has to type a number. Two surfaces draining the same session will each
+#: consume what the other wanted, which is what the explicit cursor is for.
+CURSORS: dict[str, int] = {}
 
 #: Every function carries an explicit ``tool`` name under a ``tether_`` prefix,
 #: which is what decides the domain this service appears as: the gateway folds
@@ -132,6 +147,44 @@ API_MANIFEST: dict[str, Any] = {
             "timeout": 60,
         },
         {
+            "name": "drain",
+            "tool": "tether_drain",
+            "description": (
+                "Read what has happened in a session: commands and their "
+                "output, how each ended, and both sides of the conversation. "
+                "Answered from this host's own buffer, so it still works while "
+                "the daemon is restarting. With no cursor it means 'what is "
+                "new since I last asked', so you can call it bare. Use "
+                "`until` with a task id from `run` to wait for that command to "
+                "finish instead of polling for it."
+            ),
+            "params": [
+                {"name": "cursor", "type": "number",
+                 "description": "Read from here. Omit to continue from your "
+                                "own last read."},
+                {"name": "wait", "type": "number",
+                 "description": "Seconds to wait for something to arrive "
+                                "(default 0, at most 90)."},
+                {"name": "until", "type": "number",
+                 "description": "Return as soon as this task id has ended."},
+                {"name": "limit", "type": "number",
+                 "description": "Most events to return (default 500)."},
+                {"name": "code", "type": "string",
+                 "description": "Only this session, named by its slot."},
+                {"name": "task", "type": "number",
+                 "description": "Only this task."},
+                {"name": "types", "type": "string",
+                 "description": "Comma-separated kinds to keep, matched by "
+                                "prefix: `owner.` for what the person said, "
+                                "`task.` for what ran."},
+                {"name": "raw", "type": "boolean",
+                 "description": "Keep output as base64 rather than decoding it "
+                                "to text. For bytes that are not text, such as "
+                                "a terminal's escape sequences."},
+            ],
+            "timeout": 120,
+        },
+        {
             "name": "logs",
             "tool": "tether_logs",
             "description": "Tail this host's tether daemon log.",
@@ -141,11 +194,27 @@ API_MANIFEST: dict[str, Any] = {
             ],
         },
     ],
-    "emitters": [],
+    "emitters": [
+        {
+            "topic": "session",
+            "description": (
+                "Fires once per session event: a phase change, a task starting, "
+                "a chunk of its output, how it ended, and either side of the "
+                "conversation. Payload is the event, carrying {type, seq, at, "
+                "slot} and its own fields — projected on /svc/tether/emit/"
+                "session. Emitting is best effort, so a subscriber that must "
+                "not miss anything reconciles against `drain` using the `seq` "
+                "it last saw. The invite phrase is in no event: the slot is "
+                "public, the phrase never leaves the two machines."
+            ),
+        },
+    ],
     "sessions": [],
 }
 
 #: The verbs that act on a session, and so mean nothing on the relay host.
+#: ``drain`` is not among them: it is answered here and truthfully returns an
+#: empty buffer on a host that carries sessions rather than driving them.
 SESSION_VERBS = ("invite", "run", "send", "cut")
 
 CHILD = daemon.Child()
@@ -188,7 +257,14 @@ async def status(args: dict) -> dict:
     Answered locally first so it still says something useful when the daemon is
     the thing that is wrong — which is the only time anybody reads it closely.
     """
-    report: dict[str, Any] = {"ok": True, "child": CHILD.snapshot()}
+    report: dict[str, Any] = {
+        "ok": True,
+        "child": CHILD.snapshot(),
+        # Where this host's own buffer stands, which is what `drain` reads and
+        # is not the same thing as the daemon's. A caller comparing the two can
+        # see whether the watch connection is keeping up.
+        "stream": JOURNAL.head(),
+    }
     if paths.ROLE == paths.RELAY:
         # The relay's own status is behind its bearer and reachable only over
         # the network it serves. What this host can say is that it is running.
@@ -198,6 +274,111 @@ async def status(args: dict) -> dict:
     except control.DaemonUnavailable as exc:
         report |= _unreachable(exc)
     return report
+
+
+def _decoded(events: list[dict], raw: bool) -> list[dict]:
+    """Turn chunks back into something a person can read.
+
+    Output travels as bytes because a terminal's stream is escape sequences and
+    a command's can split a character across a chunk boundary. Consecutive
+    chunks of the same task and stream are joined before decoding, so a
+    character that was split in transit is whole again by the time anyone sees
+    it. That healing is only possible here, where the pieces are together.
+    """
+    import base64
+
+    out: list[dict] = []
+    for event in events:
+        if event.get("type") != "task.output":
+            out.append(event)
+            continue
+        last = out[-1] if out else None
+        if (
+            last is not None
+            and last.get("type") == "task.output"
+            and last.get("task") == event.get("task")
+            and last.get("stream") == event.get("stream")
+        ):
+            last["_chunks"].append(event.get("data") or "")
+            last["bytes"] = last.get("bytes", 0) + event.get("bytes", 0)
+            continue
+        joined = dict(event)
+        joined["_chunks"] = [event.get("data") or ""]
+        out.append(joined)
+
+    for event in out:
+        chunks = event.pop("_chunks", None)
+        if chunks is None:
+            continue
+        # Decoded one chunk at a time and joined as bytes. Each chunk was
+        # encoded on its own and carries its own padding, so joining the
+        # encoded strings and decoding once would drop everything after the
+        # first chunk that did not land on a three-byte boundary.
+        blob = b""
+        for chunk in chunks:
+            try:
+                blob += base64.b64decode(chunk)
+            except Exception:  # noqa: BLE001 — one bad chunk is not the whole stream
+                continue
+        if raw:
+            event["data"] = base64.b64encode(blob).decode("ascii")
+            continue
+        event.pop("data", None)
+        event["text"] = blob.decode("utf-8", errors="replace")
+    return out
+
+
+async def drain(args: dict, as_: str | None = None) -> dict:
+    """What has happened, from where this caller last looked.
+
+    Answered here rather than forwarded, which is the point rather than a
+    shortcut: the moment somebody most wants to know what a session did is the
+    moment its daemon has just died.
+    """
+    def number(name: str, default: int | None = None) -> int | None:
+        value = args.get(name)
+        if value is None:
+            return default
+        try:
+            return int(value)
+        except (TypeError, ValueError):
+            return default
+
+    who = as_ or "-"
+    cursor = number("cursor")
+    if cursor is None:
+        cursor = CURSORS.get(who)
+    limit = max(1, min(number("limit", 500) or 500, 2000))
+    hold = max(0.0, min(float(number("wait", 0) or 0), 90.0))
+    until = number("until")
+    slot = None
+    code = args.get("code")
+    if code:
+        first = str(code).split()[0]
+        try:
+            slot = int(first)
+        except ValueError:
+            return {"ok": False, "error": f"`{code}` does not start with a slot number"}
+    types = tuple(t.strip() for t in str(args.get("types") or "").split(",") if t.strip())
+
+    if hold:
+        found, _, _ = JOURNAL.since(cursor, limit=limit, slot=slot,
+                                    task=number("task"), types=types)
+        if not found:
+            await JOURNAL.wait(hold, until=until)
+
+    events, nxt, gap = JOURNAL.since(cursor, limit=limit, slot=slot,
+                                     task=number("task"), types=types)
+    CURSORS[who] = nxt
+    head = JOURNAL.head()
+    return {
+        "ok": True,
+        "epoch": head["epoch"],
+        "cursor": nxt,
+        "more": nxt < head["next"],
+        "gap": gap,
+        "events": _decoded(events, bool(args.get("raw"))),
+    }
 
 
 async def logs(args: dict) -> dict:
@@ -222,6 +403,19 @@ HANDLERS: dict[str, Any] = {
 }
 HANDLERS["status"] = status
 HANDLERS["logs"] = logs
+HANDLERS["drain"] = drain
+
+
+async def _emit(topic: str, payload: dict) -> None:
+    """Announce one event, if anything is listening. Never raises."""
+    if ADAPTER is None:
+        return
+    await ADAPTER.emit(topic, payload)
+
+
+async def _keep_watching() -> None:
+    """Hold the daemon's event stream open for the life of this process."""
+    await stream.watch_forever(JOURNAL, SESSION_LOGS, _emit)
 
 
 async def _keep_child_running() -> None:
@@ -244,6 +438,9 @@ async def _keep_child_running() -> None:
 #: a dropped handle survivable.
 SUPERVISION: asyncio.Task | None = None
 
+#: The event stream's task, held for the same reason.
+WATCHING: asyncio.Task | None = None
+
 
 def _on_start() -> None:
     """Arrange for the child to run, and return.
@@ -253,8 +450,12 @@ def _on_start() -> None:
     task would block initialisation on a loop written never to finish, and every
     inbound call would sit behind a gate that never opens.
     """
-    global SUPERVISION
+    global SUPERVISION, WATCHING
     SUPERVISION = spawn_supervised("tether-child", _keep_child_running)
+    # The events the child reports, on their way to the log, the topic and the
+    # buffer `drain` reads. Supervised the same way and for the same reason: a
+    # loop written never to finish must not be awaited from here.
+    WATCHING = spawn_supervised("tether-watch", _keep_watching)
 
 
 async def main() -> None:
@@ -263,10 +464,13 @@ async def main() -> None:
         format="%(asctime)s %(levelname)s %(name)s %(message)s",
     )
     log.info("tether: role=%s binaries=%s", paths.ROLE, paths.BIN_DIR)
+    global ADAPTER
+    ADAPTER = ServiceAdapter("tether", API_MANIFEST, HANDLERS,
+                             on_start=_on_start)
     try:
-        await ServiceAdapter("tether", API_MANIFEST, HANDLERS,
-                             on_start=_on_start).run()
+        await ADAPTER.run()
     finally:
+        SESSION_LOGS.close()
         # The child dies with this process either way — that is what
         # PR_SET_PDEATHSIG is for. Stopping it here is what makes a clean
         # shutdown look clean in the log rather than like a kill.
