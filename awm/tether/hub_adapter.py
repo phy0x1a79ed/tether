@@ -96,10 +96,13 @@ API_MANIFEST: dict[str, Any] = {
             "name": "run",
             "tool": "tether_run",
             "description": (
-                "Run one command on the owner's machine in a live session and "
-                "return its output and exit status. The owner watches it "
-                "happen; nothing here is hidden from them. One command at a "
-                "time per session, and its input is closed from the start."
+                "Start one command on the owner's machine in a live session. "
+                "Returns a task id immediately and does NOT wait: the output "
+                "and the exit status arrive on the session stream, so read "
+                "them with `drain --until <task>`. The owner watches it "
+                "happen; nothing here is hidden from them. Its input is closed "
+                "from the start, so a command that reads until end of input "
+                "does not wait for a keyboard."
             ),
             "params": [
                 {"name": "command", "type": "string",
@@ -108,17 +111,113 @@ API_MANIFEST: dict[str, Any] = {
                  "description": "Which session, named by its slot — the first "
                                 "number of the invite code. Omit when only one "
                                 "is live."},
+                {"name": "limit_s", "type": "number",
+                 "description": "Stop the command after this many seconds. "
+                                "Bounds one that would never end on a machine "
+                                "you are a guest on."},
             ],
-            "timeout": 600,
+            "timeout": 60,
+        },
+        {
+            "name": "shell",
+            "tool": "tether_shell",
+            "description": (
+                "Open a terminal on the owner's machine, rather than running "
+                "one command. This is the only way a full-screen program is "
+                "usable, and the only way the owner sees it as the screen you "
+                "are looking at rather than as escape codes. Type at it with "
+                "`keys`, read it with `drain`, and end it with `close`. One "
+                "terminal per session: the owner has one screen."
+            ),
+            "params": [
+                {"name": "cols", "type": "number",
+                 "description": "Terminal width (default 120)."},
+                {"name": "rows", "type": "number",
+                 "description": "Terminal height (default 40)."},
+                {"name": "command", "type": "string",
+                 "description": "What to run in it. Defaults to the owner's "
+                                "own shell."},
+                {"name": "code", "type": "string",
+                 "description": "Which session, named by its slot."},
+            ],
+            "timeout": 60,
+        },
+        {
+            "name": "keys",
+            "tool": "tether_keys",
+            "description": (
+                "Type at a task. This talks to the PROGRAM, not to the person "
+                "— use `send` to say something to them. Confusing the two "
+                "types a sentence into somebody's shell."
+            ),
+            "params": [
+                {"name": "task", "type": "number",
+                 "description": "Which task, from `run` or `shell`."},
+                {"name": "text", "type": "string",
+                 "description": "What to type."},
+                {"name": "enter", "type": "boolean",
+                 "description": "Add a newline after the text."},
+                {"name": "data", "type": "string",
+                 "description": "Base64 bytes, for keys with no printable "
+                                "form. Ctrl-C is `Aw==`. Use instead of "
+                                "`text`, not with it."},
+                {"name": "code", "type": "string",
+                 "description": "Which session, named by its slot."},
+            ],
+            "timeout": 60,
+        },
+        {
+            "name": "resize",
+            "tool": "tether_resize",
+            "description": (
+                "Tell a task its terminal changed size. A full-screen program "
+                "redraws itself to fit."
+            ),
+            "params": [
+                {"name": "task", "type": "number", "description": "Which task."},
+                {"name": "cols", "type": "number", "description": "New width."},
+                {"name": "rows", "type": "number", "description": "New height."},
+                {"name": "code", "type": "string",
+                 "description": "Which session, named by its slot."},
+            ],
+            "timeout": 60,
+        },
+        {
+            "name": "close",
+            "tool": "tether_close",
+            "description": (
+                "Stop a task. This kills it rather than signalling end of "
+                "input. The session carries on."
+            ),
+            "params": [
+                {"name": "task", "type": "number", "description": "Which task."},
+                {"name": "code", "type": "string",
+                 "description": "Which session, named by its slot."},
+            ],
+            "timeout": 60,
+        },
+        {
+            "name": "tasks",
+            "tool": "tether_tasks",
+            "description": (
+                "What is open right now in a session: each task, what it is, "
+                "how long it has been going and how much it has written."
+            ),
+            "params": [
+                {"name": "code", "type": "string",
+                 "description": "Which session, named by its slot."},
+            ],
+            "timeout": 60,
         },
         {
             "name": "send",
             "tool": "tether_send",
             "description": (
-                "Send a line of text to the person at the other keyboard. It "
-                "appears on their screen. This is how you explain what you are "
-                "about to do before you do it, and it reaches them while they "
-                "are still deciding whether to let you in."
+                "Say a line to the person at the other keyboard. It appears "
+                "on their screen. This talks to the PERSON, not to a program "
+                "— use `keys` to type at a task. This is how you explain what "
+                "you are about to do before you do it, and it reaches them "
+                "while they are still deciding whether to let you in."
             ),
             "params": [
                 {"name": "text", "type": "string",
@@ -215,7 +314,8 @@ API_MANIFEST: dict[str, Any] = {
 #: The verbs that act on a session, and so mean nothing on the relay host.
 #: ``drain`` is not among them: it is answered here and truthfully returns an
 #: empty buffer on a host that carries sessions rather than driving them.
-SESSION_VERBS = ("invite", "run", "send", "cut")
+SESSION_VERBS = ("invite", "run", "shell", "keys", "resize", "close",
+                 "tasks", "send", "cut")
 
 CHILD = daemon.Child()
 

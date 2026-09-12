@@ -27,7 +27,7 @@ use tokio::sync::{mpsc, oneshot};
 
 use crate::config::Config;
 use crate::journal::{self, Journal};
-use crate::session::{self, Command, Session};
+use crate::session::{self, Command, Session, What};
 
 pub struct Operator {
     cfg: Arc<Config>,
@@ -71,21 +71,85 @@ impl Operator {
             "status" => Ok(self.status()),
             "run" => {
                 let command = text(args, "command")?;
-                self.put(args, |reply| Command::Run { command, reply })
-                    .await
+                let limit_s = match args.get("limit_s") {
+                    None | Some(Value::Null) => None,
+                    Some(v) => Some(
+                        v.as_u64()
+                            .ok_or_else(|| "`limit_s` must be a whole number".to_string())?,
+                    ),
+                };
+                self.put(args, What::Run { command, limit_s }).await
             }
+            "shell" => {
+                let cols = size(args, "cols", 120)?;
+                let rows = size(args, "rows", 40)?;
+                self.put(
+                    args,
+                    What::Shell {
+                        command: optional(args, "command"),
+                        cols,
+                        rows,
+                    },
+                )
+                .await
+            }
+            "keys" => {
+                let task = size(args, "task", 0)?;
+                if task == 0 {
+                    return Err("`task` is required: which task to type at".into());
+                }
+                let data = keystrokes(args)?;
+                self.put(
+                    args,
+                    What::Keys {
+                        task: u32::from(task),
+                        data,
+                    },
+                )
+                .await
+            }
+            "resize" => {
+                let task = size(args, "task", 0)?;
+                if task == 0 {
+                    return Err("`task` is required: which task changed size".into());
+                }
+                self.put(
+                    args,
+                    What::Resize {
+                        task: u32::from(task),
+                        cols: size(args, "cols", 120)?,
+                        rows: size(args, "rows", 40)?,
+                    },
+                )
+                .await
+            }
+            "close" => {
+                let task = size(args, "task", 0)?;
+                if task == 0 {
+                    return Err("`task` is required: which task to stop".into());
+                }
+                self.put(
+                    args,
+                    What::Close {
+                        task: u32::from(task),
+                    },
+                )
+                .await
+            }
+            "tasks" => self.put(args, What::Tasks).await,
             "send" => {
                 let text = text(args, "text")?;
-                self.put(args, |reply| Command::Say { text, reply }).await
+                self.put(args, What::Say { text }).await
             }
             "cut" => {
                 let reason = optional(args, "reason")
                     .unwrap_or_else(|| "the operator ended the session".into());
-                self.put(args, |reply| Command::Cut { reason, reply }).await
+                self.put(args, What::Cut { reason }).await
             }
             other => Err(format!(
                 "`{other}` is not a tether verb; this daemon answers invite, \
-                 status, run, send and cut"
+                 status, run, shell, keys, resize, close, tasks, send, cut \
+                 and watch"
             )),
         }
     }
@@ -190,16 +254,13 @@ impl Operator {
     }
 
     /// Put one command to the session the caller named, and wait for its reply.
-    async fn put<F>(&self, args: &Value, build: F) -> Result<Value, String>
-    where
-        F: FnOnce(oneshot::Sender<Result<Value, String>>) -> Command,
-    {
+    async fn put(&self, args: &Value, what: What) -> Result<Value, String> {
         let tx = self.target(optional(args, "code").as_deref())?;
-        let (reply_tx, reply_rx) = oneshot::channel();
-        tx.send(build(reply_tx))
+        let (reply, answer) = oneshot::channel();
+        tx.send(Command { what, reply })
             .await
             .map_err(|_| "that session has ended".to_string())?;
-        reply_rx
+        answer
             .await
             .map_err(|_| "that session ended before it answered".to_string())?
     }
@@ -272,6 +333,57 @@ fn optional(args: &Value, key: &str) -> Option<String> {
         .and_then(|v| v.as_str())
         .map(|v| v.trim().to_string())
         .filter(|v| !v.is_empty())
+}
+
+/// A whole number that fits a terminal dimension or a task id.
+fn size(args: &Value, key: &str, fallback: u16) -> Result<u16, String> {
+    match args.get(key) {
+        None | Some(Value::Null) => Ok(fallback),
+        Some(v) => v
+            .as_u64()
+            .and_then(|n| u16::try_from(n).ok())
+            .ok_or_else(|| format!("`{key}` must be a whole number")),
+    }
+}
+
+/// What to type at a task: plain text, or bytes for the keys that are not text.
+///
+/// Two ways in because a control character is not a string. `ctrl-c` is one
+/// byte with no printable form, and a caller that could only send text would
+/// have no way to interrupt what it started.
+fn keystrokes(args: &Value) -> Result<Vec<u8>, String> {
+    let text = optional(args, "text");
+    let data = optional(args, "data");
+    if text.is_some() && data.is_some() {
+        return Err("pass `text` or `data`, not both".into());
+    }
+    if let Some(encoded) = data {
+        return unbase64(&encoded).ok_or_else(|| "`data` is not base64".to_string());
+    }
+    let mut out = text
+        .ok_or_else(|| "`text` or `data` is required: what to type".to_string())?
+        .into_bytes();
+    if args.get("enter").and_then(|v| v.as_bool()).unwrap_or(false) {
+        out.push(b'\n');
+    }
+    Ok(out)
+}
+
+fn unbase64(s: &str) -> Option<Vec<u8>> {
+    const SET: &[u8; 64] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+    let mut bits: u32 = 0;
+    let mut have: u32 = 0;
+    let mut out = Vec::new();
+    for byte in s.bytes().filter(|b| !b.is_ascii_whitespace() && *b != b'=') {
+        let value = SET.iter().position(|c| *c == byte)? as u32;
+        bits = (bits << 6) | value;
+        have += 6;
+        if have >= 8 {
+            have -= 8;
+            out.push((bits >> have) as u8);
+        }
+    }
+    Some(out)
 }
 
 fn count(args: &Value, key: &str, fallback: usize) -> Result<usize, String> {

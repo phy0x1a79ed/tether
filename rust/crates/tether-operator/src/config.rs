@@ -26,20 +26,15 @@ pub const SOCKET_ENV: &str = "TETHER_CONTROL_SOCKET";
 pub const TOKEN_ENV: &str = "AWM_TETHER_ISSUE_TOKEN";
 pub const WHO_ENV: &str = "TETHER_WHO";
 
-/// How long a command may run before the daemon stops waiting for it.
+/// How long a command may run before the daemon stops it.
 ///
-/// Under the manifest's 600-second ceiling by a wide margin, so a command that
-/// overruns comes back as a reply that says so rather than as a control-socket
-/// timeout, which tells the caller nothing about whether the command is still
-/// running on the owner's machine.
-pub const RUN_TIMEOUT: Duration = Duration::from_secs(480);
-
-/// How much of one task's output the daemon keeps, per stream.
-///
-/// The owner sees all of it either way — this is a cap on what is quoted back
-/// into a reply, not on what runs. A command that prints a gigabyte should
-/// truncate the answer, not end the daemon.
-pub const MAX_CAPTURE: usize = 512 * 1024;
+/// Its old justification is gone with the blocking reply it was sized against:
+/// nothing here waits for a command any more, so this no longer has a
+/// control-socket timeout to stay under. What it still does is bound a command
+/// that will never end, on a machine this side is a guest on. Overridable per
+/// run, and not applied to a terminal at all — a terminal has no natural length
+/// and is bounded by the session it lives in.
+pub const RUN_TIMEOUT: Duration = Duration::from_secs(3600);
 
 #[derive(Debug, Clone)]
 pub struct Config {

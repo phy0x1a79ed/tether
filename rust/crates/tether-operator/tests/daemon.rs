@@ -77,6 +77,59 @@ fn socket_path() -> std::path::PathBuf {
     ))
 }
 
+
+/// Wait for a task to end, and gather what it produced.
+///
+/// The test's stand-in for `drain --until`, and the shape every caller now has:
+/// `run` says which task, and the result is read from the stream afterwards.
+async fn finished(rig: &Rig, task: u64) -> (Value, String, String) {
+    for _ in 0..250 {
+        let (events, _, _) = rig
+            .operator
+            .journal()
+            .since(0, tether_operator::journal::BATCH);
+        let ended = events
+            .iter()
+            .find(|e| e["type"] == "task.exited" && e["task"] == task)
+            .cloned();
+        if let Some(ended) = ended {
+            let gather = |stream: &str| -> String {
+                let bytes: Vec<u8> = events
+                    .iter()
+                    .filter(|e| {
+                        e["type"] == "task.output"
+                            && e["task"] == task
+                            && e["stream"] == stream
+                    })
+                    .filter_map(|e| e["data"].as_str().map(unbase64))
+                    .flatten()
+                    .collect();
+                String::from_utf8_lossy(&bytes).into_owned()
+            };
+            return (ended, gather("stdout"), gather("stderr"));
+        }
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+    panic!("task {task} never reported how it ended");
+}
+
+fn unbase64(s: &str) -> Vec<u8> {
+    const SET: &[u8; 64] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+    let (mut bits, mut have, mut out) = (0u32, 0u32, Vec::new());
+    for byte in s.bytes().filter(|b| *b != b'=') {
+        let Some(value) = SET.iter().position(|c| *c == byte) else {
+            continue;
+        };
+        bits = (bits << 6) | value as u32;
+        have += 6;
+        if have >= 8 {
+            have -= 8;
+            out.push((bits >> have) as u8);
+        }
+    }
+    out
+}
+
 /// What the owner's end saw, and what it did about it.
 #[derive(Default, Debug)]
 struct Seen {
@@ -86,8 +139,10 @@ struct Seen {
     before_consent: Vec<String>,
     operator: Option<Hello>,
     opened: Vec<String>,
-    /// Every `Input` for the first task, in order. An empty one is end-of-file.
+    /// Every `Input`, in order. An empty one is end-of-file.
     input: Vec<Vec<u8>>,
+    /// Every `Resize`, so a terminal's negotiated size is checkable.
+    resized: Vec<(u16, u16)>,
     said: Vec<String>,
     cut: Option<String>,
 }
@@ -168,6 +223,7 @@ async fn own(address: Relay, code: InviteCode, how: Owner) -> Seen {
                 }
             }
             Ok(Frame::Input { data, .. }) => seen.input.push(data),
+            Ok(Frame::Resize { cols, rows, .. }) => seen.resized.push((cols, rows)),
             Ok(Frame::Say { text }) => seen.said.push(text),
             Ok(Frame::Ping { nonce }) => link.send(&Frame::Pong { nonce }).await.unwrap(),
             Ok(Frame::Cut { reason }) => {
@@ -278,7 +334,8 @@ async fn nothing_is_asked_for_before_the_owner_says_yes() {
         .handle("run", &json!({"command": "echo hello"}))
         .await
         .unwrap();
-    assert_eq!(ran["exit_code"], json!(0));
+    let (ended, _, _) = finished(&rig, ran["task"].as_u64().unwrap()).await;
+    assert_eq!(ended["exit_code"], json!(0));
 
     rig.operator
         .handle("cut", &json!({"reason": "done"}))
@@ -306,11 +363,17 @@ async fn a_command_goes_out_with_its_input_already_closed_and_comes_back_whole()
         .handle("run", &json!({"command": "cat /etc/hostname"}))
         .await
         .unwrap();
-    assert_eq!(ran["ok"], json!(false), "a non-zero exit is not ok");
-    assert_eq!(ran["exit_code"], json!(3));
-    assert_eq!(ran["stdout"], json!("from the owner's machine\n"));
-    assert_eq!(ran["stderr"], json!("a note\n"));
-    assert_eq!(ran["truncated"], json!(false));
+    // The reply is the task's number and nothing else, and it arrives before
+    // the command has done anything. That is the point: the caller is not
+    // holding a socket open while somebody else's machine works.
+    assert_eq!(ran["ok"], json!(true), "the ask succeeded; the command has not run");
+    assert_eq!(ran["kind"], json!("command"));
+    assert!(ran["cursor"].is_number(), "and it says where to read from");
+
+    let (ended, out, err) = finished(&rig, ran["task"].as_u64().unwrap()).await;
+    assert_eq!(ended["exit_code"], json!(3));
+    assert_eq!(out, "from the owner's machine\n");
+    assert_eq!(err, "a note\n");
 
     rig.operator.handle("cut", &json!({})).await.unwrap();
     let seen = owner.await.unwrap();
@@ -327,29 +390,113 @@ async fn a_command_goes_out_with_its_input_already_closed_and_comes_back_whole()
 }
 
 #[tokio::test(flavor = "multi_thread")]
-async fn a_second_command_is_refused_rather_than_interleaved() {
+async fn several_commands_run_at_once_and_report_separately() {
+    let rig = rig(Limits::default()).await;
+    let (invite, owner) = invited(&rig, Owner::Report(0)).await;
+    until(&rig, invite["slot"].as_u64().unwrap(), "open").await;
+
+    // This used to be refused. One task at a time was never a rule about
+    // safety — it was a consequence of the reply being the result, and it went
+    // when the reply stopped being the result.
+    let first = rig
+        .operator
+        .handle("run", &json!({"command": "one"}))
+        .await
+        .unwrap();
+    let second = rig
+        .operator
+        .handle("run", &json!({"command": "two"}))
+        .await
+        .unwrap();
+    assert_ne!(first["task"], second["task"], "each ask names its own task");
+
+    let (a, _, _) = finished(&rig, first["task"].as_u64().unwrap()).await;
+    let (b, _, _) = finished(&rig, second["task"].as_u64().unwrap()).await;
+    assert_eq!(a["exit_code"], json!(0));
+    assert_eq!(b["exit_code"], json!(0));
+
+    rig.operator.handle("cut", &json!({})).await.unwrap();
+    let _ = owner.await;
+    rig.stop();
+}
+
+/// The limit that did survive, and it is about resources rather than order.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_session_will_not_hold_more_tasks_than_it_can_account_for() {
     let rig = rig(Limits::default()).await;
     let (invite, owner) = invited(&rig, Owner::Ignore).await;
     until(&rig, invite["slot"].as_u64().unwrap(), "open").await;
 
-    // The stand-in never answers this one, so it is still in flight below.
-    let first = {
-        let operator = Arc::clone(&rig.operator);
-        tokio::spawn(async move { operator.handle("run", &json!({"command": "sleep"})).await })
-    };
-    tokio::time::sleep(Duration::from_millis(200)).await;
+    // The stand-in never answers, so none of these ever ends.
+    for _ in 0..8 {
+        rig.operator
+            .handle("run", &json!({"command": "sleep"}))
+            .await
+            .unwrap();
+    }
+    let err = rig
+        .operator
+        .handle("run", &json!({"command": "one too many"}))
+        .await
+        .expect_err("the ninth is refused");
+    assert!(err.contains("tasks open"), "{err}");
+
+    let listed = rig.operator.handle("tasks", &json!({})).await.unwrap();
+    assert_eq!(listed["tasks"].as_array().unwrap().len(), 8);
+
+    rig.operator.handle("cut", &json!({})).await.unwrap();
+    let _ = owner.await;
+    rig.stop();
+}
+
+/// A terminal, which nothing in this tool had ever asked for until now.
+///
+/// One per session, because the owner has one screen and a second terminal is
+/// a second thing happening on their machine that they cannot watch.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_terminal_opens_once_and_takes_what_is_typed_at_it() {
+    let rig = rig(Limits::default()).await;
+    let (invite, owner) = invited(&rig, Owner::Ignore).await;
+    until(&rig, invite["slot"].as_u64().unwrap(), "open").await;
+
+    let opened = rig
+        .operator
+        .handle("shell", &json!({"cols": 100, "rows": 30}))
+        .await
+        .unwrap();
+    assert_eq!(opened["kind"], json!("shell"));
+    let task = opened["task"].as_u64().unwrap();
 
     let err = rig
         .operator
-        .handle("run", &json!({"command": "another"}))
+        .handle("shell", &json!({}))
         .await
-        .expect_err("one task at a time");
-    assert!(err.contains("already running"), "{err}");
+        .expect_err("a second terminal is refused");
+    assert!(err.contains(&task.to_string()), "and it names the open one: {err}");
+
+    // Typing at a program is a different verb from speaking to a person, and
+    // the bytes go out as given so a key with no printable form survives.
+    rig.operator
+        .handle("keys", &json!({"task": task, "text": "ls", "enter": true}))
+        .await
+        .unwrap();
+    rig.operator
+        .handle("keys", &json!({"task": task, "data": "Aw=="}))
+        .await
+        .unwrap();
+    rig.operator
+        .handle("resize", &json!({"task": task, "cols": 80, "rows": 24}))
+        .await
+        .unwrap();
 
     rig.operator.handle("cut", &json!({})).await.unwrap();
-    // The abandoned command reports what it had, rather than never returning.
-    assert!(first.await.unwrap().is_err());
-    let _ = owner.await;
+    let seen = owner.await.unwrap();
+    assert_eq!(
+        seen.input,
+        vec![b"ls\n".to_vec(), vec![3]],
+        "a terminal is told nothing about end of input, unlike a command"
+    );
+    assert_eq!(seen.resized, vec![(80, 24)]);
     rig.stop();
 }
 
@@ -545,10 +692,12 @@ async fn a_session_is_readable_afterwards_by_somebody_who_was_not_the_caller() {
     let slot = invite["slot"].as_u64().unwrap();
     until(&rig, slot, "open").await;
 
-    rig.operator
+    let ran = rig
+        .operator
         .handle("run", &json!({"command": "df -h"}))
         .await
         .unwrap();
+    finished(&rig, ran["task"].as_u64().unwrap()).await;
     rig.operator
         .handle("send", &json!({"text": "checking the disk"}))
         .await
@@ -616,11 +765,32 @@ async fn the_phrase_is_in_no_event_the_stream_carries() {
     assert_eq!(phrase.len(), 2, "the fixture assumes a two-word phrase");
 
     let (events, _, _) = rig.operator.journal().since(0, tether_operator::journal::BATCH);
-    let whole = serde_json::to_string(&events).unwrap();
+    // Values only. A field name is part of the vocabulary rather than part of
+    // the session, and the word list is ordinary English — `signal` is both a
+    // plausible phrase word and the name of a field on every task that ended.
+    let mut said = Vec::new();
+    for event in &events {
+        collect_strings(event, &mut said);
+    }
     for word in phrase {
-        assert!(!whole.contains(&word), "the stream leaked {word:?}: {whole}");
+        for value in &said {
+            assert!(
+                !value.contains(&word),
+                "the stream leaked {word:?} in {value:?}"
+            );
+        }
     }
     rig.stop();
+}
+
+/// Every string a reader would actually receive as content.
+fn collect_strings(value: &Value, out: &mut Vec<String>) {
+    match value {
+        Value::String(s) => out.push(s.clone()),
+        Value::Array(items) => items.iter().for_each(|v| collect_strings(v, out)),
+        Value::Object(map) => map.values().for_each(|v| collect_strings(v, out)),
+        _ => {}
+    }
 }
 
 /// A watcher is told where it stands before it is told anything else, and then

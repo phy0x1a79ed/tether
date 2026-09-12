@@ -23,6 +23,7 @@
 //! spends from the relay's budget, and that budget is the failure limit that
 //! makes a spoken phrase safe.
 
+use std::collections::BTreeMap;
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
@@ -33,7 +34,7 @@ use tether_proto::frame::{Ended, Frame, Hello, Kind, Stream, TaskId};
 use tether_proto::invite::{InviteCode, Phrase, Slot};
 use tokio::sync::{mpsc, oneshot};
 
-use crate::config::{Config, MAX_CAPTURE, RUN_TIMEOUT};
+use crate::config::{Config, RUN_TIMEOUT};
 use crate::journal::{self, Journal};
 
 /// How long the daemon waits for consent once the two ends have paired.
@@ -49,30 +50,51 @@ const KEEPALIVE: Duration = Duration::from_secs(45);
 /// How long an ended session stays visible in `status` before it is forgotten.
 pub const LINGER: Duration = Duration::from_secs(600);
 
-/// Commands the daemon's control socket can put to a live session.
-pub enum Command {
+/// Where a verb's answer goes.
+pub type Ack = oneshot::Sender<Result<Value, String>>;
+
+/// One thing the control socket asked a live session to do.
+///
+/// The reply channel is beside the request rather than inside each variant, so
+/// refusing a verb does not need to know which verb it was. That mattered once
+/// there were more than three of them.
+pub struct Command {
+    pub what: What,
+    pub reply: Ack,
+}
+
+/// What was asked for.
+pub enum What {
+    /// Run a command to completion. Its output and its ending arrive on the
+    /// stream; what comes back here is the task's number.
     Run {
         command: String,
-        reply: oneshot::Sender<Result<Value, String>>,
+        limit_s: Option<u64>,
     },
-    Say {
-        text: String,
-        reply: oneshot::Sender<Result<Value, String>>,
+    /// Open a terminal. The owner watches it render as a screen rather than as
+    /// a block of text, which is the only way a full-screen program is visible
+    /// to them at all.
+    Shell {
+        command: Option<String>,
+        cols: u16,
+        rows: u16,
     },
-    Cut {
-        reason: String,
-        reply: oneshot::Sender<Result<Value, String>>,
-    },
+    /// Type at a task. Talks to the program, not to the person — see `Say`.
+    Keys { task: TaskId, data: Vec<u8> },
+    Resize { task: TaskId, cols: u16, rows: u16 },
+    /// Stop a task. The protocol is careful that this kills rather than
+    /// signalling end of input.
+    Close { task: TaskId },
+    Tasks,
+    /// Say a line to the person at the other keyboard. Talks to the person, not
+    /// to the program — see `Keys`.
+    Say { text: String },
+    Cut { reason: String },
 }
 
 impl Command {
     fn refuse(self, why: &str) {
-        let sender = match self {
-            Command::Run { reply, .. }
-            | Command::Say { reply, .. }
-            | Command::Cut { reply, .. } => reply,
-        };
-        let _ = sender.send(Err(why.to_string()));
+        let _ = self.reply.send(Err(why.to_string()));
     }
 }
 
@@ -199,8 +221,8 @@ impl Track {
     ///
     /// Takes the pair a constructor in [`journal`] returns, so the only way to
     /// record something is to have named it there.
-    fn note(&self, event: (&str, Value)) {
-        self.journal.append(Some(self.slot), event.0, event.1);
+    fn note(&self, event: (&str, Value)) -> crate::journal::Seq {
+        self.journal.append(Some(self.slot), event.0, event.1)
     }
 }
 
@@ -344,7 +366,7 @@ async fn connect(
                         finish(track, "the daemon is shutting down");
                         return None;
                     }
-                    Some(Command::Cut { reason, reply }) => {
+                    Some(Command { what: What::Cut { reason }, reply }) => {
                         let _ = reply.send(Ok(json!({"ok": true, "cut": reason})));
                         finish(track, reason);
                         return None;
@@ -409,7 +431,7 @@ async fn consent(
                     finish(track, "the daemon is shutting down");
                     return false;
                 }
-                Some(Command::Cut { reason, reply }) => {
+                Some(Command { what: What::Cut { reason }, reply }) => {
                     link.cut(&reason).await;
                     let _ = reply.send(Ok(json!({"ok": true, "cut": reason})));
                     finish(track, reason);
@@ -418,7 +440,7 @@ async fn consent(
                 // Worth allowing, and the reason the owner's side accepts it
                 // before consent: it is how the operator says what they are
                 // about to do, to somebody deciding whether to let them.
-                Some(Command::Say { text, reply }) => {
+                Some(Command { what: What::Say { text }, reply }) => {
                     track.note(journal::operator_said(&text));
                     let sent = link.send(&Frame::Say { text }).await;
                     let _ = reply.send(match sent {
@@ -440,214 +462,138 @@ async fn consent(
     }
 }
 
-/// One command in flight, and what has come back for it so far.
-struct Pending {
-    task: TaskId,
-    stdout: Vec<u8>,
-    stderr: Vec<u8>,
-    truncated: bool,
-    deadline: tokio::time::Instant,
-    killed: bool,
-    reply: oneshot::Sender<Result<Value, String>>,
+/// One task open at the owner's end.
+///
+/// What this holds is bookkeeping, not content. Output goes straight onto the
+/// stream as it arrives, so nothing accumulates here however much a command
+/// prints — which is the whole reason the old single-command buffer is gone.
+struct Task {
+    kind: Kind,
+    command: Option<String>,
+    opened: tokio::time::Instant,
+    bytes_out: u64,
+    /// A `Close` has gone out and the `Exit` that must follow has not.
+    closing: bool,
+    /// Only a command has one. A terminal has no natural length and is bounded
+    /// by the session it lives in.
+    deadline: Option<tokio::time::Instant>,
 }
 
-impl Pending {
-    fn collect(&mut self, stream: Stream, data: Vec<u8>) {
-        let sink = match stream {
-            Stream::Stderr => &mut self.stderr,
-            // A `Command` task never produces `Screen`, but a peer is not
-            // obliged to be the peer we expect. Keeping it with stdout is
-            // better than dropping bytes the owner watched go past.
-            Stream::Stdout | Stream::Screen => &mut self.stdout,
-        };
-        let room = MAX_CAPTURE.saturating_sub(sink.len());
-        if data.len() > room {
-            self.truncated = true;
-        }
-        sink.extend_from_slice(&data[..room.min(data.len())]);
-    }
-
-    fn answer(self, ended: Ended) {
-        let (code, signal) = match ended {
-            Ended::Code(c) => (Some(c), None),
-            Ended::Signal(s) => (None, Some(s)),
-        };
-        let _ = self.reply.send(Ok(json!({
-            "ok": code == Some(0),
-            "task": self.task,
-            "exit_code": code,
-            "signal": signal,
-            "killed": self.killed,
-            "truncated": self.truncated,
-            "stdout": String::from_utf8_lossy(&self.stdout),
-            "stderr": String::from_utf8_lossy(&self.stderr),
-        })));
-    }
-
-    fn abandon(self, why: &str) {
-        let _ = self.reply.send(Err(format!(
-            "{why}; what the command had produced by then: {}{}",
-            String::from_utf8_lossy(&self.stdout),
-            String::from_utf8_lossy(&self.stderr),
-        )));
+impl Task {
+    fn report(&self, id: TaskId) -> Value {
+        json!({
+            "task": id,
+            "kind": if self.kind == Kind::Shell { "shell" } else { "command" },
+            "command": self.command,
+            "age_s": self.opened.elapsed().as_secs(),
+            "bytes_out": self.bytes_out,
+            "closing": self.closing,
+        })
     }
 }
+
+/// How many tasks one session may have open at once.
+///
+/// A resource bound rather than a rule about ordering. The old limit of one was
+/// a consequence of the reply being the result, and it went with it.
+const MAX_OPEN_TASKS: usize = 8;
+
+/// How long a session may hear nothing at all before it is assumed gone.
+///
+/// This is the daemon's only liveness check, and it has to exist here because
+/// the thing that used to serve as one — a command's deadline firing twice —
+/// stopped meaning the peer was unresponsive the moment a session could hold
+/// several tasks and a terminal. A task that never reports its ending is not a
+/// peer that has gone away.
+const SILENCE: Duration = Duration::from_secs(3 * 45 + 30);
 
 /// Carry the open session until either side ends it.
 async fn carry(link: &mut Link, track: &Track, rx: &mut mpsc::Receiver<Command>) {
-    let mut pending: Option<Pending> = None;
+    let mut tasks: BTreeMap<TaskId, Task> = BTreeMap::new();
     let mut next_task: TaskId = 1;
     let mut nonce: u64 = 0;
+    let mut heard = tokio::time::Instant::now();
     let mut beat = tokio::time::interval(KEEPALIVE);
     beat.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
     beat.tick().await; // the first tick is immediate; the socket is fresh
 
     loop {
-        // Rebuilt each turn so it tracks whatever is in flight now. A sleep is
-        // cheap and the loop only turns when something happened.
-        let overrun = match &pending {
-            Some(p) => tokio::time::sleep_until(p.deadline),
+        // The earliest deadline among whatever is in flight, rebuilt each turn
+        // because the set changes. A sleep is cheap and the loop only turns
+        // when something happened.
+        let overrun = match tasks.values().filter_map(|t| t.deadline).min() {
+            Some(at) => tokio::time::sleep_until(at),
             None => tokio::time::sleep(Duration::from_secs(3600)),
         };
         tokio::pin!(overrun);
 
         tokio::select! {
-            incoming = link.recv() => match incoming {
-                Ok(Frame::Output { task, stream, data }) => {
-                    // One frame can be larger than one event, so a big chunk
-                    // becomes several in order rather than a single record that
-                    // would dominate the ring on its own.
-                    let name = match stream {
-                        Stream::Stdout => "stdout",
-                        Stream::Stderr => "stderr",
-                        Stream::Screen => "screen",
-                    };
-                    for piece in data.chunks(journal::MAX_EVENT_DATA).filter(|c| !c.is_empty()) {
-                        track.note(journal::task_output(task, name, piece));
+            incoming = link.recv() => {
+                heard = tokio::time::Instant::now();
+                match incoming {
+                    Ok(Frame::Output { task, stream, data }) => {
+                        let name = match stream {
+                            Stream::Stdout => "stdout",
+                            Stream::Stderr => "stderr",
+                            Stream::Screen => "screen",
+                        };
+                        if let Some(t) = tasks.get_mut(&task) {
+                            t.bytes_out += data.len() as u64;
+                        }
+                        // One frame can be larger than one event, so a big
+                        // chunk becomes several in order rather than a single
+                        // record that would dominate the ring on its own.
+                        for piece in data.chunks(journal::MAX_EVENT_DATA).filter(|c| !c.is_empty()) {
+                            track.note(journal::task_output(task, name, piece));
+                        }
                     }
-                    if let Some(p) = pending.as_mut().filter(|p| p.task == task) {
-                        p.collect(stream, data);
+                    Ok(Frame::Exit { task, ended }) => {
+                        let (code, signal) = match ended {
+                            Ended::Code(c) => (Some(c), None),
+                            Ended::Signal(n) => (None, Some(n)),
+                        };
+                        track.note(journal::task_exited(task, code, signal));
+                        tasks.remove(&task);
+                    }
+                    Ok(Frame::Cut { reason }) => {
+                        finish(track, reason);
+                        return;
+                    }
+                    // The owner said something. This used to fall into the
+                    // empty arm below and be discarded without trace, which
+                    // made the frame's own definition — a line from one person
+                    // to the other — true in one direction only.
+                    Ok(Frame::Say { text }) => {
+                        track.note(journal::owner_said(&text));
+                        if let Ok(mut st) = track.state.lock() {
+                            st.heard += 1;
+                            st.last_said = Some(text);
+                        }
+                    }
+                    Ok(Frame::Ping { nonce }) => {
+                        if link.send(&Frame::Pong { nonce }).await.is_err() {
+                            break;
+                        }
+                    }
+                    Ok(_) => {}
+                    Err(e) => {
+                        finish(track, format!("the owner's end went away: {e}"));
+                        return;
                     }
                 }
-                Ok(Frame::Exit { task, ended }) => {
-                    let (code, signal) = match ended {
-                        Ended::Code(c) => (Some(c), None),
-                        Ended::Signal(n) => (None, Some(n)),
-                    };
-                    track.note(journal::task_exited(task, code, signal));
-                    if pending.as_ref().is_some_and(|p| p.task == task) {
-                        pending.take().unwrap().answer(ended);
-                    }
-                }
-                // The owner said something. This used to fall into the empty
-                // arm below and be discarded without trace, which made the
-                // frame's own definition — a line from one person to the other
-                // — true in one direction only.
-                Ok(Frame::Say { text }) => {
-                    track.note(journal::owner_said(&text));
-                    if let Ok(mut st) = track.state.lock() {
-                        st.heard += 1;
-                        st.last_said = Some(text);
-                    }
-                }
-                Ok(Frame::Cut { reason }) => {
-                    if let Some(p) = pending.take() {
-                        p.abandon(&format!("the owner ended the session: {reason}"));
-                    }
-                    finish(track, reason);
-                    return;
-                }
-                Ok(Frame::Ping { nonce }) => {
-                    if link.send(&Frame::Pong { nonce }).await.is_err() {
-                        break;
-                    }
-                }
-                Ok(_) => {}
-                Err(e) => {
-                    if let Some(p) = pending.take() {
-                        p.abandon(&format!("the session ended: {e}"));
-                    }
-                    finish(track, format!("the owner's end went away: {e}"));
-                    return;
-                }
-            },
+            }
 
             command = rx.recv() => match command {
                 None => {
                     link.cut("the operator's daemon is shutting down").await;
-                    if let Some(p) = pending.take() {
-                        p.abandon("the daemon shut down while the command was running");
-                    }
                     finish(track, "the daemon is shutting down");
                     return;
                 }
-                Some(Command::Cut { reason, reply }) => {
-                    link.cut(&reason).await;
-                    if let Some(p) = pending.take() {
-                        p.abandon(&format!("the session was cut: {reason}"));
-                    }
-                    let _ = reply.send(Ok(json!({"ok": true, "cut": reason})));
-                    finish(track, reason);
-                    return;
-                }
-                Some(Command::Say { text, reply }) => {
-                    track.note(journal::operator_said(&text));
-                    let sent = link.send(&Frame::Say { text }).await;
-                    let _ = reply.send(match sent {
-                        Ok(()) => Ok(json!({"ok": true, "said": true})),
-                        Err(e) => Err(e.to_string()),
-                    });
-                }
-                Some(Command::Run { command, reply }) => {
-                    if pending.is_some() {
-                        let _ = reply.send(Err(
-                            "this session is already running a command; wait for it \
-                             or cut the session"
-                                .into(),
-                        ));
-                        continue;
-                    }
-                    let task = next_task;
-                    next_task += 1;
-                    track.note(journal::task_started(
-                        task,
-                        "command",
-                        Some(&command),
-                        120,
-                        40,
-                    ));
-                    let opened = link.send(&Frame::Open {
-                        task,
-                        kind: Kind::Command,
-                        command: Some(command),
-                        cols: 120,
-                        rows: 40,
-                    }).await;
-                    // End-of-input immediately, because nothing here will ever
-                    // type at it. Without this a command that reads until its
-                    // input runs out — `cat`, `sort`, anything in a pipeline —
-                    // waits for a keyboard that does not exist.
-                    let opened = opened.and(
-                        link.send(&Frame::Input { task, data: Vec::new() }).await
-                    );
-                    match opened {
-                        Ok(()) => {
-                            if let Ok(mut s) = track.state.lock() {
-                                s.tasks += 1;
-                            }
-                            pending = Some(Pending {
-                                task,
-                                stdout: Vec::new(),
-                                stderr: Vec::new(),
-                                truncated: false,
-                                deadline: tokio::time::Instant::now() + RUN_TIMEOUT,
-                                killed: false,
-                                reply,
-                            });
-                        }
-                        Err(e) => {
-                            let _ = reply.send(Err(e.to_string()));
-                            finish(track, format!("the session ended: {e}"));
+                Some(Command { what, reply }) => {
+                    match run_verb(link, track, &mut tasks, &mut next_task, what, reply).await {
+                        Carry::On => {}
+                        Carry::Ended(why) => {
+                            finish(track, why);
                             return;
                         }
                     }
@@ -655,34 +601,39 @@ async fn carry(link: &mut Link, track: &Track, rx: &mut mpsc::Receiver<Command>)
             },
 
             _ = &mut overrun => {
-                // Two deadlines, and they mean different things. The first
-                // stops the command, which the protocol answers with an `Exit`
-                // like any other ending. The second is for a peer that does
-                // not answer at all, and it ends the session rather than
-                // leaving the caller holding a socket forever.
-                match pending.as_mut() {
-                    Some(p) if !p.killed => {
-                        p.killed = true;
-                        p.deadline = tokio::time::Instant::now() + Duration::from_secs(30);
-                        let task = p.task;
-                        if link.send(&Frame::Close { task }).await.is_err() {
-                            break;
-                        }
+                let now = tokio::time::Instant::now();
+                let due: Vec<TaskId> = tasks
+                    .iter()
+                    .filter(|(_, t)| t.deadline.is_some_and(|at| at <= now))
+                    .map(|(id, _)| *id)
+                    .collect();
+                for id in due {
+                    let Some(task) = tasks.get_mut(&id) else { continue };
+                    if task.closing {
+                        // Asked to stop and never said whether it did. That is
+                        // one task giving up, not a peer that has gone: the
+                        // session carries on and the silence check above is
+                        // what decides whether anybody is still there.
+                        track.note(journal::task_exited(id, None, None));
+                        tasks.remove(&id);
+                        continue;
                     }
-                    Some(_) => {
-                        let p = pending.take().unwrap();
-                        p.abandon("the command was stopped but the owner's end never \
-                                   reported how it ended");
-                        let why = "the owner's end stopped answering";
-                        link.cut(why).await;
-                        finish(track, why);
+                    task.closing = true;
+                    task.deadline = Some(now + Duration::from_secs(30));
+                    if link.send(&Frame::Close { task: id }).await.is_err() {
+                        finish(track, "the session ended while stopping a command");
                         return;
                     }
-                    None => {}
                 }
             }
 
             _ = beat.tick() => {
+                if heard.elapsed() > SILENCE {
+                    let why = "the owner's end stopped answering";
+                    link.cut(why).await;
+                    finish(track, why);
+                    return;
+                }
                 nonce += 1;
                 if link.send(&Frame::Ping { nonce }).await.is_err() {
                     break;
@@ -691,10 +642,227 @@ async fn carry(link: &mut Link, track: &Track, rx: &mut mpsc::Receiver<Command>)
         }
     }
 
-    if let Some(p) = pending.take() {
-        p.abandon("the session ended while the command was running");
-    }
     finish(track, "the session ended");
+}
+
+/// Whether the session survived a verb.
+enum Carry {
+    On,
+    Ended(String),
+}
+
+/// Do one thing the operator asked for.
+///
+/// Split out of [`carry`] because the match got longer than the loop it lives
+/// in, and because every arm here has the same shape: put a frame on the wire,
+/// tell the caller what it now knows, and say whether the session is still
+/// there.
+async fn run_verb(
+    link: &mut Link,
+    track: &Track,
+    tasks: &mut BTreeMap<TaskId, Task>,
+    next_task: &mut TaskId,
+    what: What,
+    reply: Ack,
+) -> Carry {
+    match what {
+        What::Cut { reason } => {
+            link.cut(&reason).await;
+            let _ = reply.send(Ok(json!({"ok": true, "cut": reason})));
+            Carry::Ended(reason)
+        }
+
+        What::Say { text } => {
+            track.note(journal::operator_said(&text));
+            let sent = link.send(&Frame::Say { text }).await;
+            let _ = reply.send(match sent {
+                Ok(()) => Ok(json!({"ok": true, "said": true})),
+                Err(e) => Err(e.to_string()),
+            });
+            Carry::On
+        }
+
+        What::Tasks => {
+            let open: Vec<Value> = tasks.iter().map(|(id, t)| t.report(*id)).collect();
+            let _ = reply.send(Ok(json!({"ok": true, "tasks": open})));
+            Carry::On
+        }
+
+        What::Run { command, limit_s } => {
+            if tasks.len() >= MAX_OPEN_TASKS {
+                let _ = reply.send(Err(format!(
+                    "this session already has {MAX_OPEN_TASKS} tasks open; \
+                     let one finish, or close one"
+                )));
+                return Carry::On;
+            }
+            let task = *next_task;
+            *next_task += 1;
+            let seq = track.note(journal::task_started(task, "command", Some(&command), 120, 40));
+            let opened = link
+                .send(&Frame::Open {
+                    task,
+                    kind: Kind::Command,
+                    command: Some(command.clone()),
+                    cols: 120,
+                    rows: 40,
+                })
+                .await
+                // End-of-input immediately, because nothing will ever type at a
+                // command. Without this one that reads until its input runs out
+                // — `cat`, `sort`, anything in a pipeline — waits for a keyboard
+                // that does not exist. A terminal gets no such frame: it has no
+                // end of input to be told about.
+                .and(link.send(&Frame::Input { task, data: Vec::new() }).await);
+            match opened {
+                Ok(()) => {
+                    if let Ok(mut s) = track.state.lock() {
+                        s.tasks += 1;
+                    }
+                    let limit = limit_s.map(Duration::from_secs).unwrap_or(RUN_TIMEOUT);
+                    tasks.insert(
+                        task,
+                        Task {
+                            kind: Kind::Command,
+                            command: Some(command),
+                            opened: tokio::time::Instant::now(),
+                            bytes_out: 0,
+                            closing: false,
+                            deadline: Some(tokio::time::Instant::now() + limit),
+                        },
+                    );
+                    let _ = reply.send(Ok(json!({
+                        "ok": true, "task": task, "kind": "command", "cursor": seq,
+                    })));
+                    Carry::On
+                }
+                Err(e) => {
+                    let _ = reply.send(Err(e.to_string()));
+                    Carry::Ended(format!("the session ended: {e}"))
+                }
+            }
+        }
+
+        What::Shell { command, cols, rows } => {
+            // One terminal per session, and this is policy rather than
+            // protocol. The owner has one screen, and a second terminal is a
+            // second thing happening on their machine that they cannot watch.
+            if let Some((id, _)) = tasks.iter().find(|(_, t)| t.kind == Kind::Shell) {
+                let _ = reply.send(Err(format!(
+                    "this session already has a terminal open as task {id}; \
+                     close it before opening another"
+                )));
+                return Carry::On;
+            }
+            if tasks.len() >= MAX_OPEN_TASKS {
+                let _ = reply.send(Err(format!(
+                    "this session already has {MAX_OPEN_TASKS} tasks open"
+                )));
+                return Carry::On;
+            }
+            let task = *next_task;
+            *next_task += 1;
+            let seq = track.note(journal::task_started(
+                task,
+                "shell",
+                command.as_deref(),
+                cols,
+                rows,
+            ));
+            match link
+                .send(&Frame::Open {
+                    task,
+                    kind: Kind::Shell,
+                    command: command.clone(),
+                    cols,
+                    rows,
+                })
+                .await
+            {
+                Ok(()) => {
+                    if let Ok(mut s) = track.state.lock() {
+                        s.tasks += 1;
+                    }
+                    tasks.insert(
+                        task,
+                        Task {
+                            kind: Kind::Shell,
+                            command,
+                            opened: tokio::time::Instant::now(),
+                            bytes_out: 0,
+                            closing: false,
+                            deadline: None,
+                        },
+                    );
+                    let _ = reply.send(Ok(json!({
+                        "ok": true, "task": task, "kind": "shell",
+                        "cols": cols, "rows": rows, "cursor": seq,
+                    })));
+                    Carry::On
+                }
+                Err(e) => {
+                    let _ = reply.send(Err(e.to_string()));
+                    Carry::Ended(format!("the session ended: {e}"))
+                }
+            }
+        }
+
+        What::Keys { task, data } => {
+            if !tasks.contains_key(&task) {
+                let _ = reply.send(Err(format!("task {task} is not open in this session")));
+                return Carry::On;
+            }
+            let bytes = data.len();
+            match link.send(&Frame::Input { task, data }).await {
+                Ok(()) => {
+                    let _ = reply.send(Ok(json!({"ok": true, "task": task, "bytes": bytes})));
+                    Carry::On
+                }
+                Err(e) => {
+                    let _ = reply.send(Err(e.to_string()));
+                    Carry::Ended(format!("the session ended: {e}"))
+                }
+            }
+        }
+
+        What::Resize { task, cols, rows } => {
+            if !tasks.contains_key(&task) {
+                let _ = reply.send(Err(format!("task {task} is not open in this session")));
+                return Carry::On;
+            }
+            match link.send(&Frame::Resize { task, cols, rows }).await {
+                Ok(()) => {
+                    let _ = reply.send(Ok(json!({
+                        "ok": true, "task": task, "cols": cols, "rows": rows,
+                    })));
+                    Carry::On
+                }
+                Err(e) => {
+                    let _ = reply.send(Err(e.to_string()));
+                    Carry::Ended(format!("the session ended: {e}"))
+                }
+            }
+        }
+
+        What::Close { task } => {
+            let Some(open) = tasks.get_mut(&task) else {
+                let _ = reply.send(Err(format!("task {task} is not open in this session")));
+                return Carry::On;
+            };
+            open.closing = true;
+            open.deadline = Some(tokio::time::Instant::now() + Duration::from_secs(30));
+            match link.send(&Frame::Close { task }).await {
+                Ok(()) => {
+                    let _ = reply.send(Ok(json!({"ok": true, "task": task})));
+                    Carry::On
+                }
+                Err(e) => {
+                    let _ = reply.send(Err(e.to_string()));
+                    Carry::Ended(format!("the session ended: {e}"))
+                }
+            }
+        }
+    }
 }
 
 /// The one-line command the owner runs. Assembled here because the two halves
@@ -731,22 +899,4 @@ mod tests {
         );
     }
 
-    #[test]
-    fn output_beyond_the_cap_is_kept_up_to_it_and_reported_as_cut_short() {
-        let (tx, _rx) = oneshot::channel();
-        let mut pending = Pending {
-            task: 1,
-            stdout: Vec::new(),
-            stderr: Vec::new(),
-            truncated: false,
-            deadline: tokio::time::Instant::now(),
-            killed: false,
-            reply: tx,
-        };
-        pending.collect(Stream::Stdout, vec![b'x'; MAX_CAPTURE - 1]);
-        assert!(!pending.truncated);
-        pending.collect(Stream::Stdout, vec![b'y'; 10]);
-        assert!(pending.truncated);
-        assert_eq!(pending.stdout.len(), MAX_CAPTURE);
-    }
 }
