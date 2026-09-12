@@ -20,12 +20,16 @@
 //! - [`operator`] is the table of sessions and the verbs over it.
 //! - [`session`] is one session's task, which owns its socket alone.
 //! - [`control`] is the local socket the adapter speaks to.
+//! - [`journal`] is everything that happened, for anyone who asks.
+//! - [`watch`] is the one connection that does not close.
 
 pub mod config;
 pub mod control;
+pub mod journal;
 pub mod log;
 pub mod operator;
 pub mod session;
+pub mod watch;
 
 pub use config::Config;
 pub use operator::Operator;

@@ -136,7 +136,18 @@ async fn answer(operator: Arc<Operator>, stream: UnixStream) {
         return;
     }
 
-    let reply = match serde_json::from_str::<Request>(&line) {
+    let request = serde_json::from_str::<Request>(&line);
+
+    // The one verb that does not answer and stop. It takes the write half and
+    // keeps it, so nothing below may run afterwards.
+    if let Ok(request) = &request {
+        if request.verb == "watch" {
+            crate::watch::stream(operator, &request.args, write).await;
+            return;
+        }
+    }
+
+    let reply = match request {
         Ok(request) => match operator.handle(&request.verb, &request.args).await {
             Ok(value) => value,
             Err(error) => json!({"ok": false, "error": error}),

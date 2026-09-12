@@ -531,3 +531,159 @@ async fn ask(socket: &std::path::Path, request: Value) -> Value {
     BufReader::new(read).read_line(&mut reply).await.unwrap();
     serde_json::from_str(&reply).expect("the daemon should answer with JSON")
 }
+
+/// Everything a session did, as a reader who was not the caller sees it.
+///
+/// This is the property `run`'s blocking reply never had: the caller got the
+/// output and nobody else could see any of it, including the same caller a
+/// moment later. Here a reader that was not in the room asks afterwards and
+/// gets the whole thing.
+#[tokio::test]
+async fn a_session_is_readable_afterwards_by_somebody_who_was_not_the_caller() {
+    let rig = rig(Limits::default()).await;
+    let (invite, owner) = invited(&rig, Owner::Report(0)).await;
+    let slot = invite["slot"].as_u64().unwrap();
+    until(&rig, slot, "open").await;
+
+    rig.operator
+        .handle("run", &json!({"command": "df -h"}))
+        .await
+        .unwrap();
+    rig.operator
+        .handle("send", &json!({"text": "checking the disk"}))
+        .await
+        .unwrap();
+    rig.operator.handle("cut", &json!({})).await.unwrap();
+    owner.await.unwrap();
+
+    let (events, _, gap) = rig.operator.journal().since(0, tether_operator::journal::BATCH);
+    assert!(gap.is_none(), "nothing should have been evicted");
+    let kinds: Vec<&str> = events.iter().filter_map(|e| e["type"].as_str()).collect();
+
+    for expected in [
+        "daemon.started",
+        "session.minted",
+        "session.phase",
+        "task.started",
+        "task.output",
+        "task.exited",
+        "operator.said",
+    ] {
+        assert!(kinds.contains(&expected), "missing {expected}: {kinds:?}");
+    }
+
+    let started = events.iter().find(|e| e["type"] == "task.started").unwrap();
+    assert_eq!(started["command"], "df -h");
+    assert_eq!(started["slot"], slot);
+    assert_eq!(started["kind"], "command");
+
+    let exited = events.iter().find(|e| e["type"] == "task.exited").unwrap();
+    assert_eq!(exited["exit_code"], 0);
+
+    // Ordering within a session is what makes a transcript readable.
+    let at = |kind: &str| events.iter().position(|e| e["type"] == kind).unwrap();
+    assert!(at("task.started") < at("task.output"));
+    assert!(at("task.output") < at("task.exited"));
+
+    let ended = events
+        .iter()
+        .rev()
+        .find(|e| e["type"] == "session.phase" && e["phase"] == "ended")
+        .expect("the ending is a fact too");
+    assert!(ended["ended"].as_str().unwrap().contains("operator"));
+    rig.stop();
+}
+
+/// The credential must not travel with the story.
+#[tokio::test]
+async fn the_phrase_is_in_no_event_the_stream_carries() {
+    let rig = rig(Limits::default()).await;
+    let (invite, owner) = invited(&rig, Owner::Report(0)).await;
+    until(&rig, invite["slot"].as_u64().unwrap(), "open").await;
+    rig.operator
+        .handle("run", &json!({"command": "true"}))
+        .await
+        .unwrap();
+    rig.operator.handle("cut", &json!({})).await.unwrap();
+    owner.await.unwrap();
+
+    let phrase: Vec<String> = invite["words"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|w| w.as_str().unwrap().to_string())
+        .collect();
+    assert_eq!(phrase.len(), 2, "the fixture assumes a two-word phrase");
+
+    let (events, _, _) = rig.operator.journal().since(0, tether_operator::journal::BATCH);
+    let whole = serde_json::to_string(&events).unwrap();
+    for word in phrase {
+        assert!(!whole.contains(&word), "the stream leaked {word:?}: {whole}");
+    }
+    rig.stop();
+}
+
+/// A watcher is told where it stands before it is told anything else, and then
+/// sees what happens next without having asked for it.
+#[tokio::test]
+async fn a_watcher_is_placed_in_the_stream_and_then_kept_up_to_date() {
+    let rig = rig(Limits::default()).await;
+    let running = tether_operator::control::serve(
+        Arc::clone(&rig.operator),
+        &rig.operator.config().socket.clone(),
+    )
+    .await
+    .expect("the control socket should bind");
+
+    let stream = tokio::net::UnixStream::connect(running.path.clone())
+        .await
+        .unwrap();
+    let (read, mut write) = stream.into_split();
+    let mut line = serde_json::to_vec(&json!({"verb": "watch", "args": {"since": 0}})).unwrap();
+    line.push(b'\n');
+    write.write_all(&line).await.unwrap();
+    write.flush().await.unwrap();
+    let mut reader = BufReader::new(read);
+
+    let mut first = String::new();
+    reader.read_line(&mut first).await.unwrap();
+    let opening: Value = serde_json::from_str(&first).unwrap();
+    assert_eq!(opening["type"], "watch.open");
+    assert_eq!(opening["cursor"], 0);
+    assert!(
+        opening["epoch"].as_u64().unwrap() > 0,
+        "a cursor means nothing without the daemon it belongs to"
+    );
+
+    // Everything already recorded arrives without being asked for again.
+    let mut next = String::new();
+    reader.read_line(&mut next).await.unwrap();
+    let event: Value = serde_json::from_str(&next).unwrap();
+    assert_eq!(event["type"], "daemon.started");
+    assert_eq!(event["seq"], 0);
+
+    // And so does what happens after the watcher arrived.
+    rig.operator.handle("status", &json!({})).await.unwrap();
+    let minted = rig.operator.handle("invite", &json!({})).await.unwrap();
+    let slot = minted["slot"].as_u64().unwrap();
+
+    let seen = tokio::time::timeout(Duration::from_secs(5), async {
+        loop {
+            let mut l = String::new();
+            reader.read_line(&mut l).await.unwrap();
+            let e: Value = serde_json::from_str(&l).unwrap();
+            if e["type"] == "session.minted" {
+                return e;
+            }
+        }
+    })
+    .await
+    .expect("the minting should reach a watcher that was already attached");
+
+    assert_eq!(seen["slot"], slot);
+    assert!(seen.get("code").is_none(), "the code is not a fact for subscribers");
+    assert!(seen.get("command").is_none(), "nor is the line that carries it");
+
+    running.stop();
+    rig.stop();
+}

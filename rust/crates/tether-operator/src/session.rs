@@ -34,6 +34,7 @@ use tether_proto::invite::{InviteCode, Phrase, Slot};
 use tokio::sync::{mpsc, oneshot};
 
 use crate::config::{Config, MAX_CAPTURE, RUN_TIMEOUT};
+use crate::journal::{self, Journal};
 
 /// How long the daemon waits for consent once the two ends have paired.
 ///
@@ -113,6 +114,12 @@ pub struct State {
     /// Handshakes that did not check out — in practice, a mistyped phrase.
     /// Each one spends from the relay's pairing budget for this slot.
     pub misses: u32,
+    /// Lines the owner has said, and the most recent one. A summary only: the
+    /// conversation itself lives on the stream. This exists so that `status`,
+    /// the verb that answers when everything else is broken, can still show
+    /// that the person at the other end is trying to say something.
+    pub heard: u32,
+    pub last_said: Option<String>,
     pub ended: Option<String>,
     pub ended_at: Option<Instant>,
 }
@@ -128,6 +135,8 @@ impl State {
             opened: None,
             tasks: 0,
             misses: 0,
+            heard: 0,
+            last_said: None,
             ended: None,
             ended_at: None,
         }
@@ -142,6 +151,8 @@ impl State {
             "open_s": self.opened.map(|t| t.elapsed().as_secs()),
             "tasks": self.tasks,
             "misses": self.misses,
+            "heard": self.heard,
+            "last_said": self.last_said,
             "ended": self.ended,
             "owner": self.owner.as_ref().map(|h| json!({
                 "who": h.who,
@@ -171,29 +182,82 @@ pub struct Session {
     pub state: Arc<Mutex<State>>,
 }
 
+/// One session's two records, carried together.
+///
+/// `status` reads the state; everyone else reads the journal. Bundling them is
+/// what stops the two drifting: a phase change writes to both or to neither,
+/// because there is no way to reach one of them from in here without the other.
+#[derive(Clone)]
+pub struct Track {
+    slot: u32,
+    pub state: Arc<Mutex<State>>,
+    journal: Arc<Journal>,
+}
+
+impl Track {
+    /// Put one event on the stream, already addressed to this session.
+    ///
+    /// Takes the pair a constructor in [`journal`] returns, so the only way to
+    /// record something is to have named it there.
+    fn note(&self, event: (&str, Value)) {
+        self.journal.append(Some(self.slot), event.0, event.1);
+    }
+}
+
 /// Mint a session task for a slot the relay has already issued.
-pub fn spawn(cfg: Arc<Config>, code: InviteCode, seat: String, lifetime: Duration) -> Session {
+pub fn spawn(
+    cfg: Arc<Config>,
+    code: InviteCode,
+    seat: String,
+    lifetime: Duration,
+    journal: Arc<Journal>,
+) -> Session {
     let state = Arc::new(Mutex::new(State::new(&code)));
+    let track = Track {
+        slot: code.slot.get(),
+        state: Arc::clone(&state),
+        journal,
+    };
     let (tx, rx) = mpsc::channel::<Command>(8);
-    tokio::spawn(serve(cfg, code, seat, lifetime, Arc::clone(&state), rx));
+    tokio::spawn(serve(cfg, code, seat, lifetime, track, rx));
     Session { tx, state }
 }
 
-fn set_phase(state: &Arc<Mutex<State>>, phase: Phase) {
-    if let Ok(mut s) = state.lock() {
+fn set_phase(track: &Track, phase: Phase) {
+    let owner = {
+        let Ok(mut s) = track.state.lock() else {
+            return;
+        };
         s.phase = phase;
         if phase == Phase::Open {
             s.opened = Some(Instant::now());
         }
-    }
+        s.owner.as_ref().map(|h| {
+            json!({"who": h.who, "host": h.host, "os": h.os, "build": h.build})
+        })
+    };
+    track.note(journal::session_phase(phase.as_str(), owner, None));
 }
 
-fn finish(state: &Arc<Mutex<State>>, why: impl Into<String>) {
-    if let Ok(mut s) = state.lock() {
+fn finish(track: &Track, why: impl Into<String>) {
+    let why = why.into();
+    let owner = {
+        let Ok(mut s) = track.state.lock() else {
+            return;
+        };
+        // Only the first ending is the ending. Several paths can reach here as
+        // a session comes apart, and the first one is the one that explains it.
+        if s.phase == Phase::Ended {
+            return;
+        }
         s.phase = Phase::Ended;
-        s.ended = Some(why.into());
+        s.ended = Some(why.clone());
         s.ended_at = Some(Instant::now());
-    }
+        s.owner.as_ref().map(|h| {
+            json!({"who": h.who, "host": h.host, "os": h.os, "build": h.build})
+        })
+    };
+    track.note(journal::session_phase("ended", owner, Some(&why)));
 }
 
 async fn serve(
@@ -201,12 +265,12 @@ async fn serve(
     code: InviteCode,
     seat: String,
     lifetime: Duration,
-    state: Arc<Mutex<State>>,
+    track: Track,
     mut rx: mpsc::Receiver<Command>,
 ) {
-    if let Some(mut link) = connect(&cfg, &code, &seat, lifetime, &state, &mut rx).await {
-        if consent(&cfg, &mut link, &state, &mut rx).await {
-            carry(&mut link, &state, &mut rx).await;
+    if let Some(mut link) = connect(&cfg, &code, &seat, lifetime, &track, &mut rx).await {
+        if consent(&cfg, &mut link, &track, &mut rx).await {
+            carry(&mut link, &track, &mut rx).await;
         }
     }
     // Every way a session can end arrives here, and only here. The redial loop
@@ -233,7 +297,7 @@ async fn connect(
     code: &InviteCode,
     seat: &str,
     lifetime: Duration,
-    state: &Arc<Mutex<State>>,
+    track: &Track,
     rx: &mut mpsc::Receiver<Command>,
 ) -> Option<Link> {
     let deadline = Instant::now() + lifetime;
@@ -260,24 +324,29 @@ async fn connect(
                     // likely try again, so wait for them — and count it,
                     // because the relay is counting it too.
                     Ok(Err(LinkError::Handshake(_))) => {
-                        if let Ok(mut s) = state.lock() {
-                            s.misses += 1;
-                        }
+                        let misses = match track.state.lock() {
+                            Ok(mut s) => {
+                                s.misses += 1;
+                                s.misses
+                            }
+                            Err(_) => 0,
+                        };
+                        track.note(journal::session_miss(misses));
                         break;
                     }
                     Ok(Err(e)) => {
-                        finish(state, format!("the session could not be held open: {e}"));
+                        finish(track, format!("the session could not be held open: {e}"));
                         return None;
                     }
                 },
                 command = rx.recv() => match command {
                     None => {
-                        finish(state, "the daemon is shutting down");
+                        finish(track, "the daemon is shutting down");
                         return None;
                     }
                     Some(Command::Cut { reason, reply }) => {
                         let _ = reply.send(Ok(json!({"ok": true, "cut": reason})));
-                        finish(state, reason);
+                        finish(track, reason);
                         return None;
                     }
                     Some(other) => other.refuse(
@@ -288,7 +357,7 @@ async fn connect(
             }
         }
     }
-    finish(state, "nobody redeemed the invite before it expired");
+    finish(track, "nobody redeemed the invite before it expired");
     None
 }
 
@@ -296,12 +365,12 @@ async fn connect(
 async fn consent(
     cfg: &Config,
     link: &mut Link,
-    state: &Arc<Mutex<State>>,
+    track: &Track,
     rx: &mut mpsc::Receiver<Command>,
 ) -> bool {
-    set_phase(state, Phase::Greeting);
+    set_phase(track, Phase::Greeting);
     if let Err(e) = link.send(&Frame::Hello(cfg.hello())).await {
-        finish(state, format!("could not greet the owner: {e}"));
+        finish(track, format!("could not greet the owner: {e}"));
         return false;
     }
 
@@ -312,44 +381,45 @@ async fn consent(
         tokio::select! {
             incoming = link.recv() => match incoming {
                 Ok(Frame::Hello(owner)) => {
-                    if let Ok(mut s) = state.lock() {
+                    if let Ok(mut s) = track.state.lock() {
                         s.owner = Some(owner);
                     }
-                    set_phase(state, Phase::Open);
+                    set_phase(track, Phase::Open);
                     return true;
                 }
                 Ok(Frame::Cut { reason }) => {
-                    finish(state, reason);
+                    finish(track, reason);
                     return false;
                 }
                 Ok(Frame::Say { .. }) | Ok(Frame::Ping { .. }) | Ok(Frame::Pong { .. }) => {}
                 Ok(_) => {
                     let why = "the owner's end sent session traffic before consenting";
                     link.cut(why).await;
-                    finish(state, why);
+                    finish(track, why);
                     return false;
                 }
                 Err(e) => {
-                    finish(state, format!("the owner's end went away while deciding: {e}"));
+                    finish(track, format!("the owner's end went away while deciding: {e}"));
                     return false;
                 }
             },
             command = rx.recv() => match command {
                 None => {
                     link.cut("the operator's daemon is shutting down").await;
-                    finish(state, "the daemon is shutting down");
+                    finish(track, "the daemon is shutting down");
                     return false;
                 }
                 Some(Command::Cut { reason, reply }) => {
                     link.cut(&reason).await;
                     let _ = reply.send(Ok(json!({"ok": true, "cut": reason})));
-                    finish(state, reason);
+                    finish(track, reason);
                     return false;
                 }
                 // Worth allowing, and the reason the owner's side accepts it
                 // before consent: it is how the operator says what they are
                 // about to do, to somebody deciding whether to let them.
                 Some(Command::Say { text, reply }) => {
+                    track.note(journal::operator_said(&text));
                     let sent = link.send(&Frame::Say { text }).await;
                     let _ = reply.send(match sent {
                         Ok(()) => Ok(json!({"ok": true, "said": true})),
@@ -363,7 +433,7 @@ async fn consent(
             _ = &mut waiting => {
                 let why = "nobody answered the prompt at the owner's keyboard";
                 link.cut(why).await;
-                finish(state, why);
+                finish(track, why);
                 return false;
             }
         }
@@ -424,7 +494,7 @@ impl Pending {
 }
 
 /// Carry the open session until either side ends it.
-async fn carry(link: &mut Link, state: &Arc<Mutex<State>>, rx: &mut mpsc::Receiver<Command>) {
+async fn carry(link: &mut Link, track: &Track, rx: &mut mpsc::Receiver<Command>) {
     let mut pending: Option<Pending> = None;
     let mut next_task: TaskId = 1;
     let mut nonce: u64 = 0;
@@ -444,20 +514,47 @@ async fn carry(link: &mut Link, state: &Arc<Mutex<State>>, rx: &mut mpsc::Receiv
         tokio::select! {
             incoming = link.recv() => match incoming {
                 Ok(Frame::Output { task, stream, data }) => {
+                    // One frame can be larger than one event, so a big chunk
+                    // becomes several in order rather than a single record that
+                    // would dominate the ring on its own.
+                    let name = match stream {
+                        Stream::Stdout => "stdout",
+                        Stream::Stderr => "stderr",
+                        Stream::Screen => "screen",
+                    };
+                    for piece in data.chunks(journal::MAX_EVENT_DATA).filter(|c| !c.is_empty()) {
+                        track.note(journal::task_output(task, name, piece));
+                    }
                     if let Some(p) = pending.as_mut().filter(|p| p.task == task) {
                         p.collect(stream, data);
                     }
                 }
                 Ok(Frame::Exit { task, ended }) => {
+                    let (code, signal) = match ended {
+                        Ended::Code(c) => (Some(c), None),
+                        Ended::Signal(n) => (None, Some(n)),
+                    };
+                    track.note(journal::task_exited(task, code, signal));
                     if pending.as_ref().is_some_and(|p| p.task == task) {
                         pending.take().unwrap().answer(ended);
+                    }
+                }
+                // The owner said something. This used to fall into the empty
+                // arm below and be discarded without trace, which made the
+                // frame's own definition — a line from one person to the other
+                // — true in one direction only.
+                Ok(Frame::Say { text }) => {
+                    track.note(journal::owner_said(&text));
+                    if let Ok(mut st) = track.state.lock() {
+                        st.heard += 1;
+                        st.last_said = Some(text);
                     }
                 }
                 Ok(Frame::Cut { reason }) => {
                     if let Some(p) = pending.take() {
                         p.abandon(&format!("the owner ended the session: {reason}"));
                     }
-                    finish(state, reason);
+                    finish(track, reason);
                     return;
                 }
                 Ok(Frame::Ping { nonce }) => {
@@ -470,7 +567,7 @@ async fn carry(link: &mut Link, state: &Arc<Mutex<State>>, rx: &mut mpsc::Receiv
                     if let Some(p) = pending.take() {
                         p.abandon(&format!("the session ended: {e}"));
                     }
-                    finish(state, format!("the owner's end went away: {e}"));
+                    finish(track, format!("the owner's end went away: {e}"));
                     return;
                 }
             },
@@ -481,7 +578,7 @@ async fn carry(link: &mut Link, state: &Arc<Mutex<State>>, rx: &mut mpsc::Receiv
                     if let Some(p) = pending.take() {
                         p.abandon("the daemon shut down while the command was running");
                     }
-                    finish(state, "the daemon is shutting down");
+                    finish(track, "the daemon is shutting down");
                     return;
                 }
                 Some(Command::Cut { reason, reply }) => {
@@ -490,10 +587,11 @@ async fn carry(link: &mut Link, state: &Arc<Mutex<State>>, rx: &mut mpsc::Receiv
                         p.abandon(&format!("the session was cut: {reason}"));
                     }
                     let _ = reply.send(Ok(json!({"ok": true, "cut": reason})));
-                    finish(state, reason);
+                    finish(track, reason);
                     return;
                 }
                 Some(Command::Say { text, reply }) => {
+                    track.note(journal::operator_said(&text));
                     let sent = link.send(&Frame::Say { text }).await;
                     let _ = reply.send(match sent {
                         Ok(()) => Ok(json!({"ok": true, "said": true})),
@@ -511,6 +609,13 @@ async fn carry(link: &mut Link, state: &Arc<Mutex<State>>, rx: &mut mpsc::Receiv
                     }
                     let task = next_task;
                     next_task += 1;
+                    track.note(journal::task_started(
+                        task,
+                        "command",
+                        Some(&command),
+                        120,
+                        40,
+                    ));
                     let opened = link.send(&Frame::Open {
                         task,
                         kind: Kind::Command,
@@ -527,7 +632,7 @@ async fn carry(link: &mut Link, state: &Arc<Mutex<State>>, rx: &mut mpsc::Receiv
                     );
                     match opened {
                         Ok(()) => {
-                            if let Ok(mut s) = state.lock() {
+                            if let Ok(mut s) = track.state.lock() {
                                 s.tasks += 1;
                             }
                             pending = Some(Pending {
@@ -542,7 +647,7 @@ async fn carry(link: &mut Link, state: &Arc<Mutex<State>>, rx: &mut mpsc::Receiv
                         }
                         Err(e) => {
                             let _ = reply.send(Err(e.to_string()));
-                            finish(state, format!("the session ended: {e}"));
+                            finish(track, format!("the session ended: {e}"));
                             return;
                         }
                     }
@@ -570,7 +675,7 @@ async fn carry(link: &mut Link, state: &Arc<Mutex<State>>, rx: &mut mpsc::Receiv
                                    reported how it ended");
                         let why = "the owner's end stopped answering";
                         link.cut(why).await;
-                        finish(state, why);
+                        finish(track, why);
                         return;
                     }
                     None => {}
@@ -589,7 +694,7 @@ async fn carry(link: &mut Link, state: &Arc<Mutex<State>>, rx: &mut mpsc::Receiv
     if let Some(p) = pending.take() {
         p.abandon("the session ended while the command was running");
     }
-    finish(state, "the session ended");
+    finish(track, "the session ended");
 }
 
 /// The one-line command the owner runs. Assembled here because the two halves

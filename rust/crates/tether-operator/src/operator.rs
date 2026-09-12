@@ -26,25 +26,42 @@ use tether_proto::invite::{InviteCode, Phrase, Slot, DEFAULT_WORDS, MAX_WORDS};
 use tokio::sync::{mpsc, oneshot};
 
 use crate::config::Config;
+use crate::journal::{self, Journal};
 use crate::session::{self, Command, Session};
 
 pub struct Operator {
     cfg: Arc<Config>,
     sessions: Mutex<BTreeMap<u32, Session>>,
+    /// Everything that happened, for anyone who asks. Beside the session table
+    /// rather than inside it, because a fact can outlive the session it was
+    /// about and some facts belong to no session at all.
+    journal: Arc<Journal>,
     started: Instant,
 }
 
 impl Operator {
     pub fn new(cfg: Config) -> Arc<Self> {
+        let journal = Arc::new(Journal::new());
+        let (kind, body) = journal::daemon_started(
+            &cfg.build,
+            &cfg.relay.to_string(),
+            cfg.issue_token.is_some(),
+        );
+        journal.append(None, kind, body);
         Arc::new(Self {
             cfg: Arc::new(cfg),
             sessions: Mutex::new(BTreeMap::new()),
+            journal,
             started: Instant::now(),
         })
     }
 
     pub fn config(&self) -> &Config {
         &self.cfg
+    }
+
+    pub fn journal(&self) -> &Arc<Journal> {
+        &self.journal
     }
 
     /// Answer one verb from the control socket.
@@ -126,6 +143,9 @@ impl Operator {
             ),
         });
 
+        let (kind, body) = journal::session_minted(words, lifetime.as_secs());
+        self.journal.append(Some(slot.get()), kind, body);
+
         let session = session::spawn(
             Arc::clone(&self.cfg),
             code,
@@ -133,6 +153,7 @@ impl Operator {
             // Stop waiting when the relay would have expired the slot anyway.
             // Redialling past that point can only be refused.
             lifetime,
+            Arc::clone(&self.journal),
         );
         self.sweep();
         if let Ok(mut table) = self.sessions.lock() {
@@ -161,6 +182,9 @@ impl Operator {
             "can_invite": self.cfg.issue_token.is_some(),
             "uptime_s": self.started.elapsed().as_secs(),
             "socket": self.cfg.socket.display().to_string(),
+            // Where the stream stands, so one call tells a caller both what is
+            // happening and where to start reading about it.
+            "stream": self.journal.head().to_json(),
             "sessions": sessions,
         })
     }
