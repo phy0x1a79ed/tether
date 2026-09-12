@@ -7,11 +7,17 @@
 //!
 //! # What is left behind
 //!
-//! This file, wherever the launcher put it, and nothing else. No key is written
-//! anywhere: every key in the session is derived in memory from the words and
-//! is gone when the process is. Nothing is added to `PATH`, no login item, no
-//! launch agent, no service, no cron. It does not survive a reboot because
-//! nothing asked it to.
+//! This file, wherever the launcher put it, and a record of the session beside
+//! it. Both are named in the prompt before the owner answers, because what is
+//! kept is part of what is being agreed to. Nothing else: no key is written
+//! anywhere, every key in the session being derived in memory from the words
+//! and gone when the process is, and nothing is added to `PATH`, no login item,
+//! no launch agent, no service, no cron.
+//!
+//! Nothing here waits for a reboot to disappear, but do not rely on the reboot.
+//! A temporary directory is where systems put things they clear on their own
+//! schedule, and Windows does not clear its one at all. The launcher prints the
+//! directory; deleting it is one command and needs no waiting.
 
 use std::process::ExitCode;
 
@@ -26,8 +32,9 @@ tether — let someone you trust run commands on this machine, while you watch.
     tether <slot> <word> <word>
 
 The slot and the words are the invite code you were given, typed as plain
-words. Nothing is installed and nothing survives the session. You will be
-asked here, at this keyboard, before anyone gets in.
+words. Nothing is installed. A record of the session is written where the
+prompt will name, for you to keep or delete. You will be asked here, at this
+keyboard, before anyone gets in.
 ";
 
 fn main() -> ExitCode {
@@ -84,13 +91,34 @@ async fn connect(relay: Relay, code: InviteCode) -> Outcome {
         Err(e) => return Outcome::Failed(e.to_string()),
     };
 
+    // Opened before the prompt, so the path it names is a file that already
+    // exists rather than one this intends to make. It takes the slot and never
+    // the code: the phrase is the credential and must not reach a file.
+    let mut log = tether_owner::log::Log::open(code.slot.get())
+        .map_err(|why| format!("no record could be written to {why}"));
+
     let me = me();
-    let operator = match session::greet(&mut link, &relay, &code, &me).await {
+    let operator = match session::greet(&mut link, &relay, &code, &me, &mut log).await {
         Ok(operator) => operator,
-        Err(outcome) => return outcome,
+        Err(outcome) => {
+            // Nobody consented, so there was no session to have a record of.
+            // Otherwise saying no would fill the directory the owner was just
+            // told they could simply delete.
+            if let Ok(log) = log {
+                log.discard();
+            }
+            return outcome;
+        }
     };
 
-    session::run(link, operator, relay.to_string(), code.to_string()).await
+    session::run(
+        link,
+        operator,
+        relay.to_string(),
+        code.to_string(),
+        log.ok(),
+    )
+    .await
 }
 
 /// Who this machine says it is, for the operator's side to show.

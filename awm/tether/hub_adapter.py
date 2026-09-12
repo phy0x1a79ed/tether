@@ -61,7 +61,8 @@ API_MANIFEST: dict[str, Any] = {
         "mint an invite, read the code to the person at the other machine, and "
         "they run one line and answer a prompt before anything connects. They "
         "watch everything you do and either side can cut it. Nothing is "
-        "installed on their machine and nothing survives the session."
+        "installed on their machine. Both sides keep a record of what was "
+        "done, which the owner is shown and agrees to before anything runs."
     ),
     "functions": [
         {

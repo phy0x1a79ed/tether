@@ -32,6 +32,8 @@ use std::time::Instant;
 use crossterm::{cursor, event, execute, queue, style, terminal};
 use tether_proto::frame::{Ended, Hello, Kind, Stream, TaskId};
 
+use crate::log::Log;
+
 /// How much scrollback the transcript keeps.
 const SCROLLBACK: usize = 2000;
 
@@ -109,10 +111,14 @@ pub struct Ui {
     tty: bool,
     cols: u16,
     rows: u16,
+    /// The record both people agreed to. Hung off `line` below rather than off
+    /// the wire, so "what is in the log is what you saw" is true because there
+    /// is one funnel, not because somebody checked.
+    log: Option<Log>,
 }
 
 impl Ui {
-    pub fn new(facts: Facts) -> io::Result<Self> {
+    pub fn new(facts: Facts, log: Option<Log>) -> io::Result<Self> {
         let tty = std::io::IsTerminal::is_terminal(&io::stdout());
         let (cols, rows) = terminal::size().unwrap_or((80, 24));
         let mut ui = Self {
@@ -124,6 +130,7 @@ impl Ui {
             tty,
             cols,
             rows,
+            log,
         };
         if tty {
             terminal::enable_raw_mode()?;
@@ -227,6 +234,9 @@ impl Ui {
     fn line(&mut self, text: String) {
         if !self.tty {
             println!("{text}");
+        }
+        if let Some(log) = self.log.as_mut() {
+            log.line(&text);
         }
         self.transcript.push_back(text);
         while self.transcript.len() > SCROLLBACK {
@@ -353,14 +363,27 @@ impl Ui {
     /// mode with no cursor has left something behind — and leaving nothing
     /// behind is the whole claim.
     pub fn restore(&mut self) {
-        if !self.tty {
-            return;
+        // Closed first, so the record is complete even if the replay below
+        // never happens. It is also the half that matters if this is running
+        // from `Drop` because something panicked.
+        let kept = self.log.as_mut().map(|log| {
+            log.finish();
+            log.path().display().to_string()
+        });
+        self.log = None;
+
+        if self.tty {
+            self.tty = false;
+            let _ = execute!(io::stdout(), terminal::LeaveAlternateScreen, cursor::Show);
+            let _ = terminal::disable_raw_mode();
+            for line in &self.transcript {
+                println!("{line}");
+            }
         }
-        self.tty = false;
-        let _ = execute!(io::stdout(), terminal::LeaveAlternateScreen, cursor::Show);
-        let _ = terminal::disable_raw_mode();
-        for line in &self.transcript {
-            println!("{line}");
+        // The same path the prompt named, as the last thing on their screen.
+        // First and last, so it is not something they have to have remembered.
+        if let Some(path) = kept {
+            println!("  a record of this session is in {path}");
         }
     }
 }

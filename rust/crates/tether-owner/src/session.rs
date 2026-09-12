@@ -22,6 +22,7 @@ use tether_proto::invite::InviteCode;
 use tokio::sync::mpsc;
 
 use crate::consent::{self, Answer, Ask};
+use crate::log::Log;
 use crate::exec::Runner;
 use crate::ui::{self, Event, Facts, Key, Ui};
 
@@ -70,8 +71,9 @@ pub async fn greet(
     relay: &tether_link::Relay,
     code: &InviteCode,
     me: &Hello,
+    log: &mut Result<Log, String>,
 ) -> Result<Hello, Outcome> {
-    let operator = match tokio::time::timeout(GREETING_TIMEOUT, wait_for_hello(link)).await {
+    let operator = match tokio::time::timeout(GREETING_TIMEOUT, wait_for_hello(link, log)).await {
         Ok(Ok(hello)) => hello,
         Ok(Err(outcome)) => return Err(outcome),
         Err(_) => return Err(Outcome::PeerLeft),
@@ -92,10 +94,20 @@ pub async fn greet(
         return Err(Outcome::Failed(why));
     }
 
+    if let Ok(log) = log.as_mut() {
+        log.peer(
+            &operator.who,
+            &operator.host,
+            &operator.os,
+            &operator.build,
+            &relay.to_string(),
+        );
+    }
     let ask = Ask {
         operator: &operator,
         relay,
         code,
+        log: log.as_ref().map(|l| l.path()).map_err(|why| why.as_str()),
     };
     match consent::ask(&ask) {
         Answer::Allowed => {}
@@ -112,13 +124,20 @@ pub async fn greet(
     Ok(operator)
 }
 
-async fn wait_for_hello(link: &mut Link) -> Result<Hello, Outcome> {
+async fn wait_for_hello(link: &mut Link, log: &mut Result<Log, String>) -> Result<Hello, Outcome> {
     loop {
         match link.recv().await {
             Ok(Frame::Hello(hello)) => return Ok(hello),
             // Worth showing: it is how the operator says what they are about to
-            // do, and a person deciding whether to say yes should see it.
-            Ok(Frame::Say { text }) => eprintln!("  them: {text}"),
+            // do, and a person deciding whether to say yes should see it. It is
+            // recorded too, so the account starts at the first thing said
+            // rather than at the moment consent was given.
+            Ok(Frame::Say { text }) => {
+                eprintln!("  them: {text}");
+                if let Ok(log) = log.as_mut() {
+                    log.line(&format!("them: {text}"));
+                }
+            }
             Ok(Frame::Cut { reason }) => return Err(Outcome::Cut(reason)),
             Ok(_) => {
                 let why = "the other end tried to start work before anyone here said yes";
@@ -132,8 +151,14 @@ async fn wait_for_hello(link: &mut Link) -> Result<Hello, Outcome> {
 }
 
 /// Carry the session until either side ends it.
-pub async fn run(mut link: Link, operator: Hello, relay: String, code: String) -> Outcome {
-    let mut ui = match Ui::new(Facts::new(&operator, relay, code)) {
+pub async fn run(
+    mut link: Link,
+    operator: Hello,
+    relay: String,
+    code: String,
+    log: Option<Log>,
+) -> Outcome {
+    let mut ui = match Ui::new(Facts::new(&operator, relay, code), log) {
         Ok(ui) => ui,
         Err(e) => return Outcome::Failed(format!("could not set up the display: {e}")),
     };

@@ -127,11 +127,18 @@ async fn with_nobody_at_the_keyboard_the_answer_is_no() {
     });
     tokio::time::sleep(Duration::from_millis(50)).await;
 
+    // Somewhere of its own to write a record, so that finding none afterwards
+    // means none was written rather than that it went elsewhere.
+    let records = std::env::temp_dir().join(format!("tether-refused-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&records);
+    std::fs::create_dir_all(&records).unwrap();
+
     let mut command = tokio::process::Command::new(setsid);
     command
         .arg(binary())
         .arg(slot.to_string())
         .env("TETHER_RELAY", format!("http://{}", running.addr))
+        .env("TETHER_LOG_DIR", &records)
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped());
@@ -166,5 +173,17 @@ async fn with_nobody_at_the_keyboard_the_answer_is_no() {
         ),
         None => panic!("the owner's side consented with nobody at the keyboard"),
     }
+
+    // Nobody consented, so there was no session to have a record of. Otherwise
+    // saying no would fill the directory the owner was told they could delete.
+    let left: Vec<_> = std::fs::read_dir(&records)
+        .unwrap()
+        .filter_map(|e| e.ok().map(|e| e.file_name()))
+        .collect();
+    assert!(
+        left.is_empty(),
+        "a session nobody agreed to left something behind: {left:?}"
+    );
+    let _ = std::fs::remove_dir_all(&records);
     running.stop();
 }

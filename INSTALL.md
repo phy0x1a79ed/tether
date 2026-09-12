@@ -159,6 +159,15 @@ its own address:
 
 The launcher fetches the client for that machine, runs it, and stops. It sets
 up no PATH entry, no login item, no launch agent, no service, and no cron. The
-only residue is one downloaded file, in a directory of its own under the
-temporary directory. The launcher prints that file's full path before running
-it, so the owner can delete it without hunting for it.
+residue is one directory of its own under the temporary directory, holding the
+downloaded client and the record of the session written beside it. The launcher
+prints that directory before running anything, and the consent prompt names the
+record again before the owner answers.
+
+Two different claims live here and only the first was ever the promise. **No
+session survives its process**: nothing reconnects, nothing is scheduled,
+nothing starts at boot, and killing the client ends the session at both ends.
+**Both people keep an account of what was done**: the owner's beside their
+client, the operator's under this service's state directory. The second is new
+and is a consent improvement rather than an erosion of the first — the owner
+watched it happen, so a record of it is not a secret being kept from them.

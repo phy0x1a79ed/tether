@@ -58,6 +58,11 @@ pub struct Ask<'a> {
     pub operator: &'a Hello,
     pub relay: &'a Relay,
     pub code: &'a InviteCode,
+    /// Where the record of this session is being written, or why there will
+    /// not be one. Named before the answer because it is part of what is being
+    /// agreed to: this prompt used to say nothing survives the session, and a
+    /// log on their disk is precisely a thing that survives it.
+    pub log: Result<&'a std::path::Path, &'a str>,
 }
 
 impl fmt::Display for Ask<'_> {
@@ -71,6 +76,10 @@ impl fmt::Display for Ask<'_> {
         writeln!(f, "  through  {}", self.relay)?;
         writeln!(f, "  code     {}", self.code)?;
         writeln!(f, "  build    {}", op.build)?;
+        match self.log {
+            Ok(path) => writeln!(f, "  log      {}", path.display())?,
+            Err(why) => writeln!(f, "  log      none — {why}")?,
+        }
         writeln!(f)?;
         writeln!(
             f,
@@ -78,9 +87,18 @@ impl fmt::Display for Ask<'_> {
         )?;
         writeln!(
             f,
-            "  see everything they do while it happens. Nothing is installed"
+            "  see everything they do while it happens. Nothing is installed."
         )?;
-        writeln!(f, "  and nothing survives this session.")?;
+        match self.log {
+            Ok(_) => {
+                writeln!(f, "  What is kept is the log named above — everything you see,")?;
+                writeln!(f, "  on this machine only, for you to read or delete afterwards.")?;
+            }
+            Err(_) => {
+                writeln!(f, "  Nothing will be kept: there will be no record of this")?;
+                writeln!(f, "  beyond what is on your screen while it happens.")?;
+            }
+        }
         writeln!(f)?;
         write!(f, "  Let them in? [y/N] ")
     }
@@ -196,14 +214,16 @@ mod tests {
     }
 
     #[test]
-    fn the_prompt_names_the_four_things_worth_knowing() {
+    fn the_prompt_names_the_five_things_worth_knowing() {
         let relay = Relay::parse("https://nexus.tony-xy-liu.com/tether").unwrap();
         let code = InviteCode::parse(&["7", "anchor", "kettle"]).unwrap();
         let operator = hello();
+        let log = std::path::Path::new("/tmp/tether.4kPq2x/tether-session.log");
         let text = Ask {
             operator: &operator,
             relay: &relay,
             code: &code,
+            log: Ok(log),
         }
         .to_string();
 
@@ -214,6 +234,12 @@ mod tests {
         assert!(text.contains("nexus.tony-xy-liu.com/tether"));
         // The code being redeemed.
         assert!(text.contains("7 anchor kettle"));
+        // Where the record of it will be, verbatim, so they can find the file
+        // by reading the prompt rather than by hunting for it afterwards.
+        assert!(
+            text.contains("/tmp/tether.4kPq2x/tether-session.log"),
+            "{text}"
+        );
         // And that the default is no.
         assert!(text.contains("[y/N]"));
     }
@@ -223,13 +249,35 @@ mod tests {
         let relay = Relay::parse("https://example.test").unwrap();
         let code = InviteCode::parse(&["3", "anchor", "kettle"]).unwrap();
         let operator = hello();
+        let log = std::path::Path::new("/tmp/tether.x/tether-session.log");
         let text = Ask {
             operator: &operator,
             relay: &relay,
             code: &code,
+            log: Ok(log),
         }
         .to_string();
         assert!(text.contains("run commands on this machine"));
         assert!(text.contains("see everything they do"));
+        // The sentence this prompt used to end on. A log on their disk makes
+        // it untrue, and it is the sentence they are agreeing to.
+        assert!(!text.contains("nothing survives"), "{text}");
+    }
+
+    #[test]
+    fn the_prompt_says_so_when_there_will_be_no_record() {
+        let relay = Relay::parse("https://example.test").unwrap();
+        let code = InviteCode::parse(&["3", "anchor", "kettle"]).unwrap();
+        let operator = hello();
+        let text = Ask {
+            operator: &operator,
+            relay: &relay,
+            code: &code,
+            log: Err("/tmp is read-only"),
+        }
+        .to_string();
+        assert!(text.contains("log      none — /tmp is read-only"), "{text}");
+        assert!(text.contains("Nothing will be kept"), "{text}");
+        assert!(!text.contains("What is kept is the log"), "{text}");
     }
 }

@@ -189,38 +189,80 @@ async fn operate(invite: Invite, plan: Plan, keystrokes: Option<&'static str>) -
 
 /// The owner's side, exactly as the binary runs it.
 async fn own(invite: Invite) -> Outcome {
+    own_and_record(invite).await.0
+}
+
+/// The same, and where the record of it went.
+async fn own_and_record(invite: Invite) -> (Outcome, Option<std::path::PathBuf>) {
+    log_into_a_directory_of_our_own();
     let me = hello(Role::Owner, "the owner");
     let mut link = match Link::dial_owner(&invite.relay, &invite.code).await {
         Ok(link) => link,
-        Err(e) => return Outcome::Failed(e.to_string()),
+        Err(e) => return (Outcome::Failed(e.to_string()), None),
     };
-    let operator = match session::greet(&mut link, &invite.relay, &invite.code, &me).await {
+    let mut log = tether_owner::log::Log::open(invite.code.slot.get())
+        .map_err(|why| format!("no record could be written to {why}"));
+    let path = log.as_ref().ok().map(|l| l.path().to_path_buf());
+    let operator = match session::greet(&mut link, &invite.relay, &invite.code, &me, &mut log).await
+    {
         Ok(operator) => operator,
-        Err(outcome) => return outcome,
+        Err(outcome) => {
+            if let Ok(log) = log {
+                log.discard();
+            }
+            return (outcome, path);
+        }
     };
-    session::run(
+    let outcome = session::run(
         link,
         operator,
         invite.relay.to_string(),
         invite.code.slot.to_string(),
+        log.ok(),
     )
-    .await
+    .await;
+    (outcome, path)
+}
+
+/// Keep every record this test binary writes in one place of its own.
+///
+/// Without it they land beside the test runner, which is a build directory
+/// nobody expects to fill up. Set once for the process; the names within it are
+/// already distinct, so parallel tests do not collide.
+fn log_into_a_directory_of_our_own() {
+    use std::sync::Once;
+    static ONCE: Once = Once::new();
+    ONCE.call_once(|| {
+        let dir = std::env::temp_dir().join(format!("tether-logs-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        std::env::set_var("TETHER_LOG_DIR", &dir);
+    });
 }
 
 /// Run both halves against each other and hand back what each saw.
 async fn session(invite: Invite, plan: Plan, keystrokes: Option<&'static str>) -> (Seen, Outcome) {
+    let (seen, outcome, _) = session_and_record(invite, plan, keystrokes).await;
+    (seen, outcome)
+}
+
+/// The same, and where the owner's record of it went.
+async fn session_and_record(
+    invite: Invite,
+    plan: Plan,
+    keystrokes: Option<&'static str>,
+) -> (Seen, Outcome, Option<std::path::PathBuf>) {
     // The operator takes its chair first, which is the real order: the invite
     // exists because the operator asked for it.
     let operator = tokio::spawn(operate(invite.clone(), plan, keystrokes));
     tokio::time::sleep(Duration::from_millis(50)).await;
 
-    let outcome = tokio::time::timeout(Duration::from_secs(30), own(invite))
+    let (outcome, record) = tokio::time::timeout(Duration::from_secs(30), own_and_record(invite))
         .await
         .expect("the owner's session should finish rather than hang");
     let seen = operator
         .await
         .expect("the operator's side should not panic");
-    (seen, outcome)
+    (seen, outcome, record)
 }
 
 #[tokio::test(flavor = "multi_thread")]
@@ -340,5 +382,49 @@ async fn a_wrong_phrase_is_refused_by_the_peer_and_not_by_the_relay() {
         other => panic!("a wrong phrase must not open a session: {other:?}"),
     }
     let _ = operator.await;
+    running.stop();
+}
+
+/// The record the consent prompt now promises, checked rather than asserted.
+///
+/// It has to hold what the owner watched go past, and it must not hold the one
+/// thing on their screen that is a credential — the invite code sits in the
+/// header line, redrawn every second, which is exactly why the logger is told a
+/// slot and never a code.
+#[tokio::test(flavor = "multi_thread")]
+async fn the_record_is_what_the_owner_saw_and_never_the_phrase() {
+    let (running, invite) = rendezvous().await;
+    let words: Vec<String> = invite
+        .code
+        .phrase
+        .words()
+        .iter()
+        .map(|w| w.to_string())
+        .collect();
+
+    let (_, _, record) = session_and_record(
+        invite,
+        Plan::Run {
+            kind: Kind::Command,
+            command: Some("printf 'the disk is fine\n'; exit 0".into()),
+        },
+        None,
+    )
+    .await;
+
+    let path = record.expect("a consented session writes a record");
+    let text = std::fs::read_to_string(&path).expect("and the file is there afterwards");
+
+    assert!(text.contains("tether session log"), "{text}");
+    assert!(text.contains("the disk is fine"), "the output is in it: {text}");
+    assert!(text.contains("printf"), "and so is what was asked for: {text}");
+    assert!(text.contains("ended     "), "and how long it ran: {text}");
+
+    for word in words {
+        assert!(
+            !text.contains(&word),
+            "the record leaked the phrase word {word:?}"
+        );
+    }
     running.stop();
 }

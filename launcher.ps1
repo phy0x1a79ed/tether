@@ -6,8 +6,9 @@
 # can run the script served at the mount itself. It fetches the client for this
 # machine, runs it with whatever followed the call, and stops. Nothing is
 # installed: no PATH entry, no startup item, no scheduled task, no service. What
-# is left behind is one file under the temporary directory, named below before
-# it runs, so the owner can delete it without looking for it.
+# is left behind is this directory: the client, and the record of the session
+# written beside it. The directory is named below before anything runs, and the
+# record is named again in the prompt before the owner answers it.
 #
 # # Why the line is shaped like that
 #
@@ -79,7 +80,8 @@ if (-not (Test-Path $bin) -or (Get-Item $bin).Length -eq 0) {
 # they can see it.
 try { Unblock-File -Path $bin } catch {}
 
-Write-Host "tether: running $bin - delete it when you are done."
+Write-Host "tether: running $bin"
+Write-Host "tether: delete $dir when you are done - the client and its log are in it."
 
 & $bin @code
 exit $LASTEXITCODE

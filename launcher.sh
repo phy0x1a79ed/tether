@@ -7,8 +7,9 @@
 # whole address there is. It fetches the client for this machine, runs it with
 # whatever followed `bash -s`, and stops. Nothing is installed: no PATH entry,
 # no login item, no launch agent, no service, no cron. What is left behind is
-# one file in the temporary directory, named below before it runs, so the owner
-# can delete it without looking for it.
+# this directory: the client, and the record of the session written beside it.
+# The directory is named below before anything runs, and the record is named
+# again in the prompt before the owner answers it.
 #
 # # Why there is no checksum here
 #
@@ -69,7 +70,8 @@ if [ "$os" = macos ] && command -v xattr >/dev/null 2>&1; then
     xattr -d com.apple.quarantine "$bin" 2>/dev/null || true
 fi
 
-echo "tether: running $bin — delete it when you are done." >&2
+echo "tether: running $bin" >&2
+echo "tether: delete $dir when you are done — the client and its log are in it." >&2
 
 # `exec`, so the client inherits this terminal directly. The consent prompt
 # reads the controlling terminal rather than standard input precisely because

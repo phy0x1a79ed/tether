@@ -114,7 +114,7 @@ def test_the_shipper_ships_both_launchers_where_the_relay_looks():
     assert '&["tether.ps1"]' in served
 
 
-def test_the_launcher_installs_nothing_and_says_where_it_left_the_one_file():
+def test_the_launcher_installs_nothing_and_says_what_it_left_behind():
     """Four promises this scope makes, checked against the script that would
     be the place to break them."""
     text = LAUNCHER.read_text()
@@ -124,7 +124,10 @@ def test_the_launcher_installs_nothing_and_says_where_it_left_the_one_file():
     # It runs the client in place of itself, so the terminal reaches the
     # consent prompt directly rather than through a wrapper.
     assert re.search(r'^exec "\$bin" "\$@"$', text, re.M)
-    assert "delete it when you are done" in text
+    # It names the whole directory rather than the client alone. There are two
+    # files in it now — the client and the session record — and telling the
+    # owner to delete one of them would leave the other.
+    assert "delete $dir when you are done" in text
 
 
 def test_the_powershell_launcher_installs_nothing_either():
@@ -137,4 +140,4 @@ def test_the_powershell_launcher_installs_nothing_either():
     # session is a non-zero exit on Windows as it is everywhere else.
     assert re.search(r"^& \$bin @code$", text, re.M)
     assert re.search(r"^exit \$LASTEXITCODE$", text, re.M)
-    assert "delete it when you are done" in text
+    assert "delete $dir when you are done" in text
