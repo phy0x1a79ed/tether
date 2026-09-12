@@ -143,7 +143,7 @@ struct Chat {
 impl Ui {
     pub fn new(facts: Facts, log: Option<Log>) -> io::Result<Self> {
         let tty = std::io::IsTerminal::is_terminal(&io::stdout());
-        let (cols, rows) = terminal::size().unwrap_or((80, 24));
+        let (cols, rows) = measure();
         let mut ui = Self {
             facts,
             started: Instant::now(),
@@ -330,10 +330,9 @@ impl Ui {
         if !self.tty {
             return Ok(());
         }
-        if let Ok((cols, rows)) = terminal::size() {
-            if (cols, rows) != (self.cols, self.rows) {
-                self.resized(cols, rows);
-            }
+        let (cols, rows) = measure();
+        if (cols, rows) != (self.cols, self.rows) {
+            self.resized(cols, rows);
         }
         let plan = layout::split(self.cols, self.rows);
         let mut out = io::stdout();
@@ -688,6 +687,20 @@ impl Ui {
 }
 
 /// Pad or cut a line to the terminal's width.
+/// How big the owner's terminal is, with a usable answer when it will not say.
+///
+/// A pseudo-terminal whose window size was never set reports zero, and a
+/// zero-width display draws nothing at all. That is not a small screen, it is a
+/// blank one, and it looks exactly like a client that failed to start. Seen for
+/// real on a session opened without a window size, where the whole display
+/// repainted two empty rows about once a second.
+fn measure() -> (u16, u16) {
+    match terminal::size() {
+        Ok((cols, rows)) if cols > 0 && rows > 0 => (cols, rows),
+        _ => (80, 24),
+    }
+}
+
 /// Write one line into one region, and put the terminal back afterwards.
 ///
 /// The only way anything but the grid reaches the screen. A region pads itself

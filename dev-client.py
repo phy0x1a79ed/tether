@@ -149,7 +149,9 @@ def main() -> None:
         return
 
     if verb == "shell":
-        answer = ask(path, "shell", {"cols": 120, "rows": 40} if not arg else {"command": arg})
+        # No size unless one was asked for, so the daemon uses the size the
+        # owner said they can see rather than a number chosen here.
+        answer = ask(path, "shell", {"command": arg} if arg else {})
         die(answer)
         print(f"terminal open as task {answer['task']} "
               f"({answer['cols']}x{answer['rows']}) — type at it with "
@@ -170,13 +172,16 @@ def main() -> None:
         return
 
     if verb in {"close", "tasks", "status", "say", "cut"}:
-        args = {
-            "close": {"task": int(arg)} if arg else {},
-            "tasks": {},
-            "status": {},
-            "say": {"text": arg},
-            "cut": {"reason": arg or "the session is over"},
-        }[verb]
+        # Built for the one verb being run. A table of every case, evaluated
+        # eagerly, ran `int(arg)` on a sentence somebody was trying to say.
+        if verb == "close":
+            args = {"task": int(arg)} if arg else {}
+        elif verb == "say":
+            args = {"text": arg}
+        elif verb == "cut":
+            args = {"reason": arg or "the session is over"}
+        else:
+            args = {}
         answer = ask(path, "send" if verb == "say" else verb, args)
         print(json.dumps(answer, indent=4, sort_keys=True))
         return

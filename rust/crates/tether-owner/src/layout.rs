@@ -203,9 +203,27 @@ mod tests {
         }
     }
 
+    /// A terminal reporting nothing is a real case — a pseudo-terminal whose
+    /// window size was never set — and the display substitutes a usable size
+    /// before it gets here, because drawing nothing looks like a crash rather
+    /// than a small window. This only asserts the degenerate input does not
+    /// panic or invent a chat pane.
+    #[test]
+    fn a_size_of_zero_is_answered_rather_than_panicked_on() {
+        for (cols, rows) in [(0u16, 0u16), (0, 24), (80, 0), (1, 1)] {
+            let l = split(cols, rows);
+            assert_eq!(l.shape, Shape::NoChat, "at {cols}x{rows}");
+            assert!(l.chat.is_none());
+            assert!(l.input.is_none());
+        }
+    }
+
+    /// Three rows is the floor for the claim, because a header, a body and a
+    /// footer are three things and they cannot be placed in fewer. Below it the
+    /// display substitutes a real size rather than trying.
     #[test]
     fn nothing_is_ever_drawn_off_the_bottom_or_the_right() {
-        for cols in [10u16, 24, 40, 61, 80, 200] {
+        for cols in [1u16, 10, 24, 40, 61, 80, 200] {
             for rows in [3u16, 5, 8, 10, 24, 60] {
                 let l = split(cols, rows);
                 for rect in [Some(l.work), l.chat, l.input, Some(l.footer)]
