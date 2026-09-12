@@ -74,7 +74,7 @@ impl Operator {
                 let limit_s = match args.get("limit_s") {
                     None | Some(Value::Null) => None,
                     Some(v) => Some(
-                        v.as_u64()
+                        whole(v)
                             .ok_or_else(|| "`limit_s` must be a whole number".to_string())?,
                     ),
                 };
@@ -340,20 +340,33 @@ fn optional(args: &Value, key: &str) -> Option<String> {
 fn maybe_size(args: &Value, key: &str) -> Result<Option<u16>, String> {
     match args.get(key) {
         None | Some(Value::Null) => Ok(None),
-        Some(v) => v
-            .as_u64()
+        Some(v) => whole(v)
             .and_then(|n| u16::try_from(n).ok())
             .map(Some)
             .ok_or_else(|| format!("`{key}` must be a whole number")),
     }
 }
 
+/// A whole number, however the caller happened to encode it.
+///
+/// The generated CLI renders a manifest `number` as a float, so `--task 1`
+/// arrives as JSON `1.0`. Accepting only integers made every numeric argument
+/// unusable from `awm tether ...` while working perfectly from anything that
+/// sends real integers — which is the kind of gap that cannot show up until the
+/// surface is real, and did not until the first `--task` was typed at it.
+fn whole(v: &Value) -> Option<u64> {
+    if let Some(n) = v.as_u64() {
+        return Some(n);
+    }
+    let f = v.as_f64()?;
+    (f.is_finite() && f >= 0.0 && f.fract() == 0.0).then_some(f as u64)
+}
+
 /// A whole number that fits a terminal dimension or a task id.
 fn size(args: &Value, key: &str, fallback: u16) -> Result<u16, String> {
     match args.get(key) {
         None | Some(Value::Null) => Ok(fallback),
-        Some(v) => v
-            .as_u64()
+        Some(v) => whole(v)
             .and_then(|n| u16::try_from(n).ok())
             .ok_or_else(|| format!("`{key}` must be a whole number")),
     }
@@ -402,8 +415,7 @@ fn unbase64(s: &str) -> Option<Vec<u8>> {
 fn count(args: &Value, key: &str, fallback: usize) -> Result<usize, String> {
     match args.get(key) {
         None | Some(Value::Null) => Ok(fallback),
-        Some(v) => v
-            .as_u64()
+        Some(v) => whole(v)
             .and_then(|n| usize::try_from(n).ok())
             .ok_or_else(|| format!("`{key}` must be a whole number")),
     }
@@ -453,6 +465,26 @@ mod tests {
     async fn an_unknown_verb_names_the_ones_that_exist() {
         let err = operator().handle("sudo", &json!({})).await.unwrap_err();
         assert!(err.contains("status"), "{err}");
+    }
+
+    /// The generated CLI renders a manifest `number` as a float, so `--task 1`
+    /// arrives as `1.0`. Reading only integers made every numeric argument
+    /// unusable from `awm tether ...` while working fine from anything sending
+    /// real integers, which is why it survived until somebody typed one.
+    #[test]
+    fn a_whole_number_is_whole_however_it_was_encoded() {
+        assert_eq!(whole(&json!(1)), Some(1));
+        assert_eq!(whole(&json!(1.0)), Some(1));
+        assert_eq!(whole(&json!(120.0)), Some(120));
+        assert_eq!(whole(&json!(0)), Some(0));
+        // Still not whole numbers.
+        assert_eq!(whole(&json!(1.5)), None);
+        assert_eq!(whole(&json!(-1)), None);
+        assert_eq!(whole(&json!("1")), None);
+        assert_eq!(whole(&json!(null)), None);
+
+        assert_eq!(size(&json!({"cols": 80.0}), "cols", 120), Ok(80));
+        assert_eq!(count(&json!({"words": 3.0}), "words", 2), Ok(3));
     }
 
     #[tokio::test]
