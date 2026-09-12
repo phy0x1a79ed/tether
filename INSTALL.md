@@ -141,10 +141,25 @@ the registration handshake carries no token.
 The child dies with this process, which is deliberate. A tether that outlived
 its supervisor would be the persistence this tool refuses to have.
 
-Run `awm tether --help` for the verbs. Two of them answer locally rather than
-reaching the daemon, because they are the two that have to work when the daemon
-is the thing that is wrong: `status` reports the child's process state before
-merging whatever the daemon says, and `logs` reads the file.
+Run `awm tether --help` for the verbs. Three of them answer locally rather than
+reaching the daemon, because they are the three that have to work when the
+daemon is the thing that is wrong: `status` reports the child's process state
+before merging whatever the daemon says, `logs` reads the file, and `drain`
+reads this host's own buffer of what the session did.
+
+One shape is worth knowing before reading the list. **Asking is a call and
+hearing back is a stream.** `run` and `shell` start something and answer with a
+task id immediately; the output, the exit and anything either person said arrive
+as events. Read them with `drain`, which with no cursor means "what is new since
+I last asked" and remembers that per caller, or follow them live on the
+service's `session` topic.
+
+That costs a caller two steps where there used to be one, and buys three things
+it could not have before: starting something long without holding a socket open
+for it, more than one task at a time, and a second reader seeing the same
+session as the first. `tether-dev.sh` does the second step for you, which is
+where the convenience belongs — bending the verbs to suit a terminal would have
+cost the rest.
 
 ## The owner's side installs nothing
 

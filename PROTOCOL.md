@@ -41,6 +41,15 @@ One set of words, used in the code, the verbs, the interface and these docs.
 handshake would drift, and a handshake that drifts fails as a wrong invite code
 rather than as a version mismatch.
 
+The operator's daemon keeps a journal of what each session did — every task, its
+output, how it ended, and both sides of the conversation — numbered across the
+daemon and stamped with an epoch it mints at startup. The epoch is what a reader
+needs to know that a cursor from before a restart names nothing. Its `watch`
+verb streams that journal and is the one request on the control socket that does
+not answer and stop. Nothing in the journal carries the phrase: events are
+addressed by slot, and the module that builds them will not name the types that
+hold the secret.
+
 ## A session, in order
 
 1. The operator's daemon posts to `/issue` with the bearer. The relay returns a
