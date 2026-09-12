@@ -1,11 +1,18 @@
 //! The invite code: the whole credential, in a form a person can say out loud.
 //!
-//! A code is a **slot** and a **phrase**, written as plain tokens with nothing
+//! A code is a **slot** and a **phrase**, written as plain words with nothing
 //! to quote or punctuate:
 //!
 //! ```text
-//! 7 anchor kettle
+//! acre anchor kettle
 //! ```
+//!
+//! Every token is a word, including the slot. The slot is a number underneath
+//! and travels as one in a URL, but a number read aloud beside two words
+//! invites the question of what it is for, and it is the part a person is most
+//! likely to garble. So it is spoken as the word at its own index in the same
+//! vocabulary, and position alone says which word is which: the first names
+//! the session, the rest are the secret.
 //!
 //! The two halves are secret in opposite ways, and keeping them apart is the
 //! reason the design is safe at this size.
@@ -30,6 +37,11 @@
 //! Raising the word count costs the minting side one constant and costs the
 //! owner one more word to read, because the launcher takes tokens as ordinary
 //! arguments.
+//!
+//! Naming the slot with a word does not change any of that arithmetic. The
+//! slot word is public, it is chosen by the relay rather than drawn, and the
+//! phrase words are drawn independently of it, so the secret is twenty bits
+//! before and after.
 
 use std::fmt;
 
@@ -49,12 +61,14 @@ pub const MAX_SLOT: u32 = 999;
 
 #[derive(Debug, thiserror::Error, PartialEq, Eq)]
 pub enum InviteError {
-    #[error("an invite code is a slot then {DEFAULT_WORDS} or more words, like `7 anchor kettle`")]
+    #[error("an invite code is {} words, like `acre anchor kettle`", DEFAULT_WORDS + 1)]
     TooFewTokens,
     #[error("that is more than {MAX_WORDS} words")]
     TooManyWords,
     #[error("`{0}` is not a slot number")]
     BadSlot(String),
+    #[error("`{0}` does not name a session — it is the first word of a code that says which")]
+    NotASlotWord(String),
     #[error("slot {0} is out of range")]
     SlotOutOfRange(u32),
     #[error("`{0}` is not one of the invite words")]
@@ -75,6 +89,29 @@ impl Slot {
 
     pub fn get(self) -> u32 {
         self.0
+    }
+
+    /// The word this slot is read aloud as.
+    ///
+    /// The word at the slot's own index in the invite vocabulary, which is why
+    /// [`MAX_SLOT`] has to stay below the length of that list.
+    pub fn word(self) -> &'static str {
+        WORDS[self.0 as usize]
+    }
+
+    /// Read the first word of a code back into the slot it names.
+    ///
+    /// A word the vocabulary does not have, or one whose index is no slot, is
+    /// refused here rather than dialled. Saying the three words in the wrong
+    /// order usually names some other session instead, and that fails at the
+    /// relay in the ordinary way, with the ordinary message about a code that
+    /// is not live.
+    pub fn from_word(s: &str) -> Result<Self, InviteError> {
+        let w = s.trim().to_ascii_lowercase();
+        match WORDS.binary_search(&w.as_str()) {
+            Ok(i) if (1..=MAX_SLOT as usize).contains(&i) => Ok(Self(i as u32)),
+            _ => Err(InviteError::NotASlotWord(w)),
+        }
     }
 
     /// Parse a slot out of a URL path segment.
@@ -196,18 +233,23 @@ pub struct InviteCode {
 }
 
 impl InviteCode {
-    /// Read the tokens the launcher was invoked with: slot first, then words.
+    /// Read the words the launcher was invoked with: the session, then the
+    /// secret.
+    ///
+    /// The floor is the whole code. Accepting fewer would read the first
+    /// secret word as the session and quietly halve the entropy, which is the
+    /// one mistake here that nothing downstream could notice.
     pub fn parse<S: AsRef<str>>(tokens: &[S]) -> Result<Self, InviteError> {
         let tokens: Vec<&str> = tokens
             .iter()
             .map(|t| t.as_ref().trim())
             .filter(|t| !t.is_empty())
             .collect();
-        if tokens.len() < 2 {
+        if tokens.len() < 1 + DEFAULT_WORDS {
             return Err(InviteError::TooFewTokens);
         }
         Ok(Self {
-            slot: Slot::parse(tokens[0])?,
+            slot: Slot::from_word(tokens[0])?,
             phrase: Phrase::parse(&tokens[1..])?,
         })
     }
@@ -215,7 +257,7 @@ impl InviteCode {
 
 impl fmt::Display for InviteCode {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        write!(f, "{} {}", self.slot, self.phrase)
+        write!(f, "{} {}", self.slot.word(), self.phrase)
     }
 }
 
@@ -339,9 +381,9 @@ mod tests {
 
     #[test]
     fn a_code_reads_back_the_way_it_was_read_out() {
-        let code = InviteCode::parse(&["7", "anchor", "kettle"]).unwrap();
+        let code = InviteCode::parse(&["  ACRE ", "Anchor", "kettle"]).unwrap();
         assert_eq!(code.slot.get(), 7);
-        assert_eq!(code.to_string(), "7 anchor kettle");
+        assert_eq!(code.to_string(), "acre anchor kettle");
     }
 
     #[test]
@@ -354,15 +396,45 @@ mod tests {
         }
     }
 
+    /// Every slot the relay can issue has a word, and every word reads back to
+    /// the slot it came from. A gap anywhere in that range is a session nobody
+    /// can be invited to.
     #[test]
-    fn a_code_without_a_slot_is_refused_rather_than_guessed_at() {
+    fn every_slot_the_relay_can_issue_can_be_said_and_heard() {
+        for n in 1..=MAX_SLOT {
+            let slot = Slot::new(n).unwrap();
+            assert_eq!(Slot::from_word(slot.word()).unwrap(), slot, "slot {n}");
+        }
+    }
+
+    #[test]
+    fn a_word_that_names_no_session_is_refused_rather_than_dialled() {
+        // Past the end of the slot range, and so a phrase word only.
         assert_eq!(
-            InviteCode::parse(&["anchor", "kettle"]).unwrap_err(),
-            InviteError::BadSlot("anchor".into())
+            Slot::from_word("zodiac").unwrap_err(),
+            InviteError::NotASlotWord("zodiac".into())
         );
         assert_eq!(
-            InviteCode::parse(&["7"]).unwrap_err(),
-            InviteError::TooFewTokens
+            Slot::from_word("quokka").unwrap_err(),
+            InviteError::NotASlotWord("quokka".into())
+        );
+    }
+
+    /// The failure this shape makes possible: two words would parse, with the
+    /// session word eating one of the secret ones, and twenty bits would
+    /// silently become ten.
+    #[test]
+    fn a_code_short_of_its_words_is_refused_rather_than_guessed_at() {
+        for short in [vec!["acre", "anchor"], vec!["acre"], vec![]] {
+            assert_eq!(
+                InviteCode::parse(&short).unwrap_err(),
+                InviteError::TooFewTokens,
+                "{short:?}"
+            );
+        }
+        assert_eq!(
+            InviteCode::parse(&["7", "anchor", "kettle"]).unwrap_err(),
+            InviteError::NotASlotWord("7".into())
         );
     }
 }

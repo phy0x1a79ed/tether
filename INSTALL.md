@@ -165,12 +165,12 @@ cost the rest.
 
 The owner runs one line and holds no key material:
 
-    curl -fsSL https://nexus.tony-xy-liu.com/tether | bash -s 7 anchor kettle
+    curl -fsSL https://nexus.tony-xy-liu.com/tether | bash -s acre anchor kettle
 
 Windows has no shell that can run that script, so it has its own launcher at
 its own address:
 
-    & ([scriptblock]::Create((irm https://nexus.tony-xy-liu.com/tether/win))) 7 anchor kettle
+    & ([scriptblock]::Create((irm https://nexus.tony-xy-liu.com/tether/win))) acre anchor kettle
 
 The launcher fetches the client for that machine, runs it, and stops. It sets
 up no PATH entry, no login item, no launch agent, no service, and no cron. The

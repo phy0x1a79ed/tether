@@ -78,8 +78,10 @@ API_MANIFEST: dict[str, Any] = {
             ),
             "params": [
                 {"name": "words", "type": "number",
-                 "description": "How many words in the code (default 2). More "
-                                "words cost the owner nothing to type."},
+                 "description": "How many secret words in the code (default "
+                                "2), on top of the word that names the "
+                                "session. More words cost the owner nothing to "
+                                "type."},
             ],
             "timeout": 60,
         },
@@ -109,9 +111,9 @@ API_MANIFEST: dict[str, Any] = {
                 {"name": "command", "type": "string",
                  "description": "The command to run."},
                 {"name": "code", "type": "string",
-                 "description": "Which session, named by its slot — the first "
-                                "number of the invite code. Omit when only one "
-                                "is live."},
+                 "description": "Which session, named by its slot — the "
+                                "number in `status`, or the first word of the "
+                                "invite code. Omit when only one is live."},
                 {"name": "limit_s", "type": "number",
                  "description": "Stop the command after this many seconds. "
                                 "Bounds one that would never end on a machine "

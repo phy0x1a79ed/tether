@@ -160,7 +160,7 @@ case "${1:---all}" in
             # swallowed: a client that cannot reach a relay exits non-zero, and
             # that non-zero *is* the success being looked for here.
             export TETHER_RELAY="https://127.0.0.1:1/tether"
-            dialled="$(in_container wine "$exe" 7 anchor kettle 2>&1 || true)"
+            dialled="$(in_container wine "$exe" acre anchor kettle 2>&1 || true)"
             unset TETHER_RELAY
             case "$dialled" in
                 *"could not reach the relay"*) echo "   it runs, and it dials" ;;

@@ -20,8 +20,8 @@ One set of words, used in the code, the verbs, the interface and these docs.
 | **owner** | the person at the machine being helped, and the machine itself |
 | **operator** | the trusted person invited in |
 | **relay** | the public box the session passes through |
-| **invite code** | a slot and two or more plain words, such as `7 anchor kettle` |
-| **slot** | the code's first token, a small number the relay issues |
+| **invite code** | three or more plain words, such as `acre anchor kettle`: the first names the slot, the rest are the phrase |
+| **slot** | the session's address: a small number the relay issues, said as the code's first word |
 | **phrase** | the rest of the code, which the relay never learns |
 | **seat** | one of the two chairs at a slot, taken with a single-use token |
 | **task** | one command or one terminal inside a session |

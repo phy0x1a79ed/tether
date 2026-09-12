@@ -906,7 +906,7 @@ mod tests {
             facts: Facts {
                 operator: "awm as tony on altair".into(),
                 relay: "example/tether".into(),
-                code: "7 anchor kettle".into(),
+                code: "acre anchor kettle".into(),
             },
             started: Instant::now(),
             transcript: VecDeque::new(),

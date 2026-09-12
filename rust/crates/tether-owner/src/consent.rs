@@ -216,7 +216,7 @@ mod tests {
     #[test]
     fn the_prompt_names_the_five_things_worth_knowing() {
         let relay = Relay::parse("https://nexus.tony-xy-liu.com/tether").unwrap();
-        let code = InviteCode::parse(&["7", "anchor", "kettle"]).unwrap();
+        let code = InviteCode::parse(&["acre", "anchor", "kettle"]).unwrap();
         let operator = hello();
         let log = std::path::Path::new("/tmp/tether.4kPq2x/tether-session.log");
         let text = Ask {
@@ -233,7 +233,7 @@ mod tests {
         // Which relay the session crosses.
         assert!(text.contains("nexus.tony-xy-liu.com/tether"));
         // The code being redeemed.
-        assert!(text.contains("7 anchor kettle"));
+        assert!(text.contains("acre anchor kettle"));
         // Where the record of it will be, verbatim, so they can find the file
         // by reading the prompt rather than by hunting for it afterwards.
         assert!(
@@ -247,7 +247,7 @@ mod tests {
     #[test]
     fn the_prompt_says_what_the_operator_will_be_able_to_do() {
         let relay = Relay::parse("https://example.test").unwrap();
-        let code = InviteCode::parse(&["3", "anchor", "kettle"]).unwrap();
+        let code = InviteCode::parse(&["ability", "anchor", "kettle"]).unwrap();
         let operator = hello();
         let log = std::path::Path::new("/tmp/tether.x/tether-session.log");
         let text = Ask {
@@ -267,7 +267,7 @@ mod tests {
     #[test]
     fn the_prompt_says_so_when_there_will_be_no_record() {
         let relay = Relay::parse("https://example.test").unwrap();
-        let code = InviteCode::parse(&["3", "anchor", "kettle"]).unwrap();
+        let code = InviteCode::parse(&["ability", "anchor", "kettle"]).unwrap();
         let operator = hello();
         let text = Ask {
             operator: &operator,

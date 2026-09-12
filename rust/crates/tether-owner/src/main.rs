@@ -1,4 +1,4 @@
-//! `tether 7 anchor kettle` — the whole interface the owner ever sees.
+//! `tether acre anchor kettle` — the whole interface the owner ever sees.
 //!
 //! Plain tokens, nothing to quote, no punctuation inside the code. The launcher
 //! passes whatever followed `bash -s` straight through, so a longer code costs
@@ -29,10 +29,10 @@ use tether_proto::invite::InviteCode;
 const USAGE: &str = "\
 tether — let someone you trust run commands on this machine, while you watch.
 
-    tether <slot> <word> <word>
+    tether <word> <word> <word>
 
-The slot and the words are the invite code you were given, typed as plain
-words. Nothing is installed. A record of the session is written where the
+The words are the invite code you were given, in the order you were given
+them. Nothing is installed. A record of the session is written where the
 prompt will name, for you to keep or delete. You will be asked here, at this
 keyboard, before anyone gets in.
 ";

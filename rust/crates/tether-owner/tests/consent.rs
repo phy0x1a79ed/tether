@@ -136,7 +136,7 @@ async fn with_nobody_at_the_keyboard_the_answer_is_no() {
     let mut command = tokio::process::Command::new(setsid);
     command
         .arg(binary())
-        .arg(slot.to_string())
+        .arg(slot.word())
         .env("TETHER_RELAY", format!("http://{}", running.addr))
         .env("TETHER_LOG_DIR", &records)
         .stdin(Stdio::null())

@@ -13,6 +13,11 @@
 //! credential, and a verb that *required* it would put the secret into every
 //! argument list, transcript and shell history that ever drives this tool.
 //!
+//! The slot has two spellings and both are accepted here: the number this side
+//! reports everywhere, and the word the owner was read. They are the same
+//! thing, so a code pasted whole resolves and so does a slot copied out of
+//! `status`.
+//!
 //! With exactly one session live, naming it is optional. With several it is
 //! not, and the refusal names the slots rather than guessing, because guessing
 //! wrong here means running a command on the wrong person's machine.
@@ -276,7 +281,9 @@ impl Operator {
 
         if let Some(code) = code {
             let first = code.split_whitespace().next().unwrap_or(code);
-            let slot = Slot::parse(first).map_err(|e| e.to_string())?;
+            let slot = Slot::parse(first)
+                .or_else(|_| Slot::from_word(first))
+                .map_err(|_| format!("`{first}` names no session"))?;
             let session = table
                 .get(&slot.get())
                 .ok_or_else(|| format!("there is no session {slot} on this host"))?;
@@ -452,6 +459,28 @@ mod tests {
             .await
             .expect_err("there is no session");
         assert!(err.contains("invite"), "{err}");
+    }
+
+    /// The slot is a number on this side and a word on the owner's, so both
+    /// spellings have to land on the same session. With none open, the two
+    /// answers agreeing is the whole proof.
+    #[tokio::test]
+    async fn a_session_answers_to_the_number_and_to_the_word_alike() {
+        let op = operator();
+        let by_number = op
+            .handle("run", &json!({"code": "7", "command": "true"}))
+            .await;
+        let by_word = op
+            .handle(
+                "run",
+                &json!({"code": "acre anchor kettle", "command": "true"}),
+            )
+            .await;
+        assert_eq!(format!("{by_number:?}"), format!("{by_word:?}"));
+        assert!(
+            format!("{by_number:?}").contains("no session 7"),
+            "{by_number:?}"
+        );
     }
 
     #[tokio::test]

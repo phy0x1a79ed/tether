@@ -1,6 +1,6 @@
 # The owner's first contact with tether, on Windows.
 #
-#   & ([scriptblock]::Create((irm https://nexus.tony-xy-liu.com/tether/win))) 7 anchor kettle
+#   & ([scriptblock]::Create((irm https://nexus.tony-xy-liu.com/tether/win))) acre anchor kettle
 #
 # Served by the relay at /win under the mount, because Windows has no shell that
 # can run the script served at the mount itself. It fetches the client for this
@@ -17,7 +17,7 @@
 # the shape that keeps the code on the same line as the address. TETHER_CODE is
 # the second route for anyone who finds that line hard to read out:
 #
-#   $env:TETHER_CODE = '7 anchor kettle'
+#   $env:TETHER_CODE = 'acre anchor kettle'
 #   irm https://nexus.tony-xy-liu.com/tether/win | iex
 #
 # # Why there is no checksum here
@@ -59,7 +59,7 @@ switch ($machine) {
 
 $code = $args
 if (-not $code -and $env:TETHER_CODE) { $code = $env:TETHER_CODE.Split(' ') }
-if (-not $code) { Die 'no invite code: pass the slot and the words you were read' }
+if (-not $code) { Die 'no invite code: pass the three words you were read' }
 
 $dir = Join-Path $env:TEMP ("tether." + [System.IO.Path]::GetRandomFileName())
 New-Item -ItemType Directory -Path $dir | Out-Null

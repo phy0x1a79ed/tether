@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # The owner's first contact with tether, and usually their only one.
 #
-#   curl -fsSL https://nexus.tony-xy-liu.com/tether | bash -s 7 anchor kettle
+#   curl -fsSL https://nexus.tony-xy-liu.com/tether | bash -s acre anchor kettle
 #
 # Served by the relay at the mount root, so the address in that line is the
 # whole address there is. It fetches the client for this machine, runs it with
@@ -22,9 +22,10 @@
 #
 # # Why the arguments are passed straight through
 #
-# They are the invite code: a slot and some plain words, nothing to quote and
-# no punctuation. `"$@"` keeps that true no matter how many words the code has,
-# so raising the word count is a change on the minting side alone.
+# They are the invite code: the word that names the session, then the words
+# that are the secret. Nothing to quote and no punctuation. `"$@"` keeps that
+# true no matter how many words the code has, so raising the word count is a
+# change on the minting side alone.
 set -euo pipefail
 
 BASE="${TETHER_RELAY:-https://nexus.tony-xy-liu.com/tether}"
