@@ -90,6 +90,19 @@ pub struct Limits {
     /// still closes the door long before guessing twenty bits is worth trying.
     pub max_pairings: u32,
 
+    /// How long a slot outlives the operator's chair going empty.
+    ///
+    /// A slot exists to be the address of an operator who is waiting at it, so
+    /// it should not outlive one. But the operator's socket cycles: each dial
+    /// gets ninety seconds, and when nobody has redeemed the invite yet the
+    /// chair is dropped and retaken immediately. That gap is microseconds, so
+    /// this only has to be long enough to cover it — and short enough that a
+    /// daemon which died without saying so leaves a door that shuts on its own.
+    ///
+    /// The deliberate release is what handles the ordinary case. This is the
+    /// backstop for the case where nothing got to say anything.
+    pub operator_grace: Duration,
+
     /// The per-address window for public requests, and what fits in one.
     pub rate_window: Duration,
     pub rate_burst: u32,
@@ -106,6 +119,7 @@ impl Default for Limits {
             keepalive: Duration::from_secs(30),
             drain_grace: Duration::from_secs(5),
             max_pairings: 5,
+            operator_grace: Duration::from_secs(10),
             rate_window: Duration::from_secs(60),
             rate_burst: 30,
         }

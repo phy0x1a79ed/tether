@@ -61,8 +61,17 @@ rather than as a version mismatch.
    frame is how the operator learns consent was given.
 9. Tasks run. The owner watches each one as it happens.
 10. Either side sends `Cut`. The other exits and says why.
+11. The daemon posts to `/release/{slot}/{seat token}`. The slot stops existing,
+    so the next person to run that code is turned away at once rather than
+    seated opposite nobody.
 
-The relay sees steps 1, 4, 5 and the bytes. It sees none of 6 through 10.
+The relay sees steps 1, 4, 5, 11 and the bytes. It sees none of 6 through 10.
+
+Step 11 has to be the operator's to take. The relay pumps sealed bytes and holds
+no key, so a refusal and a mistyped phrase are the same event from where it
+stands — and one must end the slot while the other must leave it open for the
+retry. Only the daemon knows which happened. If it never says, the slot expires
+on its own a few seconds after its chair goes empty.
 
 ## Why the slot and the phrase are separate
 
@@ -220,4 +229,5 @@ when standard input is. Both are the person, and neither is the pipe.
 
 Nothing. No session content, no key material, no record of a finished session.
 State lives in memory, so restarting the relay ends every live session. Its log
-records that a slot was issued and says nothing else about the session.
+records that a slot was issued and that it was released, and says nothing else
+about the session.

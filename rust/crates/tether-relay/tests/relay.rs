@@ -105,6 +105,17 @@ async fn claim(addr: SocketAddr, slot: u64) -> String {
     json(&body)["token"].as_str().unwrap().to_string()
 }
 
+/// End a slot the way the operator's daemon does when it is finished.
+async fn release(addr: SocketAddr, slot: u64, seat: &str) -> (u16, String) {
+    http(
+        addr,
+        "POST",
+        &format!("/release/{slot}/{seat}"),
+        &[("cf-connecting-ip", "203.0.113.9")],
+    )
+    .await
+}
+
 type Socket = WebSocketStream<MaybeTlsStream<TcpStream>>;
 
 async fn join(addr: SocketAddr, slot: u64, token: &str) -> Result<Socket, WsError> {
@@ -568,5 +579,53 @@ async fn a_host_with_no_assets_says_so_rather_than_failing() {
     let (status, body) = http(r.addr, "GET", "/health", &[]).await;
     assert_eq!(status, 200);
     assert_eq!(body.trim(), "ok");
+    r.stop();
+}
+
+/// The whole point of the release route, at the level a person experiences it.
+///
+/// Before this existed, a session that had ended left a slot that went on
+/// minting tickets for another five minutes. The next person to run the same
+/// code got one, took the owner's chair, and waited out their entire handshake
+/// budget opposite a chair nobody was in — then were told the code might be
+/// mistyped, which was the one thing it was not.
+#[tokio::test]
+async fn a_released_slot_turns_the_next_attempt_away_instead_of_seating_it() {
+    let r = relay(Limits::default()).await;
+    let (slot, seat) = issue(r.addr).await;
+
+    let (status, body) = release(r.addr, slot, &seat).await;
+    assert_eq!(status, 200, "{body}");
+
+    let (status, _) = http(
+        r.addr,
+        "POST",
+        &format!("/claim/{slot}"),
+        &[("cf-connecting-ip", "203.0.113.9")],
+    )
+    .await;
+    assert_eq!(status, 404, "a claim on a released slot must find nothing");
+    r.stop();
+}
+
+/// The seat token is the whole authorisation, so a caller without it changes
+/// nothing — and is told exactly what an unknown slot is told, because the
+/// shape of a refusal must not map this surface.
+#[tokio::test]
+async fn releasing_without_the_seat_token_is_refused_like_anything_else() {
+    let r = relay(Limits::default()).await;
+    let (slot, seat) = issue(r.addr).await;
+
+    let wrong = "0123456789abcdef0123456789abcdef";
+    assert_ne!(wrong, seat);
+    let (status, _) = release(r.addr, slot, wrong).await;
+    assert_eq!(status, 404);
+
+    let (status, _) = release(r.addr, 998, &seat).await;
+    assert_eq!(status, 404, "an unknown slot answers the same way");
+
+    // Untouched: the real operator can still use it.
+    let ticket = claim(r.addr, slot).await;
+    assert_eq!(ticket.len(), 32);
     r.stop();
 }

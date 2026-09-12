@@ -71,9 +71,11 @@ struct Occupant {
 }
 
 struct Session {
-    /// When this slot dies, if nobody is sitting in it. An occupied chair keeps
-    /// the session alive past the deadline; the socket's own unpaired timeout
-    /// is what bounds that.
+    /// When this slot dies, unless the operator is sitting in it. The
+    /// operator's chair keeps the session alive past the deadline, and the
+    /// socket's own unpaired timeout is what bounds that. The owner's chair
+    /// does not: an owner alone in a slot is waiting for somebody who is not
+    /// coming back.
     deadline: Instant,
     pairings_used: u32,
     operator_token: Token,
@@ -85,12 +87,6 @@ struct Session {
 }
 
 const MAX_TICKETS: usize = 8;
-
-impl Session {
-    fn occupied(&self) -> bool {
-        self.seats.iter().any(|s| s.is_some())
-    }
-}
 
 /// What `issue` hands back to the operator.
 #[derive(Debug)]
@@ -290,10 +286,47 @@ impl Sessions {
             table.remove(&slot.get());
             return true;
         }
-        // The slot goes back to waiting for someone to redeem it, with a fresh
-        // deadline, so a fumbled code costs a retry rather than a new code.
-        session.deadline = now + self.limits.issue_ttl;
+        session.deadline = now
+            + match seat {
+                // A slot is the address of an operator waiting at it, so it
+                // must not outlive one by much. The operator's chair does cycle
+                // — each dial gets ninety seconds and is retaken the instant it
+                // ends — so this grace covers that gap and little else.
+                //
+                // Before this, an operator that had finished left a slot that
+                // still minted tickets for five more minutes. The next person
+                // to run the code sat down opposite nobody and waited out their
+                // own handshake budget before being told the wrong thing.
+                Seat::Operator => self.limits.operator_grace,
+                // An owner leaving is a fumbled phrase or a refusal, and the
+                // operator is still sitting there. Give the slot its full life
+                // back, so a retry costs a retry rather than a new code.
+                Seat::Owner => self.limits.issue_ttl,
+            };
         false
+    }
+
+    /// End a slot because the operator says it is finished with it.
+    ///
+    /// The relay cannot decide this for itself. It pumps sealed bytes and holds
+    /// no key, so a refusal and a mistyped phrase look identical from here —
+    /// one must destroy the slot and the other must leave it open. Only the
+    /// operator knows which happened, and this is how it says so.
+    ///
+    /// The seat token is the whole authorisation. It is what the relay handed
+    /// back when it issued the slot, and it is already the secret that lets
+    /// that operator take its chair. Anyone holding it could end the session
+    /// by occupying it anyway.
+    pub fn destroy(&self, slot: Slot, token: Token) -> bool {
+        let mut table = self.inner.lock().unwrap();
+        let Some(session) = table.get(&slot.get()) else {
+            return false;
+        };
+        if session.operator_token != token {
+            return false;
+        }
+        table.remove(&slot.get());
+        true
     }
 
     pub fn reap(&self, now: Instant) -> usize {
@@ -303,8 +336,16 @@ impl Sessions {
         before - table.len()
     }
 
+    /// Drop every slot that has run out of reasons to exist.
+    ///
+    /// An occupied chair used to be reason enough, either chair. It is not: an
+    /// owner sitting alone in a slot whose operator has gone is exactly the
+    /// hang this table is meant to prevent, and counting them as occupancy
+    /// would pin that slot open for as long as they waited. Only the operator's
+    /// chair keeps a slot alive past its deadline, because only the operator
+    /// can answer.
     fn reap_locked(table: &mut HashMap<u32, Session>, now: Instant) {
-        table.retain(|_, s| s.occupied() || s.deadline > now);
+        table.retain(|_, s| s.seats[Seat::Operator.index()].is_some() || s.deadline > now);
     }
 }
 
@@ -512,7 +553,7 @@ mod tests {
     }
 
     #[test]
-    fn an_occupied_slot_outlives_its_deadline() {
+    fn a_slot_the_operator_is_sitting_in_outlives_its_deadline() {
         let s = sessions();
         let now = Instant::now();
         let issued = s.issue(now).unwrap();
@@ -524,6 +565,24 @@ mod tests {
         assert_eq!(s.live(), 1);
     }
 
+    /// The counterpart, and the reason the reaper asks which chair rather than
+    /// whether any chair. An owner sitting alone is waiting for an operator
+    /// that has gone; treating that as occupancy pins the slot open for exactly
+    /// as long as they are prepared to wait.
+    #[test]
+    fn an_owner_alone_does_not_keep_a_slot_whose_operator_has_gone() {
+        let s = sessions();
+        let now = Instant::now();
+        let issued = s.issue(now).unwrap();
+        let (ticket, _) = s.claim(issued.slot, now).unwrap();
+        let _owner = s.join(issued.slot, ticket, chan(), now).unwrap();
+        assert_eq!(
+            s.reap(now + s.limits.issue_ttl + Duration::from_secs(1)),
+            1
+        );
+        assert_eq!(s.live(), 0);
+    }
+
     #[test]
     fn an_unredeemed_slot_expires() {
         let s = sessions();
@@ -533,15 +592,72 @@ mod tests {
         assert_eq!(s.live(), 0);
     }
 
+    /// A fumbled phrase pairs, fails and drops the owner. The operator is still
+    /// sitting there, so the slot gets its whole life back and the code the
+    /// owner was read aloud is still the code.
     #[test]
-    fn leaving_a_chair_gives_the_slot_a_fresh_deadline() {
+    fn an_owner_leaving_gives_the_slot_its_full_life_back() {
+        let s = sessions();
+        let now = Instant::now();
+        let issued = s.issue(now).unwrap();
+        let _operator = s.join(issued.slot, issued.token, chan(), now).unwrap();
+        let (ticket, _) = s.claim(issued.slot, now).unwrap();
+        let _owner = s.join(issued.slot, ticket, chan(), now).unwrap();
+
+        let late = now + s.limits.issue_ttl + Duration::from_secs(60);
+        assert!(!s.leave(issued.slot, Seat::Owner, late));
+        assert_eq!(s.reap(late + s.limits.issue_ttl - Duration::from_secs(1)), 0);
+        assert_eq!(s.live(), 1, "the operator is still waiting at it");
+    }
+
+    /// The operator leaving is the other half, and the asymmetry is the fix. A
+    /// slot is the address of an operator waiting at it, so once that operator
+    /// is gone the slot has only long enough to get one back.
+    #[test]
+    fn an_operator_leaving_gives_the_slot_only_a_grace() {
         let s = sessions();
         let now = Instant::now();
         let issued = s.issue(now).unwrap();
         let _waiting = s.join(issued.slot, issued.token, chan(), now).unwrap();
+
         let late = now + s.limits.issue_ttl + Duration::from_secs(60);
         assert!(!s.leave(issued.slot, Seat::Operator, late));
-        assert_eq!(s.reap(late + Duration::from_secs(1)), 0);
+
+        // Inside the grace the slot is still there, which is what lets the
+        // dial loop drop its chair and take it straight back.
+        assert_eq!(s.reap(late + s.limits.operator_grace - Duration::from_millis(1)), 0);
+        // Past it, gone — where it used to get another five minutes.
+        assert_eq!(s.reap(late + s.limits.operator_grace + Duration::from_secs(1)), 1);
+        assert_eq!(s.live(), 0);
+    }
+
+    /// The bug this was all for. A session ends, and the next person to run the
+    /// same code must be told so rather than seated opposite nobody.
+    #[test]
+    fn a_released_slot_stops_handing_out_tickets_at_once() {
+        let s = sessions();
+        let now = Instant::now();
+        let issued = s.issue(now).unwrap();
+        assert!(s.claim(issued.slot, now).is_some(), "live, before the release");
+
+        assert!(s.destroy(issued.slot, issued.token));
+
+        assert!(
+            s.claim(issued.slot, now).is_none(),
+            "a claim on a released slot is what used to hang the owner"
+        );
+        assert_eq!(s.live(), 0);
+        assert!(!s.destroy(issued.slot, issued.token), "and it is gone for good");
+    }
+
+    #[test]
+    fn a_release_without_the_seat_token_does_nothing() {
+        let s = sessions();
+        let now = Instant::now();
+        let issued = s.issue(now).unwrap();
+        assert!(!s.destroy(issued.slot, Token::mint()));
+        assert_eq!(s.live(), 1);
+        assert!(s.claim(issued.slot, now).is_some());
     }
 
     #[test]

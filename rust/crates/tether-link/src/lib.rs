@@ -109,6 +109,22 @@ pub struct Link {
     channel: Channel,
 }
 
+/// Tell the relay a slot is finished with, so it stops existing now.
+///
+/// Not a method on [`Link`], because the moment this matters is after the link
+/// is gone. The relay cannot work out on its own that a session is over — a
+/// refusal and a mistyped phrase look the same through sealed bytes, and one
+/// must end the slot while the other must leave it open for a retry. The
+/// operator is the only party that knows, so it says so here.
+///
+/// Best effort. The relay expires an operator-less slot on its own shortly
+/// after, so a failure here costs a few seconds of a code that no longer works,
+/// not a leaked session.
+pub async fn release(relay: &Relay, slot: Slot, seat_token: &str) -> Result<(), LinkError> {
+    http::post_json(relay, &relay.release_path(slot, seat_token), None).await?;
+    Ok(())
+}
+
 impl Link {
     /// The owner's way in: claim a ticket, take the owner's chair, handshake.
     ///

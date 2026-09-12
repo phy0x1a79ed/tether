@@ -27,7 +27,8 @@ use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use serde_json::{json, Value};
-use tether_link::{Link, LinkError};
+use tether_link::http::HttpError;
+use tether_link::{release, Link, LinkError};
 use tether_proto::frame::{Ended, Frame, Hello, Kind, Stream, TaskId};
 use tether_proto::invite::{InviteCode, Phrase, Slot};
 use tokio::sync::{mpsc, oneshot};
@@ -203,13 +204,27 @@ async fn serve(
     state: Arc<Mutex<State>>,
     mut rx: mpsc::Receiver<Command>,
 ) {
-    let Some(mut link) = connect(&cfg, &code, &seat, lifetime, &state, &mut rx).await else {
-        return;
-    };
-    if !consent(&cfg, &mut link, &state, &mut rx).await {
-        return;
+    if let Some(mut link) = connect(&cfg, &code, &seat, lifetime, &state, &mut rx).await {
+        if consent(&cfg, &mut link, &state, &mut rx).await {
+            carry(&mut link, &state, &mut rx).await;
+        }
     }
-    carry(&mut link, &state, &mut rx).await;
+    // Every way a session can end arrives here, and only here. The redial loop
+    // inside `connect` drops and retakes the chair many times without reaching
+    // it, which is exactly the distinction the relay cannot make for itself: an
+    // operator between dials is still attached, an operator that has got this
+    // far is not, and the slot should stop existing rather than seat the next
+    // person opposite nobody.
+    match release(&cfg.relay, code.slot, &seat).await {
+        Ok(()) => {}
+        // The slot was already gone: an invite nobody redeemed had expired
+        // before we got here, which is the ordinary ending rather than a fault.
+        Err(LinkError::Http(HttpError::Status(404))) => {}
+        Err(e) => crate::log::info(format_args!(
+            "slot {} could not be released ({e}); it expires on its own shortly",
+            code.slot
+        )),
+    }
 }
 
 /// Hold the operator's chair until the owner arrives, or the invite expires.

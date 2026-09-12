@@ -136,6 +136,15 @@ impl Relay {
         format!("{}/issue", self.prefix)
     }
 
+    /// The path that ends a slot early, carrying the seat token as its proof.
+    ///
+    /// The token is in the path rather than a header because it is the same
+    /// credential, in the same position, as the one `/join` already takes, and
+    /// the edge's allow-list matches on shape.
+    pub fn release_path(&self, slot: Slot, seat: &str) -> String {
+        format!("{}/release/{}/{}", self.prefix, slot, seat)
+    }
+
     /// The URL the owner pipes into a shell.
     ///
     /// The mount root itself, so the whole address is the one thing already
@@ -188,6 +197,10 @@ mod tests {
         assert_eq!(r.host(), "nexus.tony-xy-liu.com");
         assert_eq!(r.port(), 443);
         assert_eq!(r.claim_path(slot(7)), "/tether/claim/7");
+        assert_eq!(
+            r.release_path(slot(7), "0123456789abcdef0123456789abcdef"),
+            "/tether/release/7/0123456789abcdef0123456789abcdef"
+        );
         assert_eq!(
             r.join_url(slot(7), "abc"),
             "wss://nexus.tony-xy-liu.com/tether/join/7/abc"

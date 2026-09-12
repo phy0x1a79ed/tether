@@ -120,6 +120,7 @@ pub fn router(relay: Arc<Relay>) -> Router {
         .route("/status", get(status))
         .route("/issue", post(issue))
         .route("/claim/{slot}", post(claim))
+        .route("/release/{slot}/{token}", post(release))
         .route("/join/{slot}/{token}", get(join))
         // Twice on purpose. The address the owner is read out is the mount
         // itself — `https://…/tether` — and whether the edge hands that to
@@ -208,6 +209,39 @@ async fn claim(
         .into_response(),
         None => nothing_here(),
     }
+}
+
+/// End a slot, because the operator that owns it is finished with it.
+///
+/// The seat token in the path is the authorisation, exactly as it is on
+/// `/join`: it is what this relay handed back when it issued the slot, and
+/// nobody else has it. There is no bearer check on top, because possession of
+/// that token already permits occupying the chair, which ends the session by
+/// another route.
+///
+/// Rate-limited like `/claim`, so a caller guessing tokens is spending its
+/// address's budget rather than scanning freely.
+async fn release(
+    State(relay): State<Arc<Relay>>,
+    Path((slot, token)): Path<(String, String)>,
+    headers: HeaderMap,
+) -> Response {
+    if !relay
+        .limiter
+        .allow(&relay.rate_key(&headers), Instant::now())
+    {
+        return (StatusCode::TOO_MANY_REQUESTS, "too many requests\n").into_response();
+    }
+    let (Ok(slot), Some(token)) = (Slot::parse(&slot), Token::parse(&token)) else {
+        return nothing_here();
+    };
+    // A wrong token and an unknown slot answer identically, like every other
+    // refusal on this surface: the shape of a decline must not map it.
+    if !relay.sessions.destroy(slot, token) {
+        return nothing_here();
+    }
+    log::info(format_args!("released slot {slot}"));
+    Json(json!({"released": slot.get()})).into_response()
 }
 
 /// Take a chair and start carrying bytes.
