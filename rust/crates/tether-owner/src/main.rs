@@ -65,6 +65,14 @@ fn main() -> ExitCode {
         Some(at) => (&args[..at], Some(&args[at + 1..])),
         None => (&args[..], None),
     };
+    // Anything that goes wrong this badly is said on the screen the owner was
+    // left with, rather than on the full-screen display it takes down.
+    let report = std::panic::take_hook();
+    std::panic::set_hook(Box::new(move |info| {
+        tether_owner::ui::release();
+        report(info);
+    }));
+
     let code = match InviteCode::parse(code) {
         Ok(code) => code,
         Err(e) => {

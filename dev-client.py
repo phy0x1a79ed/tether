@@ -111,7 +111,7 @@ def main() -> None:
         answer = ask(path, "invite")
         die(answer)
         print()
-        print("Run this on the owner machine, in a real terminal:")
+        print("Run this on the owner machine:")
         print()
         print("  " + answer["command"])
         print()

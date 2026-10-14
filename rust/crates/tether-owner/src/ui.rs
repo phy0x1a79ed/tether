@@ -27,6 +27,7 @@
 
 use std::collections::VecDeque;
 use std::io::{self, Write};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Instant;
 
 use crossterm::{cursor, event, execute, queue, style, terminal};
@@ -160,6 +161,7 @@ impl Ui {
         if tty {
             terminal::enable_raw_mode()?;
             execute!(io::stdout(), terminal::EnterAlternateScreen, cursor::Hide)?;
+            HELD.store(true, Ordering::SeqCst);
         }
         ui.line(format!(
             "session open with {} through {}",
@@ -499,8 +501,7 @@ impl Ui {
 
         if self.tty {
             self.tty = false;
-            let _ = execute!(io::stdout(), terminal::LeaveAlternateScreen, cursor::Show);
-            let _ = terminal::disable_raw_mode();
+            release();
             for line in &self.transcript {
                 println!("{line}");
             }
@@ -596,6 +597,21 @@ pub enum Typed {
     Cut,
     /// Send this to the other person.
     Send(String),
+}
+
+/// Whether the display has the terminal: raw, on the alternate screen.
+static HELD: AtomicBool = AtomicBool::new(false);
+
+/// Give the terminal back, if the display has it.
+///
+/// Public for the panic hook. A panic's message is printed before anything
+/// unwinds, so without this it lands on the alternate screen and is wiped when
+/// `Drop` leaves it, and the owner sees the client vanish without a word.
+pub fn release() {
+    if HELD.swap(false, Ordering::SeqCst) {
+        let _ = execute!(io::stdout(), terminal::LeaveAlternateScreen, cursor::Show);
+        let _ = terminal::disable_raw_mode();
+    }
 }
 
 /// The owner's keyboard, as a stream this side can stop reading.

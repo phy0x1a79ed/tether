@@ -16,7 +16,11 @@ tether-proto = { path = "crates/tether-proto" }
 anyhow = "1"
 axum = { version = "0.8", features = ["ws"] }
 chacha20poly1305 = "0.10"
-crossterm = { version = "0.29", features = ["event-stream"] }
+# `use-dev-tty` reads the keyboard with poll(2) on /dev/tty. Without it the
+# reader registers /dev/tty with kqueue, which macOS refuses for terminal
+# devices, and the client panics the moment a session opens whenever standard
+# input is not the terminal: which is always, under `curl ... | sh -s`.
+crossterm = { version = "0.29", features = ["event-stream", "use-dev-tty"] }
 futures-util = { version = "0.3", default-features = false, features = ["std", "sink"] }
 getrandom = "0.2"
 hex = "0.4"

@@ -200,8 +200,8 @@ fn rerun(relay: &tether_link::Relay, code: &InviteCode, words: &str) -> String {
     }
     // The launcher reads the relay from the same variable the client does, so
     // a run pointed elsewhere has to be pointed there again.
-    let pointed = std::env::var_os("TETHER_RELAY")
-        .map(|_| format!("TETHER_RELAY={relay} "))
+    let pointed = std::env::var(tether_link::relay::BASE_ENV)
+        .map(|base| format!("{}={base} ", tether_link::relay::BASE_ENV))
         .unwrap_or_default();
     format!(
         "curl -fsSL {} | {pointed}sh -s {code} --agree {words}",
