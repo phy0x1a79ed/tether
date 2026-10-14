@@ -145,6 +145,16 @@ impl Relay {
         format!("{}/release/{}/{}", self.prefix, slot, seat)
     }
 
+    /// Where a chair is taken for polling, with the same ticket `/join` takes.
+    pub fn poll_path(&self, slot: Slot, ticket: &str) -> String {
+        format!("{}/poll/{}/{}", self.prefix, slot, ticket)
+    }
+
+    /// One of a polled chair's requests: `recv`, `send` or `close`.
+    pub fn seat_path(&self, id: &str, verb: &str) -> String {
+        format!("{}/seat/{}/{}", self.prefix, id, verb)
+    }
+
     /// The URL the owner pipes into a shell.
     ///
     /// The mount root itself, so the whole address is the one thing already

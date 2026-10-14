@@ -34,7 +34,7 @@ use std::time::{Duration, Instant};
 
 use axum::body::Bytes;
 use axum::extract::ws::WebSocketUpgrade;
-use axum::extract::{Path, State};
+use axum::extract::{DefaultBodyLimit, Path, Query, State};
 use axum::http::{header, HeaderMap, StatusCode};
 use axum::response::{IntoResponse, Response};
 use axum::routing::{get, post};
@@ -47,12 +47,14 @@ use tokio::task::JoinHandle;
 pub mod assets;
 pub mod config;
 pub mod log;
+pub mod poll;
 pub mod pump;
 pub mod rate;
 pub mod session;
 pub mod token;
 
 use crate::config::{Config, MAX_MESSAGE};
+use crate::poll::{Polls, Recv, Sent};
 use crate::rate::Limiter;
 use crate::session::{IssueError, JoinError, Sessions};
 use crate::token::{secret_eq, Token};
@@ -66,6 +68,7 @@ const REAP_INTERVAL: Duration = Duration::from_secs(5);
 
 pub struct Relay {
     pub sessions: Arc<Sessions>,
+    pub polls: Arc<Polls>,
     limiter: Limiter,
     config: Config,
     started: Instant,
@@ -77,6 +80,7 @@ impl Relay {
         let limiter = Limiter::new(config.limits.rate_window, config.limits.rate_burst);
         Self {
             sessions,
+            polls: Arc::default(),
             limiter,
             config,
             started: Instant::now(),
@@ -122,6 +126,15 @@ pub fn router(relay: Arc<Relay>) -> Router {
         .route("/claim/{slot}", post(claim))
         .route("/release/{slot}/{token}", post(release))
         .route("/join/{slot}/{token}", get(join))
+        // The same chair as `/join`, held through plain requests instead of a
+        // socket. See [`poll`].
+        .route("/poll/{slot}/{token}", post(poll_open))
+        .route("/seat/{id}/recv", get(poll_recv))
+        .route(
+            "/seat/{id}/send",
+            post(poll_send).layer(DefaultBodyLimit::max(poll::MAX_SEND)),
+        )
+        .route("/seat/{id}/close", post(poll_close))
         // Twice on purpose. The address the owner is read out is the mount
         // itself — `https://…/tether` — and whether the edge hands that to
         // this router as `/` or as `/tether` is a property of how the mount
@@ -151,6 +164,7 @@ async fn status(State(relay): State<Arc<Relay>>, headers: HeaderMap) -> Response
         "ok": true,
         "build": relay.config.build,
         "sessions": relay.sessions.live(),
+        "polled": relay.polls.live(),
         "max_sessions": relay.config.max_sessions,
         "uptime_s": relay.started.elapsed().as_secs(),
         "assets": relay.config.assets.is_some(),
@@ -266,6 +280,76 @@ async fn join(
     ws.max_message_size(MAX_MESSAGE)
         .max_frame_size(MAX_MESSAGE)
         .on_upgrade(move |socket| pump::run(seated, socket))
+}
+
+/// Take a chair for a client that will poll for it rather than hold a socket.
+///
+/// Refused exactly as `/join` refuses, and for the same reasons.
+async fn poll_open(
+    State(relay): State<Arc<Relay>>,
+    Path((slot, token)): Path<(String, String)>,
+) -> Response {
+    let (Ok(slot), Some(token)) = (Slot::parse(&slot), Token::parse(&token)) else {
+        return nothing_here();
+    };
+    match pump::seat(Arc::clone(&relay.sessions), slot, token) {
+        Ok(seated) => Json(json!({ "id": relay.polls.open(seated) })).into_response(),
+        Err(JoinError::Unknown) => nothing_here(),
+        Err(JoinError::Taken) | Err(JoinError::Busy) => {
+            (StatusCode::CONFLICT, "that seat is taken\n").into_response()
+        }
+    }
+}
+
+#[derive(serde::Deserialize)]
+struct Ack {
+    #[serde(default)]
+    ack: u64,
+}
+
+#[derive(serde::Deserialize)]
+struct Seq {
+    #[serde(default)]
+    seq: u64,
+}
+
+async fn poll_recv(
+    State(relay): State<Arc<Relay>>,
+    Path(id): Path<String>,
+    Query(Ack { ack }): Query<Ack>,
+) -> Response {
+    match relay.polls.recv(&id, ack).await {
+        Recv::Frames(body) => (
+            [
+                (header::CONTENT_TYPE, "application/octet-stream"),
+                (header::CACHE_CONTROL, "no-store"),
+            ],
+            body,
+        )
+            .into_response(),
+        Recv::Gone => nothing_here(),
+    }
+}
+
+async fn poll_send(
+    State(relay): State<Arc<Relay>>,
+    Path(id): Path<String>,
+    Query(Seq { seq }): Query<Seq>,
+    body: Bytes,
+) -> Response {
+    match relay.polls.send(&id, seq, &body).await {
+        Sent::Next(next) => Json(json!({ "next": next })).into_response(),
+        Sent::Gone => nothing_here(),
+        Sent::Malformed => (StatusCode::BAD_REQUEST, "not a run of frames\n").into_response(),
+    }
+}
+
+async fn poll_close(State(relay): State<Arc<Relay>>, Path(id): Path<String>) -> Response {
+    if relay.polls.close(&id) {
+        Json(json!({ "closed": true })).into_response()
+    } else {
+        nothing_here()
+    }
 }
 
 async fn launcher(State(relay): State<Arc<Relay>>, headers: HeaderMap) -> Response {

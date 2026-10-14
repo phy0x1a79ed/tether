@@ -145,8 +145,10 @@ async fn next_data(socket: &mut Socket, within: Duration) -> Option<Message> {
     }
 }
 
+/// The socket ended. A read that merely timed out is not an ending, so a test
+/// that expects one cannot pass by waiting.
 fn closed(message: Option<Message>) -> bool {
-    matches!(message, Some(Message::Close(_)) | None)
+    matches!(message, Some(Message::Close(_)))
 }
 
 // ---------------------------------------------------------------------------
@@ -627,5 +629,238 @@ async fn releasing_without_the_seat_token_is_refused_like_anything_else() {
     // Untouched: the real operator can still use it.
     let ticket = claim(r.addr, slot).await;
     assert_eq!(ticket.len(), 32);
+    r.stop();
+}
+
+// ---------------------------------------------------------------------------
+// The polled chair: the same pairing, held through plain requests.
+// ---------------------------------------------------------------------------
+
+/// A request with a body, answered with bytes rather than text.
+async fn http_bytes(addr: SocketAddr, method: &str, path: &str, body: &[u8]) -> (u16, Vec<u8>) {
+    let mut stream = TcpStream::connect(addr).await.unwrap();
+    let head = format!(
+        "{method} {path} HTTP/1.1\r\nHost: relay.invalid\r\nConnection: close\r\nContent-Length: {}\r\n\r\n",
+        body.len()
+    );
+    stream.write_all(head.as_bytes()).await.unwrap();
+    stream.write_all(body).await.unwrap();
+    let mut raw = Vec::new();
+    stream.read_to_end(&mut raw).await.unwrap();
+    let split = raw
+        .windows(4)
+        .position(|w| w == b"\r\n\r\n")
+        .expect("a header block");
+    let head = String::from_utf8_lossy(&raw[..split]);
+    let status = head.split_whitespace().nth(1).unwrap().parse().unwrap();
+    (status, raw[split + 4..].to_vec())
+}
+
+async fn poll_open(addr: SocketAddr, slot: u64, token: &str) -> (u16, String) {
+    http(addr, "POST", &format!("/poll/{slot}/{token}"), &[]).await
+}
+
+fn frames(list: &[&[u8]]) -> Vec<u8> {
+    let mut body = Vec::new();
+    for frame in list {
+        body.extend_from_slice(&(frame.len() as u32).to_be_bytes());
+        body.extend_from_slice(frame);
+    }
+    body
+}
+
+/// What a `recv` answered: the number of its first frame, and the frames.
+fn unframe(body: &[u8]) -> (u64, Vec<Vec<u8>>) {
+    let first = u64::from_be_bytes(body[..8].try_into().unwrap());
+    let mut rest = &body[8..];
+    let mut out = Vec::new();
+    while !rest.is_empty() {
+        let len = u32::from_be_bytes(rest[..4].try_into().unwrap()) as usize;
+        out.push(rest[4..4 + len].to_vec());
+        rest = &rest[4 + len..];
+    }
+    (first, out)
+}
+
+async fn recv(addr: SocketAddr, id: &str, ack: u64) -> (u16, Vec<u8>) {
+    http_bytes(addr, "GET", &format!("/seat/{id}/recv?ack={ack}"), b"").await
+}
+
+async fn send(addr: SocketAddr, id: &str, seq: u64, list: &[&[u8]]) -> (u16, Vec<u8>) {
+    http_bytes(
+        addr,
+        "POST",
+        &format!("/seat/{id}/send?seq={seq}"),
+        &frames(list),
+    )
+    .await
+}
+
+/// An operator on a socket and an owner polling, paired and past the first frame.
+async fn polled_pair(r: &Running) -> (Socket, String) {
+    let (slot, token) = issue(r.addr).await;
+    let operator = join(r.addr, slot, &token).await.expect("the operator");
+    let ticket = claim(r.addr, slot).await;
+    let (status, body) = poll_open(r.addr, slot, &ticket).await;
+    assert_eq!(status, 200, "{body}");
+    (operator, json(&body)["id"].as_str().unwrap().to_string())
+}
+
+#[tokio::test]
+async fn a_polled_owner_and_a_socket_operator_exchange_bytes_unchanged() {
+    let r = relay(Limits::default()).await;
+    let (mut operator, id) = polled_pair(&r).await;
+
+    let from_operator: Vec<u8> = (0..=255u8).cycle().take(5000).collect();
+    operator
+        .send(Message::Binary(from_operator.clone().into()))
+        .await
+        .unwrap();
+    operator
+        .send(Message::Binary(vec![7].into()))
+        .await
+        .unwrap();
+
+    let mut got = Vec::new();
+    let mut ack = 0;
+    while got.len() < 2 {
+        let (status, body) = recv(r.addr, &id, ack).await;
+        assert_eq!(status, 200);
+        let (first, list) = unframe(&body);
+        assert_eq!(first, ack);
+        ack += list.len() as u64;
+        got.extend(list);
+    }
+    assert_eq!(got, vec![from_operator, vec![7]]);
+
+    let from_owner: &[u8] = &[0x00, 0xff, 0xfe, 0x80, 0x0a];
+    let (status, body) = send(r.addr, &id, 0, &[from_owner, b"two"]).await;
+    assert_eq!(status, 200);
+    assert_eq!(json(&String::from_utf8_lossy(&body))["next"], 2);
+    assert_eq!(
+        next_data(&mut operator, Duration::from_secs(5)).await,
+        Some(Message::Binary(from_owner.to_vec().into()))
+    );
+    assert_eq!(
+        next_data(&mut operator, Duration::from_secs(5)).await,
+        Some(Message::Binary(b"two".to_vec().into()))
+    );
+    r.stop();
+}
+
+#[tokio::test]
+async fn a_request_the_client_never_saw_answered_can_be_made_again() {
+    let r = relay(Limits::default()).await;
+    let (mut operator, id) = polled_pair(&r).await;
+
+    // A frame handed down stays until a later recv acknowledges it, so a
+    // response a proxy cut off is answered again rather than lost.
+    operator
+        .send(Message::Binary(b"once".to_vec().into()))
+        .await
+        .unwrap();
+    let (_, body) = recv(r.addr, &id, 0).await;
+    assert_eq!(unframe(&body), (0, vec![b"once".to_vec()]));
+    let (_, body) = recv(r.addr, &id, 0).await;
+    assert_eq!(unframe(&body), (0, vec![b"once".to_vec()]));
+
+    // And a send the client repeats is carried once.
+    send(r.addr, &id, 0, &[b"a"]).await;
+    let (_, body) = send(r.addr, &id, 0, &[b"a", b"b"]).await;
+    assert_eq!(json(&String::from_utf8_lossy(&body))["next"], 2);
+    // A send that skips ahead is refused from the gap onward.
+    let (_, body) = send(r.addr, &id, 5, &[b"z"]).await;
+    assert_eq!(json(&String::from_utf8_lossy(&body))["next"], 2);
+
+    let mut seen = Vec::new();
+    while let Some(Message::Binary(bytes)) =
+        next_data(&mut operator, Duration::from_millis(500)).await
+    {
+        seen.push(bytes.to_vec());
+    }
+    assert_eq!(seen, vec![b"a".to_vec(), b"b".to_vec()]);
+    r.stop();
+}
+
+#[tokio::test]
+async fn a_polled_owner_hears_the_operator_leave() {
+    let r = relay(Limits::default()).await;
+    let (mut operator, id) = polled_pair(&r).await;
+    operator
+        .send(Message::Binary(vec![1].into()))
+        .await
+        .unwrap();
+    let (_, body) = recv(r.addr, &id, 0).await;
+    assert_eq!(unframe(&body).1.len(), 1);
+
+    operator.close(None).await.unwrap();
+    let status = tokio::time::timeout(Duration::from_secs(10), async {
+        loop {
+            let (status, _) = recv(r.addr, &id, 1).await;
+            if status != 200 {
+                return status;
+            }
+        }
+    })
+    .await
+    .expect("the recv should end once the operator has gone");
+    assert_eq!(status, 404);
+    r.stop();
+}
+
+#[tokio::test]
+async fn closing_a_polled_chair_ends_the_session_for_the_other_end() {
+    let r = relay(Limits::default()).await;
+    let (mut operator, id) = polled_pair(&r).await;
+    send(r.addr, &id, 0, &[b"hello"]).await;
+    next_data(&mut operator, Duration::from_secs(5))
+        .await
+        .unwrap();
+
+    let (status, _) = http(r.addr, "POST", &format!("/seat/{id}/close"), &[]).await;
+    assert_eq!(status, 200);
+    assert!(closed(
+        next_data(&mut operator, Duration::from_secs(5)).await
+    ));
+    let (status, _) = recv(r.addr, &id, 0).await;
+    assert_eq!(status, 404);
+    r.stop();
+}
+
+#[tokio::test]
+async fn a_polled_chair_whose_client_stops_asking_is_dropped() {
+    let limits = Limits {
+        idle_timeout: Duration::from_millis(300),
+        keepalive: Duration::from_millis(50),
+        ..Limits::default()
+    };
+    let r = relay(limits).await;
+    let (mut operator, id) = polled_pair(&r).await;
+    send(r.addr, &id, 0, &[b"hello"]).await;
+    next_data(&mut operator, Duration::from_secs(5))
+        .await
+        .unwrap();
+
+    // No further request: nothing stands in for the pong a socket would send.
+    assert!(closed(
+        next_data(&mut operator, Duration::from_secs(5)).await
+    ));
+    r.stop();
+}
+
+#[tokio::test]
+async fn a_poll_naming_nothing_is_refused_like_everything_else() {
+    let r = relay(Limits::default()).await;
+    let (slot, _) = issue(r.addr).await;
+    let (status, _) = poll_open(r.addr, slot, &"0".repeat(32)).await;
+    assert_eq!(status, 404);
+    let (status, _) = poll_open(r.addr, 999, &"0".repeat(32)).await;
+    assert_eq!(status, 404);
+    let nobody = "ab".repeat(16);
+    assert_eq!(recv(r.addr, &nobody, 0).await.0, 404);
+    assert_eq!(send(r.addr, &nobody, 0, &[b"x"]).await.0, 404);
+    assert_eq!(recv(r.addr, "not-an-id", 0).await.0, 404);
+    let (status, _) = http(r.addr, "POST", &format!("/seat/{nobody}/close"), &[]).await;
+    assert_eq!(status, 404);
     r.stop();
 }

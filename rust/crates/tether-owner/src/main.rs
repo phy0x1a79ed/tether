@@ -110,6 +110,9 @@ async fn connect(relay: Relay, code: InviteCode) -> Outcome {
         Ok(link) => link,
         Err(e) => return Outcome::Failed(e.to_string()),
     };
+    if let Some(why) = link.polled() {
+        eprintln!("  carrying the session over plain requests, because {why}");
+    }
 
     // Opened before the prompt, so the path it names is a file that already
     // exists rather than one this intends to make. It takes the slot and never

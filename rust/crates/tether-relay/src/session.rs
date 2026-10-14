@@ -62,7 +62,12 @@ impl Seat {
 }
 
 struct Occupant {
-    tx: Outbound,
+    /// While this socket waits, what the peer will be handed. Once paired,
+    /// nothing: the peer's reader then holds the only sender for this socket's
+    /// channel, so the channel closes the moment the peer goes. That is the
+    /// teardown cascade in [`crate::pump`], and a copy kept here would stop it
+    /// — each end would sit on its socket until its own idle deadline.
+    tx: Option<Outbound>,
     /// `Some` while this socket is waiting for the other chair to fill;
     /// `None` once it is paired. A peer that finds `None` here is looking at a
     /// pairing already in progress and must be refused rather than joined to a
@@ -239,18 +244,20 @@ impl Sessions {
         match session.seats[seat.other().index()].as_mut() {
             Some(peer) => {
                 let handoff = peer.handoff.take().ok_or(JoinError::Busy)?;
-                let peer_tx = peer.tx.clone();
+                let peer_tx = peer.tx.take().ok_or(JoinError::Busy)?;
                 // Each end is handed the *other* end's channel. Handing back
                 // the channel a socket already owns wires it to itself, which
                 // looks exactly like a working pairing until a byte has to
                 // reach somebody.
-                let mine = tx.clone();
-                session.seats[seat.index()] = Some(Occupant { tx, handoff: None });
+                session.seats[seat.index()] = Some(Occupant {
+                    tx: None,
+                    handoff: None,
+                });
                 session.pairings_used += 1;
                 // The receiver is gone only if the peer's socket died between
                 // taking its chair and this moment; its own cleanup is already
                 // on the way, so let this join fall back to waiting.
-                if handoff.send(mine).is_err() {
+                if handoff.send(tx).is_err() {
                     session.seats[seat.index()] = None;
                     session.pairings_used -= 1;
                     return Err(JoinError::Busy);
@@ -263,7 +270,7 @@ impl Sessions {
             None => {
                 let (handoff, peer) = oneshot::channel();
                 session.seats[seat.index()] = Some(Occupant {
-                    tx,
+                    tx: Some(tx),
                     handoff: Some(handoff),
                 });
                 Ok(Join::Waiting { seat, peer })
@@ -576,10 +583,7 @@ mod tests {
         let issued = s.issue(now).unwrap();
         let (ticket, _) = s.claim(issued.slot, now).unwrap();
         let _owner = s.join(issued.slot, ticket, chan(), now).unwrap();
-        assert_eq!(
-            s.reap(now + s.limits.issue_ttl + Duration::from_secs(1)),
-            1
-        );
+        assert_eq!(s.reap(now + s.limits.issue_ttl + Duration::from_secs(1)), 1);
         assert_eq!(s.live(), 0);
     }
 
@@ -606,7 +610,10 @@ mod tests {
 
         let late = now + s.limits.issue_ttl + Duration::from_secs(60);
         assert!(!s.leave(issued.slot, Seat::Owner, late));
-        assert_eq!(s.reap(late + s.limits.issue_ttl - Duration::from_secs(1)), 0);
+        assert_eq!(
+            s.reap(late + s.limits.issue_ttl - Duration::from_secs(1)),
+            0
+        );
         assert_eq!(s.live(), 1, "the operator is still waiting at it");
     }
 
@@ -625,9 +632,15 @@ mod tests {
 
         // Inside the grace the slot is still there, which is what lets the
         // dial loop drop its chair and take it straight back.
-        assert_eq!(s.reap(late + s.limits.operator_grace - Duration::from_millis(1)), 0);
+        assert_eq!(
+            s.reap(late + s.limits.operator_grace - Duration::from_millis(1)),
+            0
+        );
         // Past it, gone — where it used to get another five minutes.
-        assert_eq!(s.reap(late + s.limits.operator_grace + Duration::from_secs(1)), 1);
+        assert_eq!(
+            s.reap(late + s.limits.operator_grace + Duration::from_secs(1)),
+            1
+        );
         assert_eq!(s.live(), 0);
     }
 
@@ -638,7 +651,10 @@ mod tests {
         let s = sessions();
         let now = Instant::now();
         let issued = s.issue(now).unwrap();
-        assert!(s.claim(issued.slot, now).is_some(), "live, before the release");
+        assert!(
+            s.claim(issued.slot, now).is_some(),
+            "live, before the release"
+        );
 
         assert!(s.destroy(issued.slot, issued.token));
 
@@ -647,7 +663,10 @@ mod tests {
             "a claim on a released slot is what used to hang the owner"
         );
         assert_eq!(s.live(), 0);
-        assert!(!s.destroy(issued.slot, issued.token), "and it is gone for good");
+        assert!(
+            !s.destroy(issued.slot, issued.token),
+            "and it is gone for good"
+        );
     }
 
     #[test]

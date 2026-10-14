@@ -26,6 +26,15 @@
 //!
 //! A wrong phrase gets as far as step 4 and fails there — at the **peer**, not
 //! at the relay, which has no opinion because it never knew the phrase.
+//!
+//! # What carries it
+//!
+//! A WebSocket, when the path allows one. The owner's machine may sit behind a
+//! proxy that refuses or breaks the upgrade, so the owner falls back to plain
+//! requests ([`poll`]) when the upgrade fails for any reason other than the
+//! relay's own refusal. `TETHER_TRANSPORT=poll` or `=socket` takes the choice
+//! away, for testing either path on its own. The operator always holds a
+//! socket: it runs where its operator put it, not behind someone else's proxy.
 
 use std::time::Duration;
 
@@ -39,6 +48,7 @@ use tokio_tungstenite::WebSocketStream;
 
 pub mod http;
 pub mod net;
+pub mod poll;
 pub mod relay;
 
 pub use net::{DialError, Route};
@@ -62,6 +72,8 @@ pub enum LinkError {
     /// The socket would not open. Carries the status when the relay answered
     /// with one: `404` is a slot that is not there, `409` a chair already taken.
     Socket(String),
+    /// The chair is occupied, or the other one is still unwinding a pairing.
+    Taken,
     /// Nobody completed the exchange from the other side in time.
     NobodyThere,
     /// The peer's half of the exchange did not check out. In practice this is
@@ -69,6 +81,8 @@ pub enum LinkError {
     /// cryptographic failure to somebody trying to get help with a backup.
     Handshake(HandshakeError),
     Closed,
+    /// `TETHER_TRANSPORT` names neither transport.
+    Transport(String),
 }
 
 impl std::fmt::Display for LinkError {
@@ -78,6 +92,7 @@ impl std::fmt::Display for LinkError {
             Self::Dial(e) => write!(f, "{e}"),
             Self::Http(e) => write!(f, "{e}"),
             Self::Socket(e) => write!(f, "the relay would not open a socket: {e}"),
+            Self::Taken => write!(f, "somebody is already in that seat"),
             Self::NobodyThere => write!(
                 f,
                 "nobody answered on the other side of the session in time"
@@ -88,6 +103,10 @@ impl std::fmt::Display for LinkError {
             ),
             Self::Handshake(e) => write!(f, "the session could not be secured: {e}"),
             Self::Closed => write!(f, "the session ended"),
+            Self::Transport(value) => write!(
+                f,
+                "TETHER_TRANSPORT is `{value}`, but it takes `socket` or `poll`"
+            ),
         }
     }
 }
@@ -114,8 +133,77 @@ impl From<http::HttpError> for LinkError {
 
 /// A sealed session with the other end.
 pub struct Link {
-    socket: Socket,
+    transport: Transport,
     channel: Channel,
+    /// Why this session is not on a WebSocket, when it is not.
+    polled: Option<String>,
+}
+
+enum Transport {
+    Socket(Box<Socket>),
+    Poll(poll::Polled),
+}
+
+impl Transport {
+    async fn send(&mut self, bytes: Vec<u8>) -> Result<(), LinkError> {
+        match self {
+            Self::Socket(socket) => socket
+                .send(Message::Binary(bytes.into()))
+                .await
+                .map_err(|_| LinkError::Closed),
+            Self::Poll(polled) => polled.send(bytes).await,
+        }
+    }
+
+    /// The next thing the peer actually said, skipping keepalives.
+    async fn next(&mut self) -> Result<Vec<u8>, LinkError> {
+        match self {
+            Self::Socket(socket) => next_binary(socket).await,
+            Self::Poll(polled) => polled.next().await,
+        }
+    }
+
+    async fn close(&mut self) {
+        match self {
+            Self::Socket(socket) => {
+                let _ = socket.close(None).await;
+            }
+            Self::Poll(polled) => polled.close().await,
+        }
+    }
+}
+
+/// Which transport the owner may use.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum Carry {
+    /// A socket, or plain requests if the path will not carry one.
+    Either,
+    Socket,
+    Poll,
+}
+
+impl Carry {
+    /// What `TETHER_TRANSPORT` asks for.
+    pub fn from_env() -> Result<Self, LinkError> {
+        match std::env::var("TETHER_TRANSPORT") {
+            Err(_) => Ok(Self::Either),
+            Ok(v) => match v.trim().to_ascii_lowercase().as_str() {
+                "" => Ok(Self::Either),
+                "socket" | "websocket" => Ok(Self::Socket),
+                "poll" => Ok(Self::Poll),
+                _ => Err(LinkError::Transport(v)),
+            },
+        }
+    }
+}
+
+/// Why a socket did not open, sorted by whether plain requests could do better.
+enum Upgrade {
+    /// The relay itself refused: no such slot, or the chair is taken. Polling
+    /// would be refused the same way.
+    Refused(LinkError),
+    /// Something between here and the relay would not carry the upgrade.
+    Failed(String),
 }
 
 /// Tell the relay a slot is finished with, so it stops existing now.
@@ -141,13 +229,47 @@ impl Link {
     /// is the only point on the path where the relay can still see the client's
     /// address, because the edge forwards none of that across an upgrade, so
     /// the per-address limit lives there or nowhere.
+    ///
+    /// Each attempt claims its own ticket, because a ticket is spent by the
+    /// attempt whether or not the chair was taken.
     pub async fn dial_owner(relay: &Relay, code: &InviteCode) -> Result<Self, LinkError> {
-        let answer = http::post_json(relay, &relay.claim_path(code.slot), None).await?;
-        let ticket = answer
-            .get("token")
-            .and_then(|t| t.as_str())
-            .ok_or_else(|| http::HttpError::Malformed("no ticket in the claim".into()))?;
-        Self::open(relay, code.slot, ticket, &code.phrase, Role::Owner).await
+        Self::dial_owner_via(relay, code, Carry::from_env()?).await
+    }
+
+    /// [`Link::dial_owner`] with the transport chosen here rather than by the
+    /// environment.
+    pub async fn dial_owner_via(
+        relay: &Relay,
+        code: &InviteCode,
+        choice: Carry,
+    ) -> Result<Self, LinkError> {
+        let why = if choice == Carry::Poll {
+            "TETHER_TRANSPORT=poll asks for that".to_string()
+        } else {
+            let ticket = claim(relay, code.slot).await?;
+            match open_socket(relay, code.slot, &ticket).await {
+                Ok(socket) => {
+                    let transport = Transport::Socket(Box::new(socket));
+                    return Self::secure(transport, code.slot, &code.phrase, Role::Owner).await;
+                }
+                Err(Upgrade::Refused(e)) => return Err(e),
+                Err(Upgrade::Failed(why)) if choice == Carry::Socket => {
+                    return Err(LinkError::Socket(why))
+                }
+                Err(Upgrade::Failed(why)) => format!("the WebSocket did not open ({why})"),
+            }
+        };
+
+        let polled = poll_owner(relay, code.slot).await?;
+        let mut link = Self::secure(
+            Transport::Poll(polled),
+            code.slot,
+            &code.phrase,
+            Role::Owner,
+        )
+        .await?;
+        link.polled = Some(why);
+        Ok(link)
     }
 
     /// The operator's way in: take the operator's chair with the seat token the
@@ -168,34 +290,45 @@ impl Link {
         phrase: &Phrase,
         role: Role,
     ) -> Result<Self, LinkError> {
-        let config = WebSocketConfig::default()
-            .max_message_size(Some(MAX_FRAME + 1024))
-            .max_frame_size(Some(MAX_FRAME + 1024));
-        let route = Route::for_relay(relay)?;
-        let stream = net::dial(relay, &route).await?;
-        let (mut socket, _) =
-            tokio_tungstenite::client_async_with_config(relay.join_url(slot, token), stream, Some(config))
-                .await
-                .map_err(|e| LinkError::Socket(describe(e)))?;
+        let socket = open_socket(relay, slot, token).await.map_err(|e| match e {
+            Upgrade::Refused(e) => e,
+            Upgrade::Failed(why) => LinkError::Socket(why),
+        })?;
+        Self::secure(Transport::Socket(Box::new(socket)), slot, phrase, role).await
+    }
 
-        let channel =
-            tokio::time::timeout(HANDSHAKE_TIMEOUT, exchange(&mut socket, slot, phrase, role))
-                .await
-                .map_err(|_| LinkError::NobodyThere)??;
-
-        Ok(Self { socket, channel })
+    async fn secure(
+        mut transport: Transport,
+        slot: Slot,
+        phrase: &Phrase,
+        role: Role,
+    ) -> Result<Self, LinkError> {
+        let channel = tokio::time::timeout(
+            HANDSHAKE_TIMEOUT,
+            exchange(&mut transport, slot, phrase, role),
+        )
+        .await
+        .map_err(|_| LinkError::NobodyThere)??;
+        Ok(Self {
+            transport,
+            channel,
+            polled: None,
+        })
     }
 
     pub fn role(&self) -> Role {
         self.channel.role()
     }
 
+    /// Why this session runs over plain requests rather than a WebSocket, as
+    /// the end of a sentence starting "because", or `None` when it does not.
+    pub fn polled(&self) -> Option<&str> {
+        self.polled.as_deref()
+    }
+
     pub async fn send(&mut self, frame: &Frame) -> Result<(), LinkError> {
         let sealed = self.channel.seal(frame)?;
-        self.socket
-            .send(Message::Binary(sealed.into()))
-            .await
-            .map_err(|_| LinkError::Closed)
+        self.transport.send(sealed).await
     }
 
     /// The next frame the peer sent.
@@ -205,7 +338,7 @@ impl Link {
     /// that fails to open means the stream is out of step and everything after
     /// it is untrustworthy.
     pub async fn recv(&mut self) -> Result<Frame, LinkError> {
-        let sealed = next_binary(&mut self.socket).await?;
+        let sealed = self.transport.next().await?;
         Ok(self.channel.open(&sealed)?)
     }
 
@@ -219,44 +352,85 @@ impl Link {
                 reason: reason.to_string(),
             })
             .await;
-        let _ = self.socket.close(None).await;
+        self.transport.close().await;
+    }
+}
+
+async fn claim(relay: &Relay, slot: Slot) -> Result<String, LinkError> {
+    let answer = http::post_json(relay, &relay.claim_path(slot), None).await?;
+    answer
+        .get("token")
+        .and_then(|t| t.as_str())
+        .map(str::to_string)
+        .ok_or_else(|| http::HttpError::Malformed("no ticket in the claim".into()).into())
+}
+
+async fn open_socket(relay: &Relay, slot: Slot, token: &str) -> Result<Socket, Upgrade> {
+    let config = WebSocketConfig::default()
+        .max_message_size(Some(MAX_FRAME + 1024))
+        .max_frame_size(Some(MAX_FRAME + 1024));
+    // A route that cannot be dialled at all would fail plain requests the same
+    // way, so it is a refusal rather than a reason to poll.
+    let route = Route::for_relay(relay).map_err(|e| Upgrade::Refused(e.into()))?;
+    let stream = net::dial(relay, &route)
+        .await
+        .map_err(|e| Upgrade::Refused(e.into()))?;
+    match tokio_tungstenite::client_async_with_config(
+        relay.join_url(slot, token),
+        stream,
+        Some(config),
+    )
+    .await
+    {
+        Ok((socket, _)) => Ok(socket),
+        Err(WsError::Http(response)) => match response.status().as_u16() {
+            404 => Err(Upgrade::Refused(LinkError::Socket(
+                "there is no such session — the code may have expired".into(),
+            ))),
+            409 => Err(Upgrade::Refused(LinkError::Taken)),
+            other => Err(Upgrade::Failed(format!("the path answered {other}"))),
+        },
+        Err(other) => Err(Upgrade::Failed(other.to_string())),
+    }
+}
+
+/// Take the owner's chair for polling.
+///
+/// A socket that did open and was then cut by the path may have paired before
+/// it died. The operator's chair is then still unwinding for a moment, and the
+/// relay answers that as a taken seat — so that answer is tried again, briefly,
+/// on a fresh ticket each time.
+async fn poll_owner(relay: &Relay, slot: Slot) -> Result<poll::Polled, LinkError> {
+    let mut tries = 0;
+    loop {
+        let ticket = claim(relay, slot).await?;
+        match poll::Polled::open(relay, slot, &ticket).await {
+            Err(LinkError::Taken) if tries < 4 => {
+                tries += 1;
+                tokio::time::sleep(Duration::from_secs(1)).await;
+            }
+            other => return other,
+        }
     }
 }
 
 /// The four messages, in order. See the module docs.
 async fn exchange(
-    socket: &mut Socket,
+    transport: &mut Transport,
     slot: Slot,
     phrase: &Phrase,
     role: Role,
 ) -> Result<Channel, LinkError> {
     let (pending, ours) = handshake::start(role, slot, phrase);
-    socket
-        .send(Message::Binary(ours.into()))
-        .await
-        .map_err(|_| LinkError::Closed)?;
+    transport.send(ours).await?;
 
-    let theirs = next_binary(socket).await?;
+    let theirs = transport.next().await?;
     let (confirming, our_tag) = pending.finish(&theirs)?;
 
-    socket
-        .send(Message::Binary(our_tag.to_vec().into()))
-        .await
-        .map_err(|_| LinkError::Closed)?;
+    transport.send(our_tag.to_vec()).await?;
 
-    let their_tag = next_binary(socket).await?;
+    let their_tag = transport.next().await?;
     Ok(confirming.confirm(&their_tag)?)
-}
-
-fn describe(e: WsError) -> String {
-    match e {
-        WsError::Http(response) => match response.status().as_u16() {
-            404 => "there is no such session — the code may have expired".into(),
-            409 => "somebody is already in that seat".into(),
-            other => format!("the relay answered {other}"),
-        },
-        other => other.to_string(),
-    }
 }
 
 /// Read the next thing the peer actually said, skipping keepalives.

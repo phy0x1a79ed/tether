@@ -27,8 +27,7 @@ use std::time::Instant;
 
 use axum::body::Bytes;
 use axum::extract::ws::{Message, WebSocket};
-use futures_util::stream::{SplitSink, SplitStream};
-use futures_util::{SinkExt, StreamExt};
+use futures_util::{Sink, SinkExt, Stream, StreamExt};
 use tether_proto::invite::Slot;
 use tokio::sync::mpsc;
 use tokio::time::{timeout, MissedTickBehavior};
@@ -41,7 +40,7 @@ use crate::session::{Join, Outbound, Seat, Sessions};
 /// Small on purpose. A deep queue would let a fast operator buffer megabytes
 /// inside the relay for a slow owner; a shallow one turns that into
 /// backpressure on the socket, which is where it belongs.
-const QUEUE: usize = 32;
+pub(crate) const QUEUE: usize = 32;
 
 /// How many messages a socket may say before its peer exists.
 ///
@@ -113,6 +112,20 @@ pub fn seat(
 
 /// Wait for the other end, then carry bytes until either side stops.
 pub async fn run(seated: Seated, socket: WebSocket) {
+    let (sink, stream) = socket.split();
+    carry(seated, sink, stream).await
+}
+
+/// [`run`] for anything shaped like a socket.
+///
+/// A WebSocket is one such thing and a polled seat is the other: see
+/// [`crate::poll`]. Both go through this one loop, so the deadlines and the
+/// teardown cascade above hold for both without being written twice.
+pub async fn carry<Si, St, E>(seated: Seated, sink: Si, mut stream: St)
+where
+    Si: Sink<Message> + Unpin + Send + 'static,
+    St: Stream<Item = Result<Message, E>> + Unpin,
+{
     let Seated {
         guard,
         seat,
@@ -122,7 +135,6 @@ pub async fn run(seated: Seated, socket: WebSocket) {
         sessions,
     } = seated;
     let limits = sessions.limits().clone();
-    let (sink, mut stream) = socket.split();
 
     // The writer starts before the pairing resolves, because an operator's
     // socket may wait minutes for the owner to run the launcher and nothing
@@ -193,11 +205,14 @@ enum Wait {
 ///
 /// Holding what the socket says is then forced: the operator speaks first, so
 /// dropping those bytes would break the handshake the pairing exists to carry.
-async fn wait_for_peer(
-    stream: &mut SplitStream<WebSocket>,
+async fn wait_for_peer<St, E>(
+    stream: &mut St,
     mut peer: tokio::sync::oneshot::Receiver<Outbound>,
     budget: std::time::Duration,
-) -> Wait {
+) -> Wait
+where
+    St: Stream<Item = Result<Message, E>> + Unpin,
+{
     let mut early: Vec<Bytes> = Vec::new();
     let deadline = tokio::time::sleep(budget);
     tokio::pin!(deadline);
@@ -223,11 +238,10 @@ async fn wait_for_peer(
     }
 }
 
-async fn write_leg(
-    mut sink: SplitSink<WebSocket, Message>,
-    mut rx: mpsc::Receiver<Bytes>,
-    keepalive: std::time::Duration,
-) {
+async fn write_leg<Si>(mut sink: Si, mut rx: mpsc::Receiver<Bytes>, keepalive: std::time::Duration)
+where
+    Si: Sink<Message> + Unpin,
+{
     let mut tick = tokio::time::interval(keepalive);
     tick.set_missed_tick_behavior(MissedTickBehavior::Delay);
     tick.tick().await; // the first tick fires immediately; skip it
@@ -251,14 +265,16 @@ async fn write_leg(
     let _ = sink.close().await;
 }
 
-async fn read_leg(
-    mut stream: SplitStream<WebSocket>,
+async fn read_leg<St, E>(
+    mut stream: St,
     peer: Outbound,
     limits: &crate::config::Limits,
     slot: Slot,
     seat: Seat,
     early: Vec<Bytes>,
-) {
+) where
+    St: Stream<Item = Result<Message, E>> + Unpin,
+{
     let mut spoken = false;
     // Whatever this socket said before its peer existed, in the order it said
     // it and ahead of anything it says next.

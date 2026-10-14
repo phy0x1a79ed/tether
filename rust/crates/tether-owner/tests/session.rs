@@ -13,7 +13,7 @@
 
 use std::time::Duration;
 
-use tether_link::{Link, Relay};
+use tether_link::{Carry, Link, Relay};
 use tether_owner::session::{self, Outcome};
 use tether_proto::frame::{Ended, Frame, Hello, Kind, Role, Stream, PROTOCOL_VERSION};
 use tether_proto::invite::{InviteCode, Phrase, Slot};
@@ -194,12 +194,22 @@ async fn own(invite: Invite) -> Outcome {
 
 /// The same, and where the record of it went.
 async fn own_and_record(invite: Invite) -> (Outcome, Option<std::path::PathBuf>) {
+    let (outcome, path, _) = own_via(invite, Carry::Either).await;
+    (outcome, path)
+}
+
+/// The owner's side on a chosen transport, and why it polled if it did.
+async fn own_via(
+    invite: Invite,
+    carry: Carry,
+) -> (Outcome, Option<std::path::PathBuf>, Option<String>) {
     log_into_a_directory_of_our_own();
     let me = hello(Role::Owner, "the owner");
-    let mut link = match Link::dial_owner(&invite.relay, &invite.code).await {
+    let mut link = match Link::dial_owner_via(&invite.relay, &invite.code, carry).await {
         Ok(link) => link,
-        Err(e) => return (Outcome::Failed(e.to_string()), None),
+        Err(e) => return (Outcome::Failed(e.to_string()), None, None),
     };
+    let polled = link.polled().map(str::to_string);
     let mut log = tether_owner::log::Log::open(invite.code.slot.get())
         .map_err(|why| format!("no record could be written to {why}"));
     let path = log.as_ref().ok().map(|l| l.path().to_path_buf());
@@ -210,7 +220,7 @@ async fn own_and_record(invite: Invite) -> (Outcome, Option<std::path::PathBuf>)
             if let Ok(log) = log {
                 log.discard();
             }
-            return (outcome, path);
+            return (outcome, path, polled);
         }
     };
     let outcome = session::run(
@@ -221,7 +231,7 @@ async fn own_and_record(invite: Invite) -> (Outcome, Option<std::path::PathBuf>)
         log.ok(),
     )
     .await;
-    (outcome, path)
+    (outcome, path, polled)
 }
 
 /// Keep every record this test binary writes in one place of its own.
@@ -416,8 +426,14 @@ async fn the_record_is_what_the_owner_saw_and_never_the_phrase() {
     let text = std::fs::read_to_string(&path).expect("and the file is there afterwards");
 
     assert!(text.contains("tether session log"), "{text}");
-    assert!(text.contains("the disk is fine"), "the output is in it: {text}");
-    assert!(text.contains("printf"), "and so is what was asked for: {text}");
+    assert!(
+        text.contains("the disk is fine"),
+        "the output is in it: {text}"
+    );
+    assert!(
+        text.contains("printf"),
+        "and so is what was asked for: {text}"
+    );
     assert!(text.contains("ended     "), "and how long it ran: {text}");
 
     for word in words {
@@ -426,5 +442,134 @@ async fn the_record_is_what_the_owner_saw_and_never_the_phrase() {
             "the record leaked the phrase word {word:?}"
         );
     }
+    running.stop();
+}
+
+// ---------------------------------------------------------------------------
+// The same session over plain requests.
+// ---------------------------------------------------------------------------
+
+/// Both halves, with the owner reaching the relay at its own address on its
+/// own transport, as an owner behind a proxy does.
+async fn session_via(
+    invite: Invite,
+    owner_relay: Relay,
+    carry: Carry,
+    plan: Plan,
+    keystrokes: Option<&'static str>,
+) -> (Seen, Outcome, Option<String>) {
+    let operator = tokio::spawn(operate(invite.clone(), plan, keystrokes));
+    tokio::time::sleep(Duration::from_millis(50)).await;
+    let owner = Invite {
+        relay: owner_relay,
+        ..invite
+    };
+    let (outcome, _, polled) = tokio::time::timeout(Duration::from_secs(30), own_via(owner, carry))
+        .await
+        .expect("the owner's session should finish rather than hang");
+    let seen = operator
+        .await
+        .expect("the operator's side should not panic");
+    (seen, outcome, polled)
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_session_over_plain_requests_is_the_same_session() {
+    let (running, invite) = rendezvous().await;
+    let relay = invite.relay.clone();
+    let (seen, outcome, polled) = session_via(
+        invite,
+        relay,
+        Carry::Poll,
+        Plan::Run {
+            kind: Kind::Command,
+            command: Some("cat; printf 'done\\n' >&2; exit 4".into()),
+        },
+        Some("typed over polls\n"),
+    )
+    .await;
+
+    assert!(seen.consented, "the operator never saw the owner's consent");
+    assert_eq!(seen.text(Stream::Stdout), "typed over polls\n");
+    assert_eq!(seen.text(Stream::Stderr), "done\n");
+    assert_eq!(seen.exit, Some(Ended::Code(4)));
+    assert!(!seen.exit_came_early);
+    assert!(matches!(outcome, Outcome::Cut(_)), "{outcome:?}");
+    assert!(polled.unwrap().contains("TETHER_TRANSPORT=poll"));
+    running.stop();
+}
+
+/// A stand-in for a proxy that will not carry an upgrade: it answers every
+/// `/join` with a 502 and passes everything else through to the relay.
+async fn refusing_upgrades(relay: std::net::SocketAddr) -> std::net::SocketAddr {
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    tokio::spawn(async move {
+        loop {
+            let Ok((mut client, _)) = listener.accept().await else {
+                return;
+            };
+            tokio::spawn(async move {
+                let mut head = Vec::new();
+                let mut byte = [0u8; 1];
+                while !head.ends_with(b"\r\n\r\n") {
+                    if client.read(&mut byte).await.unwrap_or(0) == 0 {
+                        return;
+                    }
+                    head.push(byte[0]);
+                }
+                if head.starts_with(b"GET /join/") {
+                    let _ = client
+                        .write_all(b"HTTP/1.1 502 Bad Gateway\r\nContent-Length: 0\r\n\r\n")
+                        .await;
+                    return;
+                }
+                let mut upstream = tokio::net::TcpStream::connect(relay).await.unwrap();
+                upstream.write_all(&head).await.unwrap();
+                let _ = tokio::io::copy_bidirectional(&mut client, &mut upstream).await;
+            });
+        }
+    });
+    addr
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn an_owner_whose_path_refuses_the_upgrade_polls_instead() {
+    let (running, invite) = rendezvous().await;
+    let shim = refusing_upgrades(running.addr).await;
+    let (seen, outcome, polled) = session_via(
+        invite,
+        Relay::parse(&format!("http://{shim}")).unwrap(),
+        Carry::Either,
+        Plan::Run {
+            kind: Kind::Command,
+            command: Some("printf 'hello owner\\n'".into()),
+        },
+        None,
+    )
+    .await;
+
+    assert_eq!(seen.text(Stream::Stdout), "hello owner\n");
+    assert!(matches!(outcome, Outcome::Cut(_)), "{outcome:?}");
+    let polled = polled.expect("the owner should have fallen back to polling");
+    assert!(polled.contains("502"), "{polled}");
+    running.stop();
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn an_owner_told_to_use_a_socket_does_not_poll() {
+    let (running, invite) = rendezvous().await;
+    let shim = refusing_upgrades(running.addr).await;
+    let owner = Invite {
+        relay: Relay::parse(&format!("http://{shim}")).unwrap(),
+        ..invite
+    };
+    let (outcome, _, polled) = own_via(owner, Carry::Socket).await;
+    assert!(polled.is_none());
+    assert!(
+        matches!(&outcome, Outcome::Failed(why) if why.contains("502")),
+        "{outcome:?}"
+    );
     running.stop();
 }

@@ -80,12 +80,24 @@ impl fmt::Display for Proxy {
 #[derive(Debug)]
 pub enum DialError {
     /// A proxy variable is set to something this client cannot use.
-    ProxySetting { var: &'static str, why: String },
+    ProxySetting {
+        var: &'static str,
+        why: String,
+    },
     Connect(std::io::Error),
-    ProxyConnect { proxy: String, error: std::io::Error },
+    ProxyConnect {
+        proxy: String,
+        error: std::io::Error,
+    },
     /// The proxy answered the `CONNECT` with something other than 200.
-    ProxyRefused { proxy: String, status: u16 },
-    Tls { error: String, proxy: Option<String> },
+    ProxyRefused {
+        proxy: String,
+        status: u16,
+    },
+    Tls {
+        error: String,
+        proxy: Option<String>,
+    },
 }
 
 impl fmt::Display for DialError {
@@ -174,7 +186,11 @@ impl Proxy {
                         "it names a {s} proxy and this client speaks only HTTP proxies"
                     )))
                 }
-                s => return Err(bad(&format!("`{s}` is not a proxy scheme this client knows"))),
+                s => {
+                    return Err(bad(&format!(
+                        "`{s}` is not a proxy scheme this client knows"
+                    )))
+                }
             },
             None => (false, value),
         };
@@ -190,7 +206,9 @@ impl Proxy {
         let port = match port {
             // curl's default, which is what the launcher's download used.
             None => 1080,
-            Some(p) => p.parse().map_err(|_| bad(&format!("`{p}` is not a port")))?,
+            Some(p) => p
+                .parse()
+                .map_err(|_| bad(&format!("`{p}` is not a port")))?,
         };
         Ok(Self {
             tls,
@@ -261,15 +279,16 @@ async fn tunnel(proxy: &Proxy, host: &str, port: u16) -> Result<Stream, DialErro
         Some(c) => format!("Proxy-Authorization: Basic {}\r\n", base64(c.as_bytes())),
         None => String::new(),
     };
-    let request = format!(
-        "CONNECT {target} HTTP/1.1\r\nHost: {target}\r\nUser-Agent: tether\r\n{auth}\r\n"
-    );
+    let request =
+        format!("CONNECT {target} HTTP/1.1\r\nHost: {target}\r\nUser-Agent: tether\r\n{auth}\r\n");
     stream.write_all(request.as_bytes()).await.map_err(lost)?;
     stream.flush().await.map_err(lost)?;
 
     let head = read_head(&mut stream).await.map_err(lost)?;
     let status = status_of(&head).ok_or_else(|| {
-        lost(std::io::Error::other("the proxy's answer had no status line"))
+        lost(std::io::Error::other(
+            "the proxy's answer had no status line",
+        ))
     })?;
     if status != 200 {
         return Err(DialError::ProxyRefused {
@@ -369,7 +388,9 @@ fn read_pem(path: &Path) -> Vec<CertificateDer<'static>> {
 /// Whether a `NO_PROXY` list names this host. Entries match the host itself or
 /// any name under it; `*` matches everything. Ports in entries are ignored.
 fn bypassed(list: &str, host: &str) -> bool {
-    let host = host.trim_matches(|c| c == '[' || c == ']').to_ascii_lowercase();
+    let host = host
+        .trim_matches(|c| c == '[' || c == ']')
+        .to_ascii_lowercase();
     list.split([',', ' '])
         .map(str::trim)
         .filter(|e| !e.is_empty())
@@ -427,7 +448,11 @@ fn base64(input: &[u8]) -> String {
     const TABLE: &[u8; 64] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
     let mut out = String::with_capacity(input.len().div_ceil(3) * 4);
     for chunk in input.chunks(3) {
-        let b = [chunk[0], *chunk.get(1).unwrap_or(&0), *chunk.get(2).unwrap_or(&0)];
+        let b = [
+            chunk[0],
+            *chunk.get(1).unwrap_or(&0),
+            *chunk.get(2).unwrap_or(&0),
+        ];
         let n = (u32::from(b[0]) << 16) | (u32::from(b[1]) << 8) | u32::from(b[2]);
         for i in 0..4 {
             if i <= chunk.len() {
@@ -458,19 +483,28 @@ mod tests {
     #[test]
     fn no_variable_means_the_direct_route() {
         assert_eq!(route(RELAY, &[]).unwrap(), Route::Direct);
-        assert_eq!(route(RELAY, &[("HTTPS_PROXY", " ")]).unwrap(), Route::Direct);
+        assert_eq!(
+            route(RELAY, &[("HTTPS_PROXY", " ")]).unwrap(),
+            Route::Direct
+        );
     }
 
     #[test]
     fn the_variables_are_read_as_curl_reads_them() {
         let Route::Proxy(p) = route(
             RELAY,
-            &[("HTTPS_PROXY", "http://upper:1"), ("https_proxy", "lower:3128")],
+            &[
+                ("HTTPS_PROXY", "http://upper:1"),
+                ("https_proxy", "lower:3128"),
+            ],
         )
         .unwrap() else {
             panic!("no proxy")
         };
-        assert_eq!((p.host.as_str(), p.port, p.source), ("lower", 3128, "https_proxy"));
+        assert_eq!(
+            (p.host.as_str(), p.port, p.source),
+            ("lower", 3128, "https_proxy")
+        );
 
         let Route::Proxy(p) = route(RELAY, &[("ALL_PROXY", "http://egress")]).unwrap() else {
             panic!("no proxy")
@@ -478,10 +512,11 @@ mod tests {
         assert_eq!((p.host.as_str(), p.port), ("egress", 1080));
 
         // A plain relay is a test relay, and it reads the plain variables.
-        let Route::Proxy(p) =
-            route("http://127.0.0.1:9", &[("HTTPS_PROXY", "a:1"), ("http_proxy", "b:2")])
-                .unwrap()
-        else {
+        let Route::Proxy(p) = route(
+            "http://127.0.0.1:9",
+            &[("HTTPS_PROXY", "a:1"), ("http_proxy", "b:2")],
+        )
+        .unwrap() else {
             panic!("no proxy")
         };
         assert_eq!(p.host, "b");
@@ -489,22 +524,32 @@ mod tests {
 
     #[test]
     fn credentials_are_decoded_and_sent_as_basic() {
-        let Route::Proxy(p) =
-            route(RELAY, &[("HTTPS_PROXY", "http://me%40corp:p%3Ass@10.0.0.1:8080/")]).unwrap()
-        else {
+        let Route::Proxy(p) = route(
+            RELAY,
+            &[("HTTPS_PROXY", "http://me%40corp:p%3Ass@10.0.0.1:8080/")],
+        )
+        .unwrap() else {
             panic!("no proxy")
         };
         assert_eq!(p.credentials.as_deref(), Some("me@corp:p:ss"));
         assert_eq!((p.host.as_str(), p.port), ("10.0.0.1", 8080));
-        assert_eq!(base64(b"Aladdin:open sesame"), "QWxhZGRpbjpvcGVuIHNlc2FtZQ==");
+        assert_eq!(
+            base64(b"Aladdin:open sesame"),
+            "QWxhZGRpbjpvcGVuIHNlc2FtZQ=="
+        );
         assert_eq!(base64(b"ab"), "YWI=");
         assert_eq!(base64(b"a"), "YQ==");
     }
 
     #[test]
     fn no_proxy_matches_the_host_and_the_names_under_it() {
-        for list in ["nexus.tony-xy-liu.com", ".tony-xy-liu.com", "*.tony-xy-liu.com",
-                     "localhost, tony-xy-liu.com:443", "*"] {
+        for list in [
+            "nexus.tony-xy-liu.com",
+            ".tony-xy-liu.com",
+            "*.tony-xy-liu.com",
+            "localhost, tony-xy-liu.com:443",
+            "*",
+        ] {
             assert_eq!(
                 route(RELAY, &[("HTTPS_PROXY", "p:1"), ("NO_PROXY", list)]).unwrap(),
                 Route::Direct,
@@ -548,15 +593,23 @@ mod tests {
 
     #[test]
     fn the_status_is_read_off_the_first_line() {
-        assert_eq!(status_of(b"HTTP/1.1 200 Connection established\r\n\r\n"), Some(200));
-        assert_eq!(status_of(b"HTTP/1.0 407 Proxy Authentication Required\r\n"), Some(407));
+        assert_eq!(
+            status_of(b"HTTP/1.1 200 Connection established\r\n\r\n"),
+            Some(200)
+        );
+        assert_eq!(
+            status_of(b"HTTP/1.0 407 Proxy Authentication Required\r\n"),
+            Some(407)
+        );
         assert_eq!(status_of(b"garbage"), None);
     }
 
     #[tokio::test]
     async fn the_head_stops_at_the_blank_line() {
         let (mut a, mut b) = tokio::io::duplex(64);
-        a.write_all(b"HTTP/1.1 200 OK\r\nX: y\r\n\r\ntunnel").await.unwrap();
+        a.write_all(b"HTTP/1.1 200 OK\r\nX: y\r\n\r\ntunnel")
+            .await
+            .unwrap();
         let head = read_head(&mut b).await.unwrap();
         assert!(head.ends_with(b"\r\n\r\n"));
         let mut rest = [0u8; 6];
