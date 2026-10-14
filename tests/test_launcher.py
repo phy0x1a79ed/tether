@@ -16,6 +16,7 @@ from __future__ import annotations
 import http.server
 import platform
 import re
+import shutil
 import subprocess
 import threading
 
@@ -43,13 +44,20 @@ def client_names() -> list[str]:
 
 
 class _Recorder(http.server.BaseHTTPRequestHandler):
-    """Answers nothing and remembers what was asked for."""
+    """Remembers what was asked for, and answers with ``body`` if one is set."""
 
     asked: list[str] = []
+    body: bytes | None = None
 
     def do_GET(self):  # noqa: N802 — the base class names it
         type(self).asked.append(self.path)
-        self.send_error(404)
+        if type(self).body is None:
+            self.send_error(404)
+            return
+        self.send_response(200)
+        self.send_header("Content-Length", str(len(type(self).body)))
+        self.end_headers()
+        self.wfile.write(type(self).body)
 
     def log_message(self, *args):
         pass
@@ -58,6 +66,7 @@ class _Recorder(http.server.BaseHTTPRequestHandler):
 @pytest.fixture
 def relay():
     _Recorder.asked = []
+    _Recorder.body = None
     server = http.server.HTTPServer(("127.0.0.1", 0), _Recorder)
     thread = threading.Thread(target=server.serve_forever, daemon=True)
     thread.start()
@@ -68,15 +77,33 @@ def relay():
         server.server_close()
 
 
-def test_the_launcher_asks_for_a_name_the_build_stages(relay):
-    base, recorder = relay
-    # The launcher, run exactly as `curl … | bash -s` runs it. It gets a 404,
-    # which is the point: what is under test is the name in the request.
-    done = subprocess.run(
-        ["bash", str(LAUNCHER), "7", "anchor", "kettle"],
-        env={"PATH": "/usr/bin:/bin", "TETHER_RELAY": base, "HOME": "/tmp"},
-        capture_output=True, text=True, timeout=60,
+# The owner's line says `sh` or `bash`, and which shell `sh` is depends on the
+# machine. Each one this box has is a machine some owner is sitting at.
+SHELLS = [s for s in (["bash"], ["dash"], ["busybox", "sh"]) if shutil.which(s[0])]
+
+
+def launch(shell, base, *code, asset=None):
+    env = {"PATH": "/usr/bin:/bin", "TETHER_RELAY": base, "HOME": "/tmp"}
+    if asset:
+        env["TETHER_ASSET"] = asset
+    return subprocess.run(
+        [*shell, str(LAUNCHER), *code],
+        env=env, capture_output=True, text=True, timeout=60,
     )
+
+
+def elf_header(machine: int) -> bytes:
+    """The first twenty bytes of a Linux executable for one CPU, and nothing
+    after them, so it can be recognised but never run."""
+    return b"\x7fELF" + bytes(14) + machine.to_bytes(2, "little")
+
+
+@pytest.mark.parametrize("shell", SHELLS, ids=" ".join)
+def test_the_launcher_asks_for_a_name_the_build_stages(relay, shell):
+    base, recorder = relay
+    # The launcher, run exactly as `curl … | sh -s` runs it. It gets a 404,
+    # which is the point: what is under test is the name in the request.
+    done = launch(shell, base, "7", "anchor", "kettle")
     assert done.returncode != 0
     assert "could not download" in done.stderr, done.stderr
     assert recorder.asked, "the launcher asked for nothing"
@@ -87,6 +114,46 @@ def test_the_launcher_asks_for_a_name_the_build_stages(relay):
     # Written out so the assertion above cannot pass by both sides being wrong
     # in the same way.
     assert asked == f"/bin/tether-linux-{platform.machine()}"
+
+
+@pytest.mark.skipif(platform.machine() != "x86_64", reason="names an x86-64 host")
+@pytest.mark.parametrize("shell", SHELLS, ids=" ".join)
+def test_a_client_for_another_machine_is_refused_before_it_runs(relay, shell):
+    """The failure this replaces was a wrong download that died with nothing to
+    say. Now the launcher reads the header and says which two machines these
+    are."""
+    base, recorder = relay
+    recorder.body = elf_header(0xB7)
+    done = launch(shell, base, "acre", "anchor", "kettle", asset="tether-linux-aarch64")
+    assert done.returncode == 1
+    assert "this machine is linux-x86_64" in done.stderr, done.stderr
+    assert "is linux-aarch64" in done.stderr
+    assert "TETHER_ASSET=tether-linux-aarch64" in done.stderr
+    assert "nothing was run" in done.stderr
+    assert "running" not in done.stderr
+
+
+@pytest.mark.skipif(platform.machine() != "x86_64", reason="names an x86-64 host")
+@pytest.mark.parametrize("shell", SHELLS, ids=" ".join)
+def test_a_client_that_will_not_start_is_reported_rather_than_run(relay, shell):
+    """The right header on a file that cannot run: a truncated transfer, or a
+    kernel that will not load it. The launcher tries `--version` first, so the
+    owner hears that it would not start rather than seeing a bare crash."""
+    base, recorder = relay
+    recorder.body = elf_header(0x3E)
+    done = launch(shell, base, "acre", "anchor", "kettle")
+    assert done.returncode == 1
+    assert "would not start here" in done.stderr, done.stderr
+    assert "running" not in done.stderr
+
+
+@pytest.mark.parametrize("shell", SHELLS, ids=" ".join)
+def test_a_web_page_is_not_mistaken_for_a_client(relay, shell):
+    base, recorder = relay
+    recorder.body = b"<!doctype html><title>sign in</title>"
+    done = launch(shell, base, "acre", "anchor", "kettle")
+    assert done.returncode == 1
+    assert "a web page, not a client" in done.stderr, done.stderr
 
 
 def test_every_staged_client_has_a_launcher_that_can_ask_for_it():

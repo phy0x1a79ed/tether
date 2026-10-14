@@ -491,7 +491,7 @@ mod tests {
         assert!(!whole.contains(secret_a), "{whole}");
         assert!(!whole.contains(secret_b), "{whole}");
         assert!(
-            !whole.contains("bash -s"),
+            !whole.contains("sh -s "),
             "the line the owner runs embeds the phrase and must never be an event"
         );
     }

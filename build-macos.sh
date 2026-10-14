@@ -90,4 +90,4 @@ echo "   $SIZE bytes served at /tether/bin/$CLIENT"
 echo
 echo "shipped $BUILD as $CLIENT"
 echo "a Mac owner's line is unchanged:"
-echo "  curl -fsSL $PUBLIC | bash -s <code>"
+echo "  curl -fsSL $PUBLIC | sh -s <code>"

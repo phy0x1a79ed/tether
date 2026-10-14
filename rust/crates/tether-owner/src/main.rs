@@ -1,7 +1,7 @@
 //! `tether acre anchor kettle` — the whole interface the owner ever sees.
 //!
 //! Plain tokens, nothing to quote, no punctuation inside the code. The launcher
-//! passes whatever followed `bash -s` straight through, so a longer code costs
+//! passes whatever followed `sh -s` straight through, so a longer code costs
 //! nothing here and a shorter one was never the point: the code is read aloud,
 //! and reading aloud is what it is shaped for.
 //!
@@ -44,7 +44,14 @@ fn main() -> ExitCode {
         return ExitCode::SUCCESS;
     }
     if args.iter().any(|a| a == "--version") {
-        println!("tether {} (protocol v{PROTOCOL_VERSION})", build());
+        // The launcher reads the platform off this line, so a binary that runs
+        // under a translator or an emulator still says what it was built for.
+        println!(
+            "tether {} (protocol v{PROTOCOL_VERSION}) for {}-{}",
+            build(),
+            std::env::consts::OS,
+            std::env::consts::ARCH
+        );
         return ExitCode::SUCCESS;
     }
 
@@ -86,6 +93,19 @@ fn main() -> ExitCode {
 
 async fn connect(relay: Relay, code: InviteCode) -> Outcome {
     eprintln!("  reaching {relay} …");
+    // Said before anything leaves, so a route the owner did not expect is on
+    // the screen rather than inferred from a failure.
+    match tether_link::Route::for_relay(&relay) {
+        Ok(route) => {
+            if let Some(line) = route.describe() {
+                eprintln!("  {line}");
+            }
+        }
+        Err(e) => return Outcome::Failed(e.to_string()),
+    }
+    if let (_, Some(note)) = tether_link::net::extra_roots() {
+        eprintln!("  {note}");
+    }
     let mut link = match Link::dial_owner(&relay, &code).await {
         Ok(link) => link,
         Err(e) => return Outcome::Failed(e.to_string()),

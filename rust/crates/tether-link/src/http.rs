@@ -9,19 +9,17 @@
 //!
 //! Hand-rolled rather than reached for, because the surface a general client
 //! brings is surface this binary then carries onto a stranger's machine:
-//! redirects to follow, proxies to honour, cookies to keep, compression to
-//! decode. None of that is wanted here, and `Connection: close` plus
-//! read-to-end removes the last of it — there is no response framing to get
-//! wrong. What this does not support, it refuses rather than half-implements.
+//! redirects to follow, cookies to keep, compression to decode. None of that
+//! is wanted here, and `Connection: close` plus read-to-end removes the last of
+//! it — there is no response framing to get wrong. What this does not support,
+//! it refuses rather than half-implements. The route, proxy included, is
+//! [`crate::net`]'s.
 
 use std::fmt;
-use std::sync::Arc;
 
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
-use tokio::net::TcpStream;
-use tokio_rustls::rustls::{ClientConfig, RootCertStore};
-use tokio_rustls::TlsConnector;
 
+use crate::net::{self, DialError, Route};
 use crate::relay::Relay;
 
 /// A response body this size is a misdirected request, not an answer: every
@@ -30,8 +28,8 @@ const MAX_BODY: usize = 64 * 1024;
 
 #[derive(Debug)]
 pub enum HttpError {
+    Dial(DialError),
     Connect(std::io::Error),
-    Tls(String),
     /// The status the relay answered with, when it was not 200. `404` is the
     /// ordinary one and means the slot is not there — expired, spent, or never
     /// issued. The relay answers all three the same way on purpose.
@@ -42,8 +40,8 @@ pub enum HttpError {
 impl fmt::Display for HttpError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
-            Self::Connect(e) => write!(f, "could not reach the relay: {e}"),
-            Self::Tls(e) => write!(f, "could not set up TLS to the relay: {e}"),
+            Self::Dial(e) => write!(f, "{e}"),
+            Self::Connect(e) => write!(f, "lost the relay mid-request: {e}"),
             Self::Status(404) => write!(
                 f,
                 "the relay has no such session — the code may be mistyped, or it may have expired"
@@ -83,22 +81,11 @@ pub async fn post_json(
         relay.authority()
     );
 
-    let tcp = TcpStream::connect((relay.host(), relay.port()))
+    let route = Route::for_relay(relay).map_err(HttpError::Dial)?;
+    let stream = net::dial(relay, &route).await.map_err(HttpError::Dial)?;
+    let raw = exchange(stream, request)
         .await
         .map_err(HttpError::Connect)?;
-
-    let raw = if relay.tls() {
-        let name = rustls_pki_types::ServerName::try_from(relay.host().to_string())
-            .map_err(|e| HttpError::Tls(e.to_string()))?;
-        let stream = TlsConnector::from(tls_config())
-            .connect(name, tcp)
-            .await
-            .map_err(|e| HttpError::Tls(e.to_string()))?;
-        exchange(stream, request).await
-    } else {
-        exchange(tcp, request).await
-    }
-    .map_err(HttpError::Connect)?;
 
     let text = String::from_utf8_lossy(&raw);
     let status = text
@@ -136,23 +123,6 @@ where
     Ok(raw)
 }
 
-/// The trust store, from the roots compiled into this binary.
-///
-/// Mozilla's roots rather than the host's, deliberately. The owner's machine is
-/// one we know nothing about — it may be a fresh install, a Mac whose keychain
-/// the launcher cannot read, or a box whose store somebody has added to. What
-/// this binary will accept should be a property of this binary.
-fn tls_config() -> Arc<ClientConfig> {
-    let roots = RootCertStore {
-        roots: webpki_roots::TLS_SERVER_ROOTS.to_vec(),
-    };
-    Arc::new(
-        ClientConfig::builder()
-            .with_root_certificates(roots)
-            .with_no_client_auth(),
-    )
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -162,13 +132,5 @@ mod tests {
         let text = HttpError::Status(404).to_string();
         assert!(text.contains("mistyped"), "{text}");
         assert!(text.contains("expired"), "{text}");
-    }
-
-    #[test]
-    fn the_trust_store_is_not_empty() {
-        assert!(!webpki_roots::TLS_SERVER_ROOTS.is_empty());
-        // Building it must not panic, which is the failure mode when rustls has
-        // no crypto provider to pick.
-        let _ = tls_config();
     }
 }

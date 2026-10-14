@@ -33,14 +33,15 @@ use futures_util::{SinkExt, StreamExt};
 use tether_proto::frame::{Frame, Role, MAX_FRAME};
 use tether_proto::handshake::{self, Channel, HandshakeError};
 use tether_proto::invite::{InviteCode, Phrase, Slot};
-use tokio::net::TcpStream;
 use tokio_tungstenite::tungstenite::protocol::WebSocketConfig;
 use tokio_tungstenite::tungstenite::{Error as WsError, Message};
-use tokio_tungstenite::{MaybeTlsStream, WebSocketStream};
+use tokio_tungstenite::WebSocketStream;
 
 pub mod http;
+pub mod net;
 pub mod relay;
 
+pub use net::{DialError, Route};
 pub use relay::{Relay, RelayError};
 
 /// How long the opening exchange may take.
@@ -51,11 +52,12 @@ pub use relay::{Relay, RelayError};
 /// then says nothing is not somebody having trouble typing.
 pub const HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(90);
 
-type Socket = WebSocketStream<MaybeTlsStream<TcpStream>>;
+type Socket = WebSocketStream<net::Stream>;
 
 #[derive(Debug)]
 pub enum LinkError {
     Relay(RelayError),
+    Dial(DialError),
     Http(http::HttpError),
     /// The socket would not open. Carries the status when the relay answered
     /// with one: `404` is a slot that is not there, `409` a chair already taken.
@@ -73,6 +75,7 @@ impl std::fmt::Display for LinkError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             Self::Relay(e) => write!(f, "{e}"),
+            Self::Dial(e) => write!(f, "{e}"),
             Self::Http(e) => write!(f, "{e}"),
             Self::Socket(e) => write!(f, "the relay would not open a socket: {e}"),
             Self::NobodyThere => write!(
@@ -94,6 +97,12 @@ impl std::error::Error for LinkError {}
 impl From<HandshakeError> for LinkError {
     fn from(e: HandshakeError) -> Self {
         Self::Handshake(e)
+    }
+}
+
+impl From<DialError> for LinkError {
+    fn from(e: DialError) -> Self {
+        Self::Dial(e)
     }
 }
 
@@ -162,13 +171,12 @@ impl Link {
         let config = WebSocketConfig::default()
             .max_message_size(Some(MAX_FRAME + 1024))
             .max_frame_size(Some(MAX_FRAME + 1024));
-        let (mut socket, _) = tokio_tungstenite::connect_async_with_config(
-            relay.join_url(slot, token),
-            Some(config),
-            false,
-        )
-        .await
-        .map_err(|e| LinkError::Socket(describe(e)))?;
+        let route = Route::for_relay(relay)?;
+        let stream = net::dial(relay, &route).await?;
+        let (mut socket, _) =
+            tokio_tungstenite::client_async_with_config(relay.join_url(slot, token), stream, Some(config))
+                .await
+                .map_err(|e| LinkError::Socket(describe(e)))?;
 
         let channel =
             tokio::time::timeout(HANDSHAKE_TIMEOUT, exchange(&mut socket, slot, phrase, role))

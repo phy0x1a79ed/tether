@@ -892,7 +892,7 @@ async fn run_verb(
 /// known on this side.
 pub fn bootstrap(relay: &tether_link::Relay, slot: Slot, phrase: &Phrase) -> String {
     format!(
-        "curl -fsSL {} | bash -s {} {}",
+        "curl -fsSL {} | sh -s {} {}",
         relay.launcher_url(),
         slot.word(),
         phrase
@@ -910,7 +910,7 @@ mod tests {
         let line = bootstrap(&relay, Slot::new(7).unwrap(), &phrase);
         assert_eq!(
             line,
-            "curl -fsSL https://nexus.tony-xy-liu.com/tether | bash -s acre anchor kettle"
+            "curl -fsSL https://nexus.tony-xy-liu.com/tether | sh -s acre anchor kettle"
         );
         // The code's own tokens carry no shell metacharacters, which is the
         // property that lets it be read aloud and typed without quoting.

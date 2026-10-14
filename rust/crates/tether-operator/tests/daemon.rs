@@ -308,7 +308,7 @@ async fn an_invite_is_a_slot_from_the_relay_and_words_the_relay_never_sees() {
     assert!((1..=999).contains(&slot), "{slot} is not a spoken slot");
     assert_eq!(invite["words"].as_array().unwrap().len(), 2);
 
-    // The line the owner is read out: three plain words after `bash -s`,
+    // The line the owner is read out: three plain words after `sh -s`,
     // nothing to quote and nothing to punctuate. The slot is a number here,
     // where it addresses a relay, and a word there, where a person says it.
     let said = tether_proto::invite::Slot::new(slot as u32).unwrap().word();
