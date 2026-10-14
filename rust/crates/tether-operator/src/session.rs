@@ -107,6 +107,10 @@ pub enum Phase {
     Waiting,
     /// Both ends are on one sealed channel; the owner is being asked.
     Greeting,
+    /// The owner's machine showed the prompt with no terminal to answer it,
+    /// and the person there may confirm by running the client again. The slot
+    /// stays open for that second run.
+    Confirming,
     /// The owner said yes. The only phase in which work may be asked for.
     Open,
     Ended,
@@ -117,6 +121,7 @@ impl Phase {
         match self {
             Phase::Waiting => "waiting",
             Phase::Greeting => "greeting",
+            Phase::Confirming => "confirming",
             Phase::Open => "open",
             Phase::Ended => "ended",
         }
@@ -298,9 +303,17 @@ async fn serve(
     track: Track,
     mut rx: mpsc::Receiver<Command>,
 ) {
-    if let Some(mut link) = connect(&cfg, &code, &seat, lifetime, &track, &mut rx).await {
-        if consent(&cfg, &mut link, &track, &mut rx).await {
-            carry(&mut link, &track, &mut rx).await;
+    let deadline = Instant::now() + lifetime;
+    while let Some(mut link) = connect(&cfg, &code, &seat, deadline, &track, &mut rx).await {
+        match consent(&cfg, &mut link, &track, &mut rx).await {
+            Consent::Given => {
+                carry(&mut link, &track, &mut rx).await;
+                break;
+            }
+            // The chair is taken again for the owner's second run, inside the
+            // same invite: confirming is not a reason to hand them a new code.
+            Consent::Deferred => continue,
+            Consent::Ended => break,
         }
     }
     // Every way a session can end arrives here, and only here. The redial loop
@@ -326,11 +339,10 @@ async fn connect(
     cfg: &Config,
     code: &InviteCode,
     seat: &str,
-    lifetime: Duration,
+    deadline: Instant,
     track: &Track,
     rx: &mut mpsc::Receiver<Command>,
 ) -> Option<Link> {
-    let deadline = Instant::now() + lifetime;
     while Instant::now() < deadline {
         // The dial gets whatever is left of the invite, never more. Its own
         // ninety-second patience is the right budget for one attempt and the
@@ -350,6 +362,13 @@ async fn connect(
                     Ok(Ok(link)) => return Some(link),
                     // Nobody has run the launcher yet. Take the chair again.
                     Ok(Err(LinkError::NobodyThere)) => break,
+                    // The last pairing is still giving the chair back, which
+                    // takes the relay a moment after an owner leaves to
+                    // confirm. Take it again once it has.
+                    Ok(Err(LinkError::Taken)) => {
+                        tokio::time::sleep(Duration::from_millis(250)).await;
+                        break;
+                    }
                     // Somebody arrived with the wrong words. They will very
                     // likely try again, so wait for them — and count it,
                     // because the relay is counting it too.
@@ -387,8 +406,27 @@ async fn connect(
             }
         }
     }
-    finish(track, "nobody redeemed the invite before it expired");
+    let confirming = track
+        .state
+        .lock()
+        .is_ok_and(|s| s.phase == Phase::Confirming);
+    finish(
+        track,
+        if confirming {
+            "the owner did not confirm before the invite expired"
+        } else {
+            "nobody redeemed the invite before it expired"
+        },
+    );
     None
+}
+
+/// How the wait for consent came out.
+enum Consent {
+    Given,
+    /// The owner is confirming with a second run. The session lives on.
+    Deferred,
+    Ended,
 }
 
 /// Say who we are, and wait for the owner's `Hello`, which *is* their consent.
@@ -397,11 +435,11 @@ async fn consent(
     link: &mut Link,
     track: &Track,
     rx: &mut mpsc::Receiver<Command>,
-) -> bool {
+) -> Consent {
     set_phase(track, Phase::Greeting);
     if let Err(e) = link.send(&Frame::Hello(cfg.hello())).await {
         finish(track, format!("could not greet the owner: {e}"));
-        return false;
+        return Consent::Ended;
     }
 
     let waiting = tokio::time::sleep(CONSENT_TIMEOUT);
@@ -415,35 +453,42 @@ async fn consent(
                         s.owner = Some(owner);
                     }
                     set_phase(track, Phase::Open);
-                    return true;
+                    return Consent::Given;
                 }
                 Ok(Frame::Cut { reason }) => {
                     finish(track, reason);
-                    return false;
+                    return Consent::Ended;
+                }
+                Ok(Frame::Defer { reason }) => {
+                    if let Ok(mut s) = track.state.lock() {
+                        s.phase = Phase::Confirming;
+                    }
+                    track.note(journal::session_confirming(&reason));
+                    return Consent::Deferred;
                 }
                 Ok(Frame::Say { .. }) | Ok(Frame::Ping { .. }) | Ok(Frame::Pong { .. }) => {}
                 Ok(_) => {
                     let why = "the owner's end sent session traffic before consenting";
                     link.cut(why).await;
                     finish(track, why);
-                    return false;
+                    return Consent::Ended;
                 }
                 Err(e) => {
                     finish(track, format!("the owner's end went away while deciding: {e}"));
-                    return false;
+                    return Consent::Ended;
                 }
             },
             command = rx.recv() => match command {
                 None => {
                     link.cut("the operator's daemon is shutting down").await;
                     finish(track, "the daemon is shutting down");
-                    return false;
+                    return Consent::Ended;
                 }
                 Some(Command { what: What::Cut { reason }, reply }) => {
                     link.cut(&reason).await;
                     let _ = reply.send(Ok(json!({"ok": true, "cut": reason})));
                     finish(track, reason);
-                    return false;
+                    return Consent::Ended;
                 }
                 // Worth allowing, and the reason the owner's side accepts it
                 // before consent: it is how the operator says what they are
@@ -464,7 +509,7 @@ async fn consent(
                 let why = "nobody answered the prompt at the owner's keyboard";
                 link.cut(why).await;
                 finish(track, why);
-                return false;
+                return Consent::Ended;
             }
         }
     }

@@ -8,10 +8,12 @@
 //! marker string below exists only inside the bypass, so its absence from the
 //! built binary is the claim, tested by reading the file.
 //!
-//! **No terminal means no.** The binary is run with no controlling terminal,
-//! against a live relay with a real operator waiting, and the operator is
-//! checked for the refusal. A prompt that silently passed when nobody could
-//! answer it would be worse than no prompt.
+//! **No terminal means no, until a second run says yes.** The binary is run
+//! with no controlling terminal, against a live relay with a real operator
+//! waiting. The operator is checked for the deferral rather than a consent, and
+//! then the second run is checked: only the words the first run printed, only
+//! once, and never before the first run has shown the prompt. A prompt that
+//! silently passed when nobody could answer it would be worse than no prompt.
 
 use std::path::Path;
 
@@ -58,21 +60,24 @@ fn setsid() -> Option<&'static str> {
         .find(|path| Path::new(path).exists())
 }
 
-#[tokio::test(flavor = "multi_thread")]
+/// A relay, and an operator at one slot of it that says who it is to every
+/// owner who pairs and reports what each one answered.
 #[cfg(not(feature = "test-consent-bypass"))]
-async fn with_nobody_at_the_keyboard_the_answer_is_no() {
-    use std::process::Stdio;
+struct Stage {
+    running: tether_relay::Running,
+    relay: String,
+    code: Vec<String>,
+    answers: tokio::sync::mpsc::UnboundedReceiver<String>,
+}
+
+#[cfg(not(feature = "test-consent-bypass"))]
+async fn stage() -> Stage {
     use std::time::Duration;
 
-    use tether_link::{Link, Relay};
+    use tether_link::{Link, LinkError, Relay};
     use tether_proto::frame::{Frame, Hello, Role, PROTOCOL_VERSION};
     use tether_proto::invite::{Phrase, Slot};
     use tether_relay::config::{Config, Limits};
-
-    let Some(setsid) = setsid() else {
-        eprintln!("no setsid on this host; skipping");
-        return;
-    };
 
     const BEARER: &str = "a-test-bearer";
     let running = tether_relay::start(Config {
@@ -94,89 +99,137 @@ async fn with_nobody_at_the_keyboard_the_answer_is_no() {
     let slot = Slot::new(issued["slot"].as_u64().unwrap() as u32).unwrap();
     let seat = issued["token"].as_str().unwrap().to_string();
     let phrase = Phrase::mint(2).unwrap();
+    let mut code = vec![slot.word().to_string()];
+    code.extend(phrase.words().iter().map(|w| w.to_string()));
 
-    // A real operator, waiting to be let in.
-    let operator = tokio::spawn({
+    let (tell, answers) = tokio::sync::mpsc::unbounded_channel();
+    tokio::spawn({
         let relay = relay.clone();
-        let phrase = phrase.clone();
         async move {
-            let mut link = Link::dial_operator(&relay, slot, &seat, &phrase)
-                .await
-                .expect("the operator should reach the relay");
-            link.send(&Frame::Hello(Hello {
-                version: PROTOCOL_VERSION,
-                role: Role::Operator,
-                who: "awm as tony".into(),
-                host: "altair".into(),
-                os: "linux".into(),
-                build: "test".into(),
-            }))
-            .await
-            .unwrap();
             loop {
-                match link.recv().await {
-                    Ok(Frame::Cut { reason }) => return Some(reason),
-                    // Consent would show up as a Hello from the owner. It must
-                    // not, because there is nobody there to give it.
-                    Ok(Frame::Hello(_)) => return None,
-                    Ok(_) => continue,
-                    Err(_) => return Some(String::new()),
+                let mut link = match Link::dial_operator(&relay, slot, &seat, &phrase).await {
+                    Ok(link) => link,
+                    Err(LinkError::NobodyThere | LinkError::Taken) => {
+                        tokio::time::sleep(Duration::from_millis(100)).await;
+                        continue;
+                    }
+                    Err(_) => return,
+                };
+                let _ = link
+                    .send(&Frame::Hello(Hello {
+                        version: PROTOCOL_VERSION,
+                        role: Role::Operator,
+                        who: "awm as tony".into(),
+                        host: "altair".into(),
+                        os: "linux".into(),
+                        build: "test".into(),
+                    }))
+                    .await;
+                let answer = loop {
+                    match link.recv().await {
+                        Ok(Frame::Defer { reason }) => break format!("defer: {reason}"),
+                        Ok(Frame::Cut { reason }) => break format!("cut: {reason}"),
+                        // Consent. Ended at once: being let in is all this
+                        // checks.
+                        Ok(Frame::Hello(_)) => {
+                            link.cut("that is all").await;
+                            break "hello".into();
+                        }
+                        Ok(_) => continue,
+                        Err(_) => break "gone".into(),
+                    }
+                };
+                if tell.send(answer).is_err() {
+                    return;
                 }
             }
         }
     });
-    tokio::time::sleep(Duration::from_millis(50)).await;
 
-    // Somewhere of its own to write a record, so that finding none afterwards
-    // means none was written rather than that it went elsewhere.
-    let records = std::env::temp_dir().join(format!("tether-refused-{}", std::process::id()));
-    let _ = std::fs::remove_dir_all(&records);
-    std::fs::create_dir_all(&records).unwrap();
+    Stage {
+        relay: format!("http://{}", running.addr),
+        running,
+        code,
+        answers,
+    }
+}
+
+/// What the operator heard from the next owner to pair.
+#[cfg(not(feature = "test-consent-bypass"))]
+async fn heard(answers: &mut tokio::sync::mpsc::UnboundedReceiver<String>) -> String {
+    tokio::time::timeout(std::time::Duration::from_secs(10), answers.recv())
+        .await
+        .expect("the operator heard nothing")
+        .unwrap()
+}
+
+/// Run the client with no controlling terminal, in a temporary directory of
+/// the test's own so the confirmation it keeps is the test's to inspect.
+#[cfg(not(feature = "test-consent-bypass"))]
+async fn unattended(
+    setsid: &str,
+    stage: &Stage,
+    tmp: &Path,
+    extra: &[&str],
+) -> (Option<i32>, String) {
+    use std::process::Stdio;
+    use std::time::Duration;
 
     let mut command = tokio::process::Command::new(setsid);
     command
         .arg(binary())
-        .arg(slot.word())
-        .env("TETHER_RELAY", format!("http://{}", running.addr))
-        .env("TETHER_LOG_DIR", &records)
+        .args(&stage.code)
+        .args(extra)
+        .env("TETHER_RELAY", &stage.relay)
+        .env("TETHER_LOG_DIR", tmp.join("records"))
+        .env("TMPDIR", tmp)
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped());
-    for word in phrase.words() {
-        command.arg(word);
-    }
-
     let done = tokio::time::timeout(Duration::from_secs(30), command.output())
         .await
         .expect("the client should give up rather than wait forever")
         .expect("the client should run");
-    let said = String::from_utf8_lossy(&done.stderr).into_owned();
-    let exit = done.status;
+    (
+        done.status.code(),
+        String::from_utf8_lossy(&done.stderr).into_owned(),
+    )
+}
 
-    let refusal = tokio::time::timeout(Duration::from_secs(10), operator)
-        .await
-        .unwrap_or_else(|_| panic!("the operator heard nothing; the client said: {said}"))
-        .unwrap();
+#[tokio::test(flavor = "multi_thread")]
+#[cfg(not(feature = "test-consent-bypass"))]
+async fn with_nobody_at_the_keyboard_the_answer_is_no_until_a_second_run_says_yes() {
+    let Some(setsid) = setsid() else {
+        eprintln!("no setsid on this host; skipping");
+        return;
+    };
+    let mut stage = stage().await;
+    let tmp = std::env::temp_dir().join(format!("tether-unattended-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&tmp);
+    std::fs::create_dir_all(tmp.join("records")).unwrap();
 
-    assert!(
-        !exit.success(),
-        "a client that was never allowed in exited 0; it said: {said}"
-    );
-    assert!(
-        said.contains("no terminal"),
-        "the owner's screen should say why, and it said: {said}"
-    );
-    match refusal {
-        Some(reason) => assert!(
-            reason.contains("no terminal"),
-            "the operator should be told why, and got {reason:?}"
-        ),
-        None => panic!("the owner's side consented with nobody at the keyboard"),
-    }
+    // A confirmation before anything was shown is refused, and before the
+    // network: the operator never hears of it.
+    let (exit, said) = unattended(setsid, &stage, &tmp, &["--agree", "acre", "acre", "acre"]).await;
+    assert_eq!(exit, Some(2), "{said}");
+    assert!(said.contains("none is waiting"), "{said}");
 
-    // Nobody consented, so there was no session to have a record of. Otherwise
-    // saying no would fill the directory the owner was told they could delete.
-    let left: Vec<_> = std::fs::read_dir(&records)
+    // The first run shows the whole prompt, and says no for now.
+    let (exit, said) = unattended(setsid, &stage, &tmp, &[]).await;
+    assert_eq!(exit, Some(3), "{said}");
+    assert!(said.contains("awm as tony on altair"), "{said}");
+    assert!(said.contains("no terminal"), "{said}");
+    let answer = heard(&mut stage.answers).await;
+    assert!(answer.starts_with("defer: "), "the operator got {answer:?}");
+    let words: Vec<String> = said
+        .lines()
+        .find_map(|line| line.trim().strip_prefix("--agree "))
+        .expect("the prompt should print the words that confirm it")
+        .split(' ')
+        .map(str::to_string)
+        .collect();
+    // Nobody consented yet, so there is no session to have a record of.
+    let left: Vec<_> = std::fs::read_dir(tmp.join("records"))
         .unwrap()
         .filter_map(|e| e.ok().map(|e| e.file_name()))
         .collect();
@@ -184,6 +237,46 @@ async fn with_nobody_at_the_keyboard_the_answer_is_no() {
         left.is_empty(),
         "a session nobody agreed to left something behind: {left:?}"
     );
-    let _ = std::fs::remove_dir_all(&records);
-    running.stop();
+    // And nothing it kept carries the words it printed.
+    let kept = std::fs::read_dir(&tmp)
+        .unwrap()
+        .filter_map(|e| e.ok())
+        .find(|e| e.file_name().to_string_lossy().starts_with("tether-"))
+        .expect("the first run should keep a confirmation");
+    let record = std::fs::read_to_string(kept.path().join("confirm")).unwrap();
+    for word in &words {
+        assert!(
+            !record.contains(&format!(" {word}\n")),
+            "{word} is in {record}"
+        );
+    }
+
+    // The wrong words are refused, again before the network.
+    let mut wrong: Vec<&str> = words.iter().map(String::as_str).collect();
+    wrong[0] = if wrong[0] == "acre" { "anchor" } else { "acre" };
+    let mut args = vec!["--agree"];
+    args.extend(&wrong);
+    let (exit, said) = unattended(setsid, &stage, &tmp, &args).await;
+    assert_eq!(exit, Some(2), "{said}");
+    assert!(said.contains("not the words"), "{said}");
+
+    // The right ones let the operator in.
+    let mut args = vec!["--agree"];
+    args.extend(words.iter().map(String::as_str));
+    let (exit, said) = unattended(setsid, &stage, &tmp, &args).await;
+    assert_eq!(
+        heard(&mut stage.answers).await,
+        "hello",
+        "the client said: {said}"
+    );
+    assert!(said.contains("confirmed with --agree"), "{said}");
+    assert_eq!(exit, Some(0), "{said}");
+
+    // Once.
+    let (exit, said) = unattended(setsid, &stage, &tmp, &args).await;
+    assert_eq!(exit, Some(2), "{said}");
+    assert!(said.contains("none is waiting"), "{said}");
+
+    let _ = std::fs::remove_dir_all(&tmp);
+    stage.running.stop();
 }

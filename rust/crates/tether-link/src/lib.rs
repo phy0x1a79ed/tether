@@ -347,11 +347,15 @@ impl Link {
     /// Best-effort by design: this runs on paths where the socket may already
     /// be gone, and failing to announce a departure must not stop the departure.
     pub async fn cut(&mut self, reason: &str) {
-        let _ = self
-            .send(&Frame::Cut {
-                reason: reason.to_string(),
-            })
-            .await;
+        self.leave(&Frame::Cut {
+            reason: reason.to_string(),
+        })
+        .await;
+    }
+
+    /// Send a last frame, then close.
+    pub async fn leave(&mut self, last: &Frame) {
+        let _ = self.send(last).await;
         self.transport.close().await;
     }
 }

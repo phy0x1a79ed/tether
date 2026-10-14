@@ -1,3 +1,4 @@
+pub mod confirm;
 pub mod consent;
 pub mod log;
 pub mod exec;

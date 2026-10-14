@@ -31,12 +31,19 @@ test-consent-bypass = []
 [dependencies]
 crossterm = { workspace = true }
 futures-util = { workspace = true }
+getrandom = { workspace = true }
+hex = { workspace = true }
 portable-pty = { workspace = true }
+sha2 = { workspace = true }
 tether-link = { workspace = true }
 tether-proto = { workspace = true }
+thiserror = { workspace = true }
 tokio = { workspace = true }
 unicode-width = { workspace = true }
 vt100 = { workspace = true }
+
+[target.'cfg(unix)'.dependencies]
+libc = { workspace = true }
 
 [dev-dependencies]
 # The end-to-end test stands a real relay up rather than faking one. The

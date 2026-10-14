@@ -319,6 +319,18 @@ pub fn session_phase(phase: &str, owner: Option<Value>, ended: Option<&str>) -> 
     )
 }
 
+/// The owner's machine had no terminal to answer the prompt at, and the
+/// person there was asked to confirm by running the client again.
+///
+/// A phase change like any other, so a reader that follows phases needs nothing
+/// new; `why` is what the owner's end said.
+pub fn session_confirming(why: &str) -> (&'static str, Value) {
+    (
+        "session.phase",
+        json!({"phase": "confirming", "owner": null, "ended": null, "why": why}),
+    )
+}
+
 /// Somebody arrived with the wrong words.
 ///
 /// The count only. A near miss of a twenty-bit phrase is still information

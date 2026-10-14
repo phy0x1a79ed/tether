@@ -22,6 +22,7 @@
 use std::process::ExitCode;
 
 use tether_link::{Link, Relay};
+use tether_owner::confirm::{Pending, Refusal};
 use tether_owner::session::{self, Outcome};
 use tether_proto::frame::{Hello, Role, PROTOCOL_VERSION};
 use tether_proto::invite::InviteCode;
@@ -30,11 +31,16 @@ const USAGE: &str = "\
 tether — let someone you trust run commands on this machine, while you watch.
 
     tether <word> <word> <word>
+    tether <word> <word> <word> --agree <word> <word> <word>
 
 The words are the invite code you were given, in the order you were given
 them. Nothing is installed. A record of the session is written where the
 prompt will name, for you to keep or delete. You will be asked here, at this
 keyboard, before anyone gets in.
+
+With no terminal here to answer at, the prompt is printed with three more
+words, and running the same command again with `--agree` and those words is
+the yes. That works once, for that code and that operator, for five minutes.
 ";
 
 fn main() -> ExitCode {
@@ -55,7 +61,11 @@ fn main() -> ExitCode {
         return ExitCode::SUCCESS;
     }
 
-    let code = match InviteCode::parse(&args) {
+    let (code, agree) = match args.iter().position(|a| a == "--agree") {
+        Some(at) => (&args[..at], Some(&args[at + 1..])),
+        None => (&args[..], None),
+    };
+    let code = match InviteCode::parse(code) {
         Ok(code) => code,
         Err(e) => {
             eprintln!("{e}\n\n{USAGE}");
@@ -68,6 +78,19 @@ fn main() -> ExitCode {
             eprintln!("{e}");
             return ExitCode::from(2);
         }
+    };
+
+    // Everything a confirmation can be checked against without the network is
+    // checked here, so a wrong one never spends a pairing from the slot.
+    let agreed = match agree {
+        None => None,
+        Some(words) => match agreement(words, &code, &relay) {
+            Ok(pending) => Some(pending),
+            Err(why) => {
+                eprintln!("not connected: {why}");
+                return ExitCode::from(2);
+            }
+        },
     };
 
     // One thread is enough for the session itself; the pty's reader and writer
@@ -83,7 +106,7 @@ fn main() -> ExitCode {
         }
     };
 
-    let outcome = runtime.block_on(connect(relay, code));
+    let outcome = runtime.block_on(connect(relay, code, agreed));
     match &outcome {
         Outcome::Cut(_) => {}
         other => eprintln!("{other}"),
@@ -91,7 +114,24 @@ fn main() -> ExitCode {
     ExitCode::from(outcome.code())
 }
 
-async fn connect(relay: Relay, code: InviteCode) -> Outcome {
+/// A second run's `--agree`, checked against what the first run left.
+fn agreement(words: &[String], code: &InviteCode, relay: &Relay) -> Result<Pending, String> {
+    if tether_owner::consent::keyboard_here() {
+        return Err("--agree is for a machine with no terminal to answer at, and this one \
+                    has one — run the command without --agree and answer the prompt"
+            .into());
+    }
+    if words.len() != tether_owner::confirm::WORDS_IN_CONFIRMATION {
+        return Err(Refusal::Malformed.to_string());
+    }
+    let pending = Pending::load().map_err(|e| e.to_string())?;
+    pending
+        .check(code, relay, words)
+        .map_err(|e| e.to_string())?;
+    Ok(pending)
+}
+
+async fn connect(relay: Relay, code: InviteCode, agreed: Option<Pending>) -> Outcome {
     eprintln!("  reaching {relay} …");
     // Said before anything leaves, so a route the owner did not expect is on
     // the screen rather than inferred from a failure.
@@ -121,7 +161,7 @@ async fn connect(relay: Relay, code: InviteCode) -> Outcome {
         .map_err(|why| format!("no record could be written to {why}"));
 
     let me = me();
-    let operator = match session::greet(&mut link, &relay, &code, &me, &mut log).await {
+    let operator = match session::greet(&mut link, &relay, &code, &me, &mut log, agreed).await {
         Ok(operator) => operator,
         Err(outcome) => {
             // Nobody consented, so there was no session to have a record of.

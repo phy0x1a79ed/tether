@@ -259,6 +259,7 @@ fn name(frame: &Frame) -> String {
         Frame::Cut { .. } => "cut",
         Frame::Ping { .. } => "ping",
         Frame::Pong { .. } => "pong",
+        Frame::Defer { .. } => "defer",
     }
     .into()
 }
@@ -365,6 +366,57 @@ async fn nothing_is_asked_for_before_the_owner_says_yes() {
         seen.before_consent
     );
     assert_eq!(seen.operator.unwrap().who, "awm as tony");
+    rig.stop();
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn an_owner_confirming_with_a_second_run_finds_the_slot_still_held() {
+    let rig = rig(Limits::default()).await;
+    let invite = rig.operator.handle("invite", &json!({})).await.unwrap();
+    let slot = invite["slot"].as_u64().unwrap();
+    let words: Vec<&str> = invite["code"].as_str().unwrap().split(' ').collect();
+    let code = InviteCode::parse(&words).unwrap();
+
+    // The first run: hear who is asking, then leave to be confirmed.
+    let mut first = Link::dial_owner(&rig.address, &code).await.unwrap();
+    loop {
+        match first.recv().await.unwrap() {
+            Frame::Hello(_) => break,
+            Frame::Say { .. } => {}
+            other => panic!("the operator sent {} before consent", name(&other)),
+        }
+    }
+    first
+        .leave(&Frame::Defer {
+            reason: "no terminal here".into(),
+        })
+        .await;
+    until(&rig, slot, "confirming").await;
+
+    // Work is still refused while the owner is away confirming.
+    let early = rig
+        .operator
+        .handle("run", &json!({"command": "true"}))
+        .await;
+    assert!(early.is_err(), "work was accepted before consent: {early:?}");
+
+    // The second run, on the same code, is let in by the same operator.
+    let owner = tokio::spawn(own(rig.address.clone(), code, Owner::Report(0)));
+    until(&rig, slot, "open").await;
+    let ran = rig
+        .operator
+        .handle("run", &json!({"command": "echo hello"}))
+        .await
+        .unwrap();
+    let (ended, _, _) = finished(&rig, ran["task"].as_u64().unwrap()).await;
+    assert_eq!(ended["exit_code"], json!(0));
+
+    rig.operator
+        .handle("cut", &json!({"reason": "done"}))
+        .await
+        .unwrap();
+    let seen = owner.await.unwrap();
+    assert!(seen.before_consent.is_empty(), "{:?}", seen.before_consent);
     rig.stop();
 }
 

@@ -62,7 +62,12 @@ API_MANIFEST: dict[str, Any] = {
         "they run one line and answer a prompt before anything connects. They "
         "watch everything you do and either side can cut it. Nothing is "
         "installed on their machine. Both sides keep a record of what was "
-        "done, which the owner is shown and agrees to before anything runs."
+        "done, which the owner is shown and agrees to before anything runs. "
+        "A machine with no terminal, such as an agent's sandbox, is shown the "
+        "prompt with three more words and says yes by running the line again "
+        "with `--agree` and those words; the session reads `confirming` "
+        "meanwhile. Only whoever read that prompt has the words, so do not "
+        "ask for them or guess them."
     ),
     "functions": [
         {

@@ -6,7 +6,9 @@
 //! a person here has answered, and the operator's side is written to send no
 //! task until it has that `Hello`. If the answer is no, what goes back is a
 //! `Cut` carrying the reason, so the refusal shows up on the operator's screen
-//! as a sentence rather than as a socket that died.
+//! as a sentence rather than as a socket that died. With no keyboard to answer
+//! at, what goes back is a `Defer` instead, and the answer comes from a second
+//! run (see [`crate::confirm`]).
 //!
 //! Two guards for one rule, because it is the rule: [`greet`] accepts only a
 //! `Hello`, a `Say` or a `Cut` before consent, and the [`Runner`] that could
@@ -21,6 +23,7 @@ use tether_proto::frame::{Frame, Hello, Role, PROTOCOL_VERSION, VIEWPORT};
 use tether_proto::invite::InviteCode;
 use tokio::sync::mpsc;
 
+use crate::confirm::Pending;
 use crate::consent::{self, Answer, Ask};
 use crate::log::Log;
 use crate::exec::Runner;
@@ -38,6 +41,9 @@ pub enum Outcome {
     Cut(String),
     /// The person at the keyboard said no.
     Refused(String),
+    /// Nobody could answer here, and the prompt said how to confirm with a
+    /// second run.
+    Deferred,
     /// The other end went away without saying anything.
     PeerLeft,
     Failed(String),
@@ -48,6 +54,7 @@ impl Outcome {
         match self {
             Outcome::Cut(_) => 0,
             Outcome::Refused(_) => 1,
+            Outcome::Deferred => 3,
             Outcome::PeerLeft => 1,
             Outcome::Failed(_) => 2,
         }
@@ -59,6 +66,7 @@ impl std::fmt::Display for Outcome {
         match self {
             Outcome::Cut(why) => write!(f, "session ended: {why}"),
             Outcome::Refused(why) => write!(f, "not connected: {why}"),
+            Outcome::Deferred => write!(f, "not connected yet: waiting for the confirmation above"),
             Outcome::PeerLeft => write!(f, "the other end went away"),
             Outcome::Failed(why) => write!(f, "{why}"),
         }
@@ -66,12 +74,16 @@ impl std::fmt::Display for Outcome {
 }
 
 /// Learn who is calling, then ask the person here whether to let them in.
+///
+/// `agreed` is a second run's confirmation, already checked against everything
+/// that could be checked before the operator said who they are.
 pub async fn greet(
     link: &mut Link,
     relay: &tether_link::Relay,
     code: &InviteCode,
     me: &Hello,
     log: &mut Result<Log, String>,
+    agreed: Option<Pending>,
 ) -> Result<Hello, Outcome> {
     let operator = match tokio::time::timeout(GREETING_TIMEOUT, wait_for_hello(link, log)).await {
         Ok(Ok(hello)) => hello,
@@ -109,12 +121,27 @@ pub async fn greet(
         code,
         log: log.as_ref().map(|l| l.path()).map_err(|why| why.as_str()),
     };
-    match consent::ask(&ask) {
+    let answer = match agreed {
+        Some(pending) => match pending.redeem(&operator) {
+            Ok(()) => {
+                consent::agreed(&ask);
+                Answer::Allowed
+            }
+            Err(why) => {
+                link.cut("the owner confirmed a prompt that named a different operator")
+                    .await;
+                return Err(Outcome::Refused(why.to_string()));
+            }
+        },
+        None => consent::ask(&ask),
+    };
+    match answer {
         Answer::Allowed => {}
         Answer::Refused(why) => {
             link.cut(why).await;
             return Err(Outcome::Refused(why.to_string()));
         }
+        Answer::Unheard => return Err(defer(link, relay, code, &operator).await),
     }
 
     // This is the consent, on the wire. Nothing left this side before it.
@@ -122,6 +149,64 @@ pub async fn greet(
         return Err(Outcome::PeerLeft);
     }
     Ok(operator)
+}
+
+/// Nobody could answer here: leave the words that will, and tell the operator
+/// to keep the slot for the second run.
+async fn defer(
+    link: &mut Link,
+    relay: &tether_link::Relay,
+    code: &InviteCode,
+    operator: &Hello,
+) -> Outcome {
+    let (pending, words) = Pending::new(code, relay, operator);
+    if let Err(why) = pending.keep() {
+        let refusal = "no terminal to ask at the owner's end";
+        eprintln!("  There is no terminal here to ask, so the answer is no.");
+        eprintln!("  (No confirmation could be kept for a second run either: {why}.)");
+        link.cut(refusal).await;
+        return Outcome::Refused(refusal.into());
+    }
+    let words = words.join(" ");
+    eprintln!("  There is no terminal here to answer at, so the answer is no for now.");
+    eprintln!(
+        "  To let them in, run the same command again within {} minutes,",
+        crate::confirm::LIFETIME.as_secs() / 60
+    );
+    eprintln!("  with this added at the end:");
+    eprintln!();
+    eprintln!("      --agree {words}");
+    eprintln!();
+    eprintln!("  that is:");
+    eprintln!();
+    eprintln!("      {}", rerun(relay, code, &words));
+    eprintln!();
+    link.leave(&Frame::Defer {
+        reason: "the owner's machine has no terminal to answer at; the prompt was shown \
+                 there, with how to confirm by running the client again"
+            .into(),
+    })
+    .await;
+    Outcome::Deferred
+}
+
+/// The command that confirms, written out whole so it can be copied.
+fn rerun(relay: &tether_link::Relay, code: &InviteCode, words: &str) -> String {
+    if cfg!(windows) {
+        let exe = std::env::current_exe()
+            .map(|p| format!("& \"{}\"", p.display()))
+            .unwrap_or_else(|_| "tether".into());
+        return format!("{exe} {code} --agree {words}");
+    }
+    // The launcher reads the relay from the same variable the client does, so
+    // a run pointed elsewhere has to be pointed there again.
+    let pointed = std::env::var_os("TETHER_RELAY")
+        .map(|_| format!("TETHER_RELAY={relay} "))
+        .unwrap_or_default();
+    format!(
+        "curl -fsSL {} | {pointed}sh -s {code} --agree {words}",
+        relay.launcher_url()
+    )
 }
 
 async fn wait_for_hello(link: &mut Link, log: &mut Result<Log, String>) -> Result<Hello, Outcome> {
@@ -324,7 +409,7 @@ pub async fn run(
                         break Outcome::PeerLeft;
                     }
                 }
-                Frame::Pong { .. } | Frame::Hello(_) => {}
+                Frame::Pong { .. } | Frame::Hello(_) | Frame::Defer { .. } => {}
                 // Output and Exit are this side's to produce. A peer sending
                 // one is claiming something ran here that did not.
                 Frame::Output { .. } | Frame::Exit { .. } => {

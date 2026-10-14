@@ -12,7 +12,9 @@
 //!
 //! **No keyboard means no.** If it cannot be opened there is nobody here to
 //! ask, and the answer to a question nobody heard is no. This is why the
-//! failure direction is stated as a rule and not left to a default.
+//! failure direction is stated as a rule and not left to a default. The
+//! prompt is still printed, and [`crate::confirm`] is how the person who reads
+//! it there can say yes by running the client a second time.
 //!
 //! **The bypass is a build feature, not a flag.** A flag that exists eventually
 //! gets used, and an unattended connect path is the one thing this tool refuses
@@ -43,6 +45,9 @@ pub enum Answer {
     /// saw. A session that ends with no reason on either screen is the thing
     /// that makes people distrust a tool.
     Refused(&'static str),
+    /// The prompt was shown and there was no keyboard to answer it at. A no,
+    /// for now.
+    Unheard,
 }
 
 impl Answer {
@@ -123,11 +128,8 @@ pub fn ask(ask: &Ask<'_>) -> Answer {
 
         // The keyboard, never standard input: see the module docs.
         let Ok(tty) = keyboard() else {
-            let _ = writeln!(
-                err,
-                "\n  There is no terminal here to ask, so the answer is no."
-            );
-            return Answer::Refused("no terminal to ask at the owner's end");
+            let _ = writeln!(err);
+            return Answer::Unheard;
         };
         let mut line = String::new();
         if BufReader::new(tty).read_line(&mut line).is_err() {
@@ -142,6 +144,19 @@ pub fn ask(ask: &Ask<'_>) -> Answer {
     }
 }
 
+/// Show the prompt answered by a second run's `--agree`, so this screen and
+/// the session's record both say what was agreed to and how.
+pub fn agreed(ask: &Ask<'_>) {
+    eprintln!("{ask}yes, confirmed with --agree");
+    eprintln!();
+}
+
+/// Whether there is a keyboard here to ask. A second run's `--agree` is refused
+/// when there is, so the two ways of answering never mix.
+pub fn keyboard_here() -> bool {
+    keyboard().is_ok()
+}
+
 /// The keyboard of the person at this machine, opened directly.
 ///
 /// Unix opens the controlling terminal. Windows has no such path and names the
@@ -154,13 +169,11 @@ pub fn ask(ask: &Ask<'_>) -> Answer {
 /// A machine that is neither refuses, which is the same answer it would give
 /// with nobody at the keyboard.
 #[cfg(unix)]
-#[allow(dead_code)] // unused under `test-consent-bypass`, where nothing asks
 fn keyboard() -> std::io::Result<std::fs::File> {
     std::fs::File::open("/dev/tty")
 }
 
 #[cfg(windows)]
-#[allow(dead_code)] // unused under `test-consent-bypass`, where nothing asks
 fn keyboard() -> std::io::Result<std::fs::File> {
     std::fs::OpenOptions::new()
         .read(true)
@@ -169,7 +182,6 @@ fn keyboard() -> std::io::Result<std::fs::File> {
 }
 
 #[cfg(not(any(unix, windows)))]
-#[allow(dead_code)] // unused under `test-consent-bypass`, where nothing asks
 fn keyboard() -> std::io::Result<std::fs::File> {
     Err(std::io::Error::new(
         std::io::ErrorKind::Unsupported,

@@ -15,7 +15,8 @@
 //!
 //! The operator sends its `Hello` and then waits. The owner's `Hello` is sent
 //! **only after the person at that keyboard has said yes**, so receiving it is
-//! how the operator learns consent was given. Until then the only frames the
+//! how the operator learns consent was given, and a `Defer` is how it learns
+//! the answer is still to come. Until then the only frames the
 //! owner will accept are `Hello`, `Say` and `Cut`; an `Open` arriving early
 //! ends the session rather than being ignored, because a peer that sends one is
 //! not the peer this protocol describes.
@@ -182,6 +183,19 @@ pub enum Frame {
         reason: String,
     },
 
+    /// Not yet. The owner's end showed the prompt and had no terminal to read
+    /// an answer from, so it asked the person there to confirm by running the
+    /// client again. Sent in place of `Hello` or `Cut`, and only before
+    /// consent. The operator keeps its slot open for the second run instead of
+    /// releasing it, which is the whole difference from a `Cut`.
+    ///
+    /// It never carries the confirmation itself. That is minted on the owner's
+    /// machine and shown only there, which is what makes the second run a
+    /// person's answer rather than something the operator could have supplied.
+    Defer {
+        reason: String,
+    },
+
     /// Keepalives. The path holds idle sockets open for an hour at nginx and
     /// less at the CDN, so a quiet session dies unless something is flowing.
     Ping {
@@ -276,6 +290,9 @@ mod tests {
             },
             Frame::Cut {
                 reason: "owner ended the session".into(),
+            },
+            Frame::Defer {
+                reason: "the owner has no terminal here".into(),
             },
             Frame::Ping { nonce: 7 },
             Frame::Pong { nonce: 7 },
