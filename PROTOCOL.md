@@ -61,13 +61,16 @@ hold the secret.
 4. The owner runs the launcher with the code — the shell one, or the PowerShell
    one at `/win`. The client posts to `/claim/{slot}` and gets the owner's
    single-use ticket.
-5. The client opens `/join/{slot}/{ticket}`. The relay now has both chairs and
-   starts moving bytes.
+5. The client opens `/join/{slot}/{ticket}`, or takes the chair by polling
+   when its path refuses a WebSocket. The relay now has both chairs and starts
+   moving bytes.
 6. Both ends run the handshake. A wrong phrase fails here, at the peer.
 7. The operator sends its `Hello`. The client shows the person who is asking,
    which relay, which code, and how to cut it.
 8. The person answers. Only a yes sends the owner's `Hello`, so receiving that
-   frame is how the operator learns consent was given.
+   frame is how the operator learns consent was given. An owner with no
+   terminal sends `Defer` instead and exits. The operator keeps the slot and
+   waits at step 3 for the second run.
 9. Tasks run. The owner watches each one as it happens.
 10. Either side sends `Cut`. The other exits and says why.
 11. The daemon posts to `/release/{slot}/{seat token}`. The slot stops existing,
@@ -148,6 +151,11 @@ asset shape decides whether the name may be asked for at all. The Windows
 launcher has a route of its own, `/win`, because PowerShell interprets what
 comes back and `/bin` serves opaque bytes.
 
+The polled routes are in the same family. The door carries `/poll/{slot}/{token}`
+and `/seat/{id}/(recv|send|close)` because `tether-relay/src/poll.rs` serves
+them. A door without them answers `404`, and an owner behind a proxy that
+refuses WebSockets then has no transport left.
+
 A door looser than the parser forwards malformed input the door exists to
 refuse. A door tighter than the parser turns a legitimate invite into a `404`
 naming no cause, on the one path whose user has no account and no way to ask.
@@ -159,6 +167,20 @@ every node, and whether a relay is configured decides `404` versus proxy. An
 edge that classified the path only when a relay was wired would fall through to
 the ordinary session check and answer `401`, which contradicts the verdict and
 tells an anonymous caller that the path is special.
+
+## When the path refuses a WebSocket
+
+Some owners reach the internet only through an egress proxy. The client dials
+through the proxy that `https_proxy` names, and `tether-link/src/net.rs` owns
+that route. A proxy may still refuse the upgrade, or cut it. The client then
+takes its chair with plain requests: one held open to receive and one to send.
+`tether-relay/src/poll.rs` owns the routes, the numbering and the body format.
+
+A polled chair is one more adapter onto the relay's pump, not a second pump. So
+the idle deadline, the queue depth and the teardown cascade are the ones a
+socket gets, and neither end of the sealed channel can tell how the other is
+carried. Only the owner ever polls. The operator's daemon always uses the
+socket, because it runs on a network its operator chose.
 
 ## Why the claim is a separate request
 
@@ -194,7 +216,7 @@ the per-direction keys. Read it there.
 
 Every frame rides inside the sealed channel, so the relay pumps bytes it cannot
 parse. `tether-proto/src/frame.rs` is the definition and carries the reasoning
-for each one. Three rules are worth stating where both ends can see them.
+for each one. Four rules are worth stating where both ends can see them.
 
 1. **Output precedes exit.** For a given task, every `Output` arrives before
    its `Exit`, and `Exit` is the last frame that task produces. A transcript
@@ -223,6 +245,11 @@ silently. The owner's pane is now the authority: a grid they cannot see all of
 breaks the sentence they consented to, and the operator is the end that can
 afford to be letterboxed.
 
+**CAUTION** `Defer` is the exception to that argument. It travels from the
+owner to the operator, so the stale daemon is the end that has to decode it,
+and an operator older than the frame drops the session instead of waiting for
+the second run. Ship the operator and the clients together.
+
 Frames are encoded with field names rather than positions. The two ends are
 separate downloads and need not be the same build, so a field added mid-struct
 must not be read as the field that used to sit there.
@@ -243,8 +270,16 @@ nothing about a string that could never appear.
 Two properties of the prompt are structural rather than careful. It reads from
 the keyboard rather than standard input, because the launcher arrives through a
 pipe and a prompt reading from that pipe would be answered by the operator. No
-keyboard means no, because the answer to a question nobody heard is no.
-`tether-owner/src/consent.rs` owns this subject.
+keyboard means not yet, because a question nobody heard has no answer.
+
+That case is answered by a second run, not by a flag that skips the prompt. The
+first run shows the whole prompt, then three words it generated locally, and
+stops. The second run must carry those words and must find the record the first
+left, under a per-user directory, for the same code, relay and operator. The
+words are generated and shown on the owner's machine after the prompt and never
+sent, so an operator cannot put a working confirmation in the line it reads
+out. A first run that already carries one fails. `tether-owner/src/consent.rs`
+and `tether-owner/src/confirm.rs` own this subject.
 
 The keyboard has two spellings and one meaning. Unix opens `/dev/tty`, the
 controlling terminal. Windows opens `CONIN$`, the console attached to this

@@ -112,6 +112,11 @@ the public host.
 | `TETHER_BUILD_CACHE` | build-clients.sh | cargo's shared build directory (default `~/.cache/tether`) |
 | `TETHER_DOCKER_DNS` | build-clients.sh | a resolver for the build container, when the default one stalls |
 | `TETHER_SHELL` | owner's client | the shell a task runs in, when the machine's own is somewhere else |
+| `TETHER_RELAY` | owner's launcher and client | the relay to use instead of the public one, for a test relay |
+| `https_proxy`, `all_proxy`, `no_proxy` | owner's client | the egress proxy, read in either case as curl reads it. `user:pass@` is Basic auth. A SOCKS proxy is refused by name |
+| `SSL_CERT_FILE`, `SSL_CERT_DIR` | owner's client | extra CA certificates, for a proxy that re-signs TLS |
+| `TETHER_TRANSPORT` | owner's client | `socket` or `poll` forces one transport. Unset tries the socket first |
+| `TETHER_ASSET` | owner's launcher | forces the download name. Tests only, and named in every refusal it causes |
 
 The relay's port is declared once in `awm.config`, because two processes must
 agree on it and neither owns it.
@@ -165,7 +170,7 @@ cost the rest.
 
 The owner runs one line and holds no key material:
 
-    curl -fsSL https://nexus.tony-xy-liu.com/tether | bash -s acre anchor kettle
+    curl -fsSL https://nexus.tony-xy-liu.com/tether | sh -s acre anchor kettle
 
 Windows has no shell that can run that script, so it has its own launcher at
 its own address:
@@ -178,6 +183,23 @@ residue is one directory of its own under the temporary directory, holding the
 downloaded client and the record of the session written beside it. The launcher
 prints that directory before running anything, and the consent prompt names the
 record again before the owner answers.
+
+The launcher is POSIX sh, so `sh`, `bash`, `dash` and busybox all run it. It
+checks the download's header and the client's own `--version` against the
+machine it detected, and refuses to run a client built for another one. The
+message names both platforms.
+
+An owner with no terminal, such as an agent in a sandbox, says yes in two runs:
+
+1. The first run shows the full consent prompt. It then prints three words and
+   the exact line to run again, and exits with status 3. The operator keeps the
+   slot and shows the session as `confirming`.
+2. The second run is that line, the code followed by `--agree` and the three
+   words. It works once, within five minutes, for the same code, relay and
+   operator. Any mismatch fails before a session opens and names which part
+   differed.
+
+`--agree` is refused wherever a terminal opens, so the two paths never mix.
 
 Two different claims live here and only the first was ever the promise. **No
 session survives its process**: nothing reconnects, nothing is scheduled,
