@@ -66,7 +66,7 @@ in_container() {
     # build that hangs rather than one that fails.
     docker run --rm \
         ${TETHER_DOCKER_DNS:+--dns "$TETHER_DOCKER_DNS"} \
-        --mount type=bind,source="$HERE/rust",target=/root/src \
+        --mount type=bind,source="$HERE",target=/root/src \
         --mount type=bind,source="$CROSS_TARGET_DIR",target="$CROSS_TARGET_DIR" \
         --mount type=bind,source="$REGISTRY_DIR",target=/root/.cargo/registry \
         --env CARGO_TARGET_DIR="$CROSS_TARGET_DIR" \
@@ -95,6 +95,7 @@ packages_for() {
         case "$bin" in
             tether|tether.exe) out="$out -p tether-owner" ;;
             tether-relay)      out="$out -p tether-relay" ;;
+            tether-operator)   out="$out -p tether-operator" ;;
         esac
     done
     echo "$out"
@@ -195,7 +196,7 @@ case "${1:---all}" in
         echo "   $TETHER_BUILD"
         step "build"
         CARGO_TARGET_DIR="$HOST_TARGET_DIR" \
-            cargo build --release --manifest-path "$HERE/rust/Cargo.toml"
+            cargo build --release --manifest-path "$HERE/Cargo.toml"
         # The stage is cleared first. A host build refreshes one slot, and
         # leaving the others behind from an earlier run is how a stale binary
         # survives a rebuild that looked like it succeeded.
