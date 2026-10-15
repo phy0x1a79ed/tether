@@ -26,7 +26,7 @@
 #
 # CAUTION: a `--host` build is dynamically linked against this machine. It is
 # right for testing here and wrong to ship, and nothing about the file says so,
-# so it writes `local` into the stage's BUILD_KIND and ship-binaries.sh refuses
+# so it writes `local` into the stage's BUILD_KIND and release.sh refuses
 # that.
 set -euo pipefail
 HERE="$(cd "$(dirname "$0")" && pwd)"
@@ -181,7 +181,7 @@ case "${1:---all}" in
         TETHER_BUILD="$(tether_stamp)"
         export TETHER_BUILD
         build_target "$1"
-        # Partial, and said so. ship-binaries.sh refuses anything but a full
+        # Partial, and said so. release.sh refuses anything but a full
         # container build, which is what stops one fresh slot beside four stale
         # ones from shipping as a set.
         echo "cross-partial" > "$TETHER_DIST/BUILD_KIND"
@@ -215,7 +215,7 @@ case "${1:---all}" in
         echo "local" > "$TETHER_DIST/BUILD_KIND"
         echo "$TETHER_BUILD" > "$TETHER_DIST/BUILD_STAMP"
         echo
-        echo "staged a HOST-LINKED tether-$os-$arch — fine to test with, refused by ship-binaries.sh"
+        echo "staged a HOST-LINKED tether-$os-$arch — fine to test with, refused by release.sh"
     ;;
     --gate)
         # shellcheck disable=SC2046
