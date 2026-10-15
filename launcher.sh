@@ -5,12 +5,13 @@
 #
 # Served by the relay at the mount root, so the address in that line is the
 # whole address there is. It fetches the client for this machine, checks that
-# the client is one this machine can run, runs it with whatever followed
-# `sh -s`, and stops. Nothing is installed: no PATH entry, no login item, no
-# launch agent, no service, no cron. What is left behind is this directory: the
-# client, and the record of the session written beside it. The directory is
-# named below before anything runs, and the record is named again in the prompt
-# before the owner answers it.
+# the bytes are the ones this release published, checks that the client is one
+# this machine can run, runs it with whatever followed `sh -s`, and stops.
+# Nothing is installed: no PATH entry, no login item, no launch agent, no
+# service, no cron. What is left behind is this directory: the client, and the
+# record of the session written beside it. The directory is named below before
+# anything runs, and the record is named again in the prompt before the owner
+# answers it.
 #
 # # Why this is plain sh
 #
@@ -19,14 +20,16 @@
 # busybox in a container, bash 3.2 on a Mac. Anything past POSIX dies on one of
 # them before it has said a word, so this script uses nothing past POSIX.
 #
-# # Why there is no checksum here
+# # Why there is a checksum here now
 #
-# The binary and this script are served by the same host over the same TLS
-# connection, so anybody able to alter one can alter the other — and would
-# simply write a matching checksum. A hash here would look like a defence and
-# be none. What the owner is actually trusting is the address they were read,
-# which is why that address is shown again by the client before it asks them
-# anything. The checks below guard against a wrong pick, not against tampering.
+# The client no longer comes from the same host as this script. A release
+# publishes it to GitHub, this launcher tries GitHub first, and the relay is
+# only the fallback for a machine that cannot reach GitHub. Two hosts means the
+# old reasoning — alter one, alter the other — no longer holds, so the sha256 of
+# every client is baked into this file when the release is cut, and a download
+# whose hash does not match is refused rather than run. The owner is still
+# trusting the address they were read; the hash is what lets a second host serve
+# the bytes without being able to change them.
 #
 # # Why the arguments are passed straight through
 #
@@ -36,9 +39,26 @@
 # change on the minting side alone.
 set -eu
 
-BASE="${TETHER_RELAY:-https://nexus.tony-xy-liu.com/tether}"
+# --- baked by release.sh (do not edit between the markers) ---
+# Empty here means this is the source copy, not a released launcher. The source
+# refuses to run: a raw checkout has no checksums, so it could only fetch
+# unverified. release.sh fills these in when it cuts a release.
+TETHER_REPO="phy0x1a79ed/tether"
+TETHER_TAG=""
+TETHER_SUMS=""
+# --- end baked ---
 
 die() { echo "tether: $*" >&2; exit 1; }
+
+[ -n "$TETHER_TAG" ] || die "this is the launcher source, which ships no checksums. Fetch a released launcher from the relay (curl -fsSL https://nexus.tony-xy-liu.com/tether) or from the repository's releases."
+
+# GitHub is the first source; the relay is the fallback a machine behind an
+# allow-list that blocks GitHub still reaches. TETHER_RELAY moves the fallback,
+# TETHER_GITHUB_BASE moves the first source (an enterprise mirror of the
+# release), and TETHER_NO_GITHUB=1 skips GitHub for a machine that cannot or may
+# not reach it.
+BASE="${TETHER_RELAY:-https://nexus.tony-xy-liu.com/tether}"
+GITHUB_BASE="${TETHER_GITHUB_BASE:-https://github.com/$TETHER_REPO/releases/download}"
 
 kernel="$(uname -s)"
 machine="$(uname -m)"
@@ -66,27 +86,77 @@ esac
 
 # Linux builds are named for the kernel's own word for the architecture; macOS
 # builds for Apple's. Keeping each side's spelling means the name here and the
-# name the shipping script writes are one string, not two that have to agree.
+# name the release writes are one string, not two that have to agree.
 [ "$os" = linux ] && [ "$arch" = arm64 ] && arch=aarch64
 expected="$os-$arch"
 asset="${TETHER_ASSET:-tether-$expected}"
 
+# The hash this release published for the asset being fetched. No entry means
+# this launcher never shipped that name, which is a mistake to stop on, not to
+# paper over by skipping the check.
+want="$(printf '%s\n' "$TETHER_SUMS" | awk -v a="$asset" '$2 == a { print $1; exit }')"
+[ -n "$want" ] || die "this release published no client called $asset"
+
+# sha256 of a file, by whatever this machine has. Order is deliberate:
+# sha256sum on Linux, shasum on a Mac, openssl where neither is. Each prints the
+# hash as its first field.
+sha256_of() {
+    if command -v sha256sum >/dev/null 2>&1; then
+        sha256sum "$1" | cut -d' ' -f1
+    elif command -v shasum >/dev/null 2>&1; then
+        shasum -a 256 "$1" | cut -d' ' -f1
+    elif command -v openssl >/dev/null 2>&1; then
+        openssl dgst -sha256 "$1" | awk '{print $NF}'
+    else
+        return 1
+    fi
+}
+
 dir="$(mktemp -d "${TMPDIR:-/tmp}/tether.XXXXXX")"
 bin="$dir/tether"
 
-if command -v curl >/dev/null 2>&1; then
-    curl -fsSL "$BASE/bin/$asset" -o "$bin" \
-        || die "could not download the client for this machine ($asset) from $BASE"
-elif command -v wget >/dev/null 2>&1; then
-    wget -qO "$bin" "$BASE/bin/$asset" \
-        || die "could not download the client for this machine ($asset) from $BASE"
-else
-    die "this machine has neither curl nor wget, so there is no way to fetch the client"
-fi
-[ -s "$bin" ] || die "the download was empty; the relay may not be serving a client for $asset"
+# One download attempt from one URL into $bin. Returns non-zero when the fetch
+# fails, so the caller can try the next source. curl follows redirects because a
+# GitHub download lands on a second host; wget does the same by default.
+fetch() {
+    if command -v curl >/dev/null 2>&1; then
+        curl -fsSL "$1" -o "$bin" 2>/dev/null
+    elif command -v wget >/dev/null 2>&1; then
+        wget -qO "$bin" "$1" 2>/dev/null
+    else
+        die "this machine has neither curl nor wget, so there is no way to fetch the client"
+    fi
+}
+
+# GitHub first, then the relay. A download that fails falls through to the next
+# source; a download that succeeds but whose hash is wrong is refused here and
+# does not fall through, because a wrong hash is tampering or corruption and the
+# next source cannot be trusted to fix it.
+got=""
+for src in github relay; do
+    [ "$src" = github ] && [ -n "${TETHER_NO_GITHUB:-}" ] && continue
+    case "$src" in
+        github) url="$GITHUB_BASE/$TETHER_TAG/$asset" ;;
+        relay)  url="$BASE/bin/$asset" ;;
+    esac
+    fetch "$url" || continue
+    [ -s "$bin" ] || continue
+    have="$(sha256_of "$bin")" \
+        || die "this machine has no sha256 tool (sha256sum, shasum or openssl), so the client cannot be verified"
+    if [ "$have" != "$want" ]; then
+        echo "tether: $url does not match the checksum this release published." >&2
+        echo "tether: expected $want" >&2
+        echo "tether: received $have" >&2
+        die "the download was altered or corrupted; nothing was run."
+    fi
+    got="$src from $url"
+    break
+done
+[ -n "$got" ] || die "could not download the client for this machine ($asset) from GitHub or $BASE"
+echo "tether: fetched $got" >&2
 
 refuse() {
-    echo "tether: this machine is $expected, but $BASE/bin/$asset is $1." >&2
+    echo "tether: this machine is $expected, but the client fetched for $asset is $1." >&2
     [ -n "${TETHER_ASSET:-}" ] && echo "tether: TETHER_ASSET=$TETHER_ASSET chose that file." >&2
     echo "tether: nothing was run. Tell the person who sent you the code what this said." >&2
     exit 1

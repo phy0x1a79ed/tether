@@ -1,8 +1,8 @@
 # What tether ships, and the one gate everything passes through on the way out.
 #
 # Sourced, never run. Three scripts read it: build-clients.sh stages into the
-# table's names, ship-binaries.sh ships them, and build-macos.sh uses the same
-# staging and the same gate for its fallback path.
+# table's names, release.sh gates and publishes them, and build-macos.sh uses
+# the same staging and the same gate for its fallback path.
 #
 # CAUTION: this sits at the service root and the container definition sits in
 # `container/`, because the repository root ignores any directory called
@@ -51,11 +51,15 @@ tether-macos-arm64:aarch64-apple-darwin:tether:macho
 tether-windows-x86_64.exe:x86_64-pc-windows-gnu:tether.exe:pe
 "
 
-# The relay binary the public host runs. Not a download, and built static for
-# the same reason the clients are: the box it runs on is not the box it is
-# built on.
+# The server-side binaries: the relay the public host runs, and the operator
+# daemon a node runs to receive sessions. Not downloads by an owner, but shipped
+# as release assets so a node fetches its pinned build the same way. Built static
+# for the same reason the clients are: the box each runs on is not the box it is
+# built on. Both are Linux-only by construction — unix sockets, unix signals —
+# so each names only the x86-64 musl target.
 TETHER_SERVER="
 tether-relay-linux-x86_64:x86_64-unknown-linux-musl:tether-relay:elf
+tether-operator-linux-x86_64:x86_64-unknown-linux-musl:tether-operator:elf
 "
 
 # A binary this small is a stub or a truncated transfer, whatever else it is.

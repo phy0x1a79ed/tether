@@ -2,10 +2,14 @@
 .runtime-env
 
 # cargo build tree and the binaries it produces
-rust/target/
+target/
 
-# the staged artifacts build-clients.sh writes, and ship-binaries.sh ships.
+# the staged artifacts build-clients.sh writes and release.sh publishes.
 # Never version-controlled and never DVC-pinned: a pinned binary is checked out
 # read-only, which costs it the executable bit. Share the compilation, not the
 # artifact.
 dist/
+
+# python bytecode from the launcher/build tests
+__pycache__/
+*.pyc

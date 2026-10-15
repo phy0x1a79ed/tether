@@ -26,7 +26,7 @@
 #
 # CAUTION: a `--host` build is dynamically linked against this machine. It is
 # right for testing here and wrong to ship, and nothing about the file says so,
-# so it writes `local` into the stage's BUILD_KIND and ship-binaries.sh refuses
+# so it writes `local` into the stage's BUILD_KIND and release.sh refuses
 # that.
 set -euo pipefail
 HERE="$(cd "$(dirname "$0")" && pwd)"
@@ -66,7 +66,7 @@ in_container() {
     # build that hangs rather than one that fails.
     docker run --rm \
         ${TETHER_DOCKER_DNS:+--dns "$TETHER_DOCKER_DNS"} \
-        --mount type=bind,source="$HERE/rust",target=/root/src \
+        --mount type=bind,source="$HERE",target=/root/src \
         --mount type=bind,source="$CROSS_TARGET_DIR",target="$CROSS_TARGET_DIR" \
         --mount type=bind,source="$REGISTRY_DIR",target=/root/.cargo/registry \
         --env CARGO_TARGET_DIR="$CROSS_TARGET_DIR" \
@@ -95,6 +95,7 @@ packages_for() {
         case "$bin" in
             tether|tether.exe) out="$out -p tether-owner" ;;
             tether-relay)      out="$out -p tether-relay" ;;
+            tether-operator)   out="$out -p tether-operator" ;;
         esac
     done
     echo "$out"
@@ -180,7 +181,7 @@ case "${1:---all}" in
         TETHER_BUILD="$(tether_stamp)"
         export TETHER_BUILD
         build_target "$1"
-        # Partial, and said so. ship-binaries.sh refuses anything but a full
+        # Partial, and said so. release.sh refuses anything but a full
         # container build, which is what stops one fresh slot beside four stale
         # ones from shipping as a set.
         echo "cross-partial" > "$TETHER_DIST/BUILD_KIND"
@@ -195,7 +196,7 @@ case "${1:---all}" in
         echo "   $TETHER_BUILD"
         step "build"
         CARGO_TARGET_DIR="$HOST_TARGET_DIR" \
-            cargo build --release --manifest-path "$HERE/rust/Cargo.toml"
+            cargo build --release --manifest-path "$HERE/Cargo.toml"
         # The stage is cleared first. A host build refreshes one slot, and
         # leaving the others behind from an earlier run is how a stale binary
         # survives a rebuild that looked like it succeeded.
@@ -214,7 +215,7 @@ case "${1:---all}" in
         echo "local" > "$TETHER_DIST/BUILD_KIND"
         echo "$TETHER_BUILD" > "$TETHER_DIST/BUILD_STAMP"
         echo
-        echo "staged a HOST-LINKED tether-$os-$arch — fine to test with, refused by ship-binaries.sh"
+        echo "staged a HOST-LINKED tether-$os-$arch — fine to test with, refused by release.sh"
     ;;
     --gate)
         # shellcheck disable=SC2046

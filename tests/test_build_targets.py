@@ -14,16 +14,18 @@ fresh.
 from __future__ import annotations
 
 import re
+from pathlib import Path
 
 import pytest
 
-from awm.tether import paths
-
 pytestmark = [pytest.mark.unit, pytest.mark.smoke]
 
-ARTIFACTS = paths.SERVICE_DIR / "artifacts.sh"
-DOCKERFILE = paths.SERVICE_DIR / "container" / "Dockerfile"
-DRIVER = paths.SERVICE_DIR / "build-clients.sh"
+# This repository's root, found from this file rather than an installed package.
+REPO = Path(__file__).resolve().parent.parent
+
+ARTIFACTS = REPO / "artifacts.sh"
+DOCKERFILE = REPO / "container" / "Dockerfile"
+DRIVER = REPO / "build-clients.sh"
 
 
 def table_triples() -> set[str]:

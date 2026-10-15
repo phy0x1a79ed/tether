@@ -1,12 +1,12 @@
 #!/usr/bin/env bash
-# Build the macOS client on a Mac and ship it to the relay.
+# Build the macOS client on a Mac and stage it for release.
 #
-#   ./build-macos.sh [host]        default: sirius
+#   ./build-macos.sh
 #
 # # When to reach for this
 #
 # Not usually. `./build-clients.sh` cross-compiles both Apple targets in a
-# container that carries Apple's SDK, so a Mac client ships from the Linux box
+# container that carries Apple's SDK, so a Mac client builds on the Linux box
 # with every other client, stamped the same and gated the same. This script is
 # the fallback for a session where that container cannot produce a Darwin
 # binary, and the proof that a Mac alone is still enough.
@@ -16,22 +16,18 @@
 #   - a Rust toolchain (https://rustup.rs)
 #
 # It builds only the owner's client. The relay and the operator daemon are
-# Linux-only and ship from a Linux box.
+# Linux-only and build on a Linux box.
 #
-# CAUTION: this ships one artifact and leaves the rest of the stage alone, so
+# CAUTION: this stages one artifact and leaves the rest of the stage alone, so
 # the stage stops being one coherent set. It writes that into BUILD_KIND, and
-# ship-binaries.sh refuses to ship a set marked that way.
+# release.sh refuses to publish a set marked that way.
 set -euo pipefail
-HOST=${1:-sirius}
 HERE="$(cd "$(dirname "$0")" && pwd)"
 . "$HERE/artifacts.sh"
-MANIFEST="$HERE/rust/Cargo.toml"
-TARGET="$HERE/rust/target/release"
-REMOTE="/var/lib/awm/state/services/tether"
-PUBLIC="https://nexus.tony-xy-liu.com/tether"
+MANIFEST="$HERE/Cargo.toml"
+TARGET="$HERE/target/release"
 
 step() { echo; echo "== $*"; }
-as_awm() { ssh "$HOST" "sudo -n -u awm bash -s" <<<"$*"; }
 
 [ "$(uname -s)" = Darwin ] \
     || { echo "this is $(uname -s); run it on the Mac the client is for" >&2; exit 1; }
@@ -66,28 +62,11 @@ echo "$BUILD" > "$TETHER_DIST/BUILD_STAMP"
 echo "   $CLIENT"
 
 step "the gate"
-# The same gate every other artifact passes, including the check that a shipped
+# The same gate every other artifact passes, including the check that a released
 # build carries no way past the consent prompt.
 tether_gate "$CLIENT" || exit 1
 
-step "ship"
-as_awm "mkdir -p $REMOTE/assets/bin" \
-    || { echo "refusing: cannot write $HOST:$REMOTE — has provision.sh run there?" >&2; exit 1; }
-# Written beside the live name and moved into place, so a download that lands
-# mid-transfer gets one whole file or the other.
-rsync -a --rsync-path='sudo -n -u awm rsync' \
-    "$TETHER_DIST/$CLIENT" "$HOST:$REMOTE/assets/bin/$CLIENT.incoming"
-as_awm "mv $REMOTE/assets/bin/$CLIENT.incoming $REMOTE/assets/bin/$CLIENT"
-as_awm "chmod 755 $REMOTE/assets/bin/$CLIENT"
-
-step "verify"
-# Fetched the way an owner would fetch it, over the public address. Asking the
-# box would prove only that a file is on disk.
-SIZE="$(curl -fsS -o /dev/null -w '%{size_download}' "$PUBLIC/bin/$CLIENT")"
-[ "$SIZE" -gt "$TETHER_MIN_BYTES" ] || { echo "the client download is $SIZE bytes" >&2; exit 1; }
-echo "   $SIZE bytes served at /tether/bin/$CLIENT"
-
 echo
-echo "shipped $BUILD as $CLIENT"
-echo "a Mac owner's line is unchanged:"
-echo "  curl -fsSL $PUBLIC | sh -s <code>"
+echo "staged $BUILD as $CLIENT in $TETHER_DIST"
+echo "release.sh picks it up from there; it will refuse this mac-only stage"
+echo "until the Linux targets are staged beside it."
