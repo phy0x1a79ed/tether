@@ -13,6 +13,14 @@
 # anything runs, and the record is named again in the prompt before the owner
 # answers it.
 #
+# # Why the directory is named for the client's checksum
+#
+# An owner runs this line once per session, and every run of a random directory
+# left another copy of the same client behind. Naming the directory for the
+# sha256 the release baked in means one release leaves one directory: a second
+# run finds the client already there, checks it against the same hash, and
+# runs it without fetching. A new release has a new hash and a new directory.
+#
 # # Why this is plain sh
 #
 # The line read out over the phone says `sh` or `bash`, and the machine at the
@@ -112,7 +120,25 @@ sha256_of() {
     fi
 }
 
-dir="$(mktemp -d "${TMPDIR:-/tmp}/tether.XXXXXX")"
+# A directory found under that fixed name is reused only when it is this user's
+# alone: on a shared box another user can make /tmp/tether.<hash> first and swap
+# the client after it is verified. Anything else falls back to a fresh mktemp.
+private_dir() {
+    [ -d "$1" ] && [ ! -L "$1" ] || return 1
+    # shellcheck disable=SC2046
+    set -- $(ls -ld "$1")
+    case "$1" in drwx------|drwx------[.@]) ;; *) return 1 ;; esac
+    [ "$3" = "$(id -un)" ]
+}
+
+dir="${TMPDIR:-/tmp}"
+dir="${dir%/}/tether.$(printf '%s' "$want" | cut -c1-16)"
+if [ -e "$dir" ] || [ -L "$dir" ]; then
+    private_dir "$dir" || dir=""
+else
+    mkdir -m 700 "$dir" 2>/dev/null || dir=""
+fi
+[ -n "$dir" ] || dir="$(mktemp -d "${TMPDIR:-/tmp}/tether.XXXXXX")"
 bin="$dir/tether"
 
 # One download attempt from one URL into $bin. Returns non-zero when the fetch
@@ -133,7 +159,11 @@ fetch() {
 # does not fall through, because a wrong hash is tampering or corruption and the
 # next source cannot be trusted to fix it.
 got=""
+if [ -f "$bin" ] && [ ! -L "$bin" ] && [ "$(sha256_of "$bin" || true)" = "$want" ]; then
+    got="reusing the verified client already in $dir"
+fi
 for src in github relay; do
+    [ -z "$got" ] || break
     [ "$src" = github ] && [ -n "${TETHER_NO_GITHUB:-}" ] && continue
     case "$src" in
         github) url="$GITHUB_BASE/$TETHER_TAG/$asset" ;;
@@ -149,11 +179,11 @@ for src in github relay; do
         echo "tether: received $have" >&2
         die "the download was altered or corrupted; nothing was run."
     fi
-    got="$src from $url"
+    got="fetched $src from $url"
     break
 done
 [ -n "$got" ] || die "could not download the client for this machine ($asset) from GitHub or $BASE"
-echo "tether: fetched $got" >&2
+echo "tether: $got" >&2
 
 refuse() {
     echo "tether: this machine is $expected, but the client fetched for $asset is $1." >&2

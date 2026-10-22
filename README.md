@@ -40,9 +40,11 @@ own address:
 
 The launcher fetches the client for the machine it detects, verifies it, runs
 it, and stops. It sets up no PATH entry, no login item, no service, and no
-cron. The residue is one directory under the temporary directory, holding the
-client and the session record, both named in the consent prompt before the
-owner answers.
+cron. The residue is one directory per release under the temporary directory,
+named for the client's SHA-256 and holding the client and the session records,
+both named in the consent prompt before the owner answers. A later run of the
+same release checks the client already there against that hash and runs it
+without downloading again.
 
 The launcher fetches the client from this repository's release first and from
 the relay only when GitHub is unreachable. It checks each download's SHA-256

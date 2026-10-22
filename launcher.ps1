@@ -11,6 +11,16 @@
 # The directory is named below before anything runs, and the record is named
 # again in the prompt before the owner answers it.
 #
+# # Why the directory is named for the client's checksum
+#
+# An owner runs this line once per session, and every run of a random directory
+# left another copy of the same client behind. Naming the directory for the
+# sha256 the release baked in means one release leaves one directory: a second
+# run finds the client already there, checks it against the same hash, and
+# runs it without fetching. A new release has a new hash and a new directory.
+# %TEMP% belongs to the user running this, so no other account can plant a
+# directory under that name first.
+#
 # # Why the line is shaped like that
 #
 # A script arriving through a pipe cannot be given arguments, and the invite
@@ -89,8 +99,8 @@ $code = $args
 if (-not $code -and $env:TETHER_CODE) { $code = $env:TETHER_CODE.Split(' ') }
 if (-not $code) { Die 'no invite code: pass the three words you were read' }
 
-$dir = Join-Path $env:TEMP ("tether." + [System.IO.Path]::GetRandomFileName())
-New-Item -ItemType Directory -Path $dir | Out-Null
+$dir = Join-Path $env:TEMP ("tether." + $want.Substring(0, 16))
+New-Item -ItemType Directory -Path $dir -Force | Out-Null
 $bin = Join-Path $dir 'tether.exe'
 
 # GitHub first, then the relay. A download that fails falls through to the next
@@ -101,7 +111,12 @@ if (-not $env:TETHER_NO_GITHUB) { $sources += "$githubBase/$TetherTag/$asset" }
 $sources += "$base/bin/$asset"
 
 $got = $null
+if ((Test-Path -PathType Leaf $bin) -and
+    (Get-FileHash -Algorithm SHA256 -Path $bin).Hash.ToLower() -eq $want) {
+    $got = "reusing the verified client already in $dir"
+}
 foreach ($url in $sources) {
+    if ($got) { break }
     try {
         Invoke-WebRequest -UseBasicParsing -Uri $url -OutFile $bin
     } catch {
@@ -115,11 +130,11 @@ foreach ($url in $sources) {
         Write-Error "tether: received $have"
         Die 'the download was altered or corrupted; nothing was run.'
     }
-    $got = $url
+    $got = "fetched $url"
     break
 }
 if (-not $got) { Die "could not download the client for this machine ($asset) from GitHub or $base" }
-Write-Host "tether: fetched $got"
+Write-Host "tether: $got"
 
 # Windows marks a downloaded file as having come from elsewhere, and refuses to
 # run it with a dialog the owner cannot answer over the phone. Clearing our own

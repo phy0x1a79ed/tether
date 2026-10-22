@@ -123,9 +123,15 @@ HOST_ASSET = f"tether-linux-{platform.machine()}"
 
 
 def launch(shell, launcher, github, relay, *code, asset=None, no_github=False):
+    # The launcher's directory is named for the client's hash, so a shared /tmp
+    # would hand one test the client an earlier test fetched. Each launcher gets
+    # the temporary directory beside it instead.
+    tmp = launcher.parent / "tmp"
+    tmp.mkdir(exist_ok=True)
     env = {
         "PATH": "/usr/bin:/bin",
         "HOME": "/tmp",
+        "TMPDIR": str(tmp),
         "TETHER_GITHUB_BASE": github.base,
         "TETHER_RELAY": relay.base,
     }
@@ -191,6 +197,60 @@ def test_the_relay_is_the_fallback_when_github_cannot_be_reached(hosts, tmp_path
     assert "fetched relay" in done.stderr, done.stderr
     assert any(TAG in p for p in github.asked), "GitHub was never tried first"
     assert "would not start here" in done.stderr
+
+
+@pytest.mark.skipif(platform.machine() != "x86_64", reason="names an x86-64 host")
+@pytest.mark.parametrize("shell", SHELLS, ids=" ".join)
+def test_a_second_run_reuses_the_client_and_fetches_nothing(hosts, tmp_path, shell):
+    """One release leaves one directory. The second run finds the client the
+    first one fetched, checks it against the same hash, and asks neither host."""
+    github, relay = hosts
+    body = elf_header(0x3E)
+    github.bodies[f"/{TAG}/{HOST_ASSET}"] = body
+    launcher = render(tmp_path, {HOST_ASSET: sha256(body)})
+    launch(shell, launcher, github, relay, "acre", "anchor", "kettle")
+    github.asked.clear()
+    done = launch(shell, launcher, github, relay, "acre", "anchor", "kettle")
+    assert "reusing the verified client" in done.stderr, done.stderr
+    assert github.asked == [] and relay.asked == []
+    assert [d.name for d in (tmp_path / "tmp").iterdir()] == [
+        f"tether.{sha256(body)[:16]}"
+    ]
+
+
+@pytest.mark.skipif(platform.machine() != "x86_64", reason="names an x86-64 host")
+@pytest.mark.parametrize("shell", SHELLS, ids=" ".join)
+def test_a_client_altered_since_the_last_run_is_fetched_again(hosts, tmp_path, shell):
+    """The hash is checked on every run, not only on the run that fetched."""
+    github, relay = hosts
+    body = elf_header(0x3E)
+    github.bodies[f"/{TAG}/{HOST_ASSET}"] = body
+    launcher = render(tmp_path, {HOST_ASSET: sha256(body)})
+    launch(shell, launcher, github, relay, "acre", "anchor", "kettle")
+    cached = tmp_path / "tmp" / f"tether.{sha256(body)[:16]}" / "tether"
+    cached.write_bytes(b"altered")
+    github.asked.clear()
+    done = launch(shell, launcher, github, relay, "acre", "anchor", "kettle")
+    assert "fetched github" in done.stderr, done.stderr
+    assert cached.read_bytes() == body
+
+
+@pytest.mark.skipif(platform.machine() != "x86_64", reason="names an x86-64 host")
+@pytest.mark.parametrize("shell", SHELLS, ids=" ".join)
+def test_a_directory_others_can_write_is_not_reused(hosts, tmp_path, shell):
+    """Another user who makes the directory first could swap the client after
+    it is verified, so a directory that is not private gets a fresh one."""
+    github, relay = hosts
+    body = elf_header(0x3E)
+    github.bodies[f"/{TAG}/{HOST_ASSET}"] = body
+    launcher = render(tmp_path, {HOST_ASSET: sha256(body)})
+    planted = tmp_path / "tmp" / f"tether.{sha256(body)[:16]}"
+    planted.mkdir(parents=True)
+    planted.chmod(0o777)
+    (planted / "tether").write_bytes(body)
+    done = launch(shell, launcher, github, relay, "acre", "anchor", "kettle")
+    assert "fetched github" in done.stderr, done.stderr
+    assert len(list((tmp_path / "tmp").iterdir())) == 2, "the planted directory was used"
 
 
 @pytest.mark.skipif(platform.machine() != "x86_64", reason="names an x86-64 host")
