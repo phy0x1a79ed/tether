@@ -993,15 +993,13 @@ async fn run_verb(
                 cols,
                 rows,
             ));
-            match link
-                .send(&Frame::Open {
-                    task,
-                    kind: Kind::Shell,
-                    command: command.clone(),
-                    cols,
-                    rows,
-                })
-            {
+            match link.send(&Frame::Open {
+                task,
+                kind: Kind::Shell,
+                command: command.clone(),
+                cols,
+                rows,
+            }) {
                 Ok(()) => {
                     if let Ok(mut s) = track.state.lock() {
                         s.tasks += 1;

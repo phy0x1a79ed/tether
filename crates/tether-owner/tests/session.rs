@@ -225,7 +225,7 @@ async fn own_via(
             }
         };
     let outcome = session::run(
-        link,
+        tether_link::Resumable::plain(link),
         operator,
         invite.relay.to_string(),
         invite.code.slot.to_string(),

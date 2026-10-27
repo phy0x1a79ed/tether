@@ -77,6 +77,15 @@ pub enum Event {
         stream: Stream,
         data: Vec<u8>,
     },
+    /// The link to the operator dropped, and the session waits for it.
+    LinkDown {
+        why: String,
+        gives_up_in: std::time::Duration,
+    },
+    /// The link is back.
+    LinkUp {
+        gap: std::time::Duration,
+    },
     Ended {
         task: TaskId,
         ended: Ended,
@@ -118,6 +127,8 @@ pub struct Ui {
     transcript: VecDeque<String>,
     pending: String,
     live: Option<Live>,
+    /// While the link is down, when the session gives up on it.
+    down: Option<Instant>,
     /// False when the owner is not on a terminal — a log, a pipe, a test. The
     /// session still runs and is still visible; it is simply printed.
     tty: bool,
@@ -151,6 +162,7 @@ impl Ui {
             transcript: VecDeque::new(),
             pending: String::new(),
             live: None,
+            down: None,
             tty,
             cols,
             rows,
@@ -239,6 +251,18 @@ impl Ui {
                 });
             }
             Event::Note(text) => self.line(format!("· {text}")),
+            Event::LinkDown { why, gives_up_in } => {
+                self.down = Some(Instant::now() + gives_up_in);
+                let mins = gives_up_in.as_secs() / 60;
+                self.line(format!(
+                    "· connection lost ({why}). Reconnecting for up to {mins} minutes; \
+                     anything running here keeps running. Press Ctrl-C to end the session now."
+                ));
+            }
+            Event::LinkUp { gap } => {
+                self.down = None;
+                self.line(format!("· connection back after {}s", gap.as_secs().max(1)));
+            }
             Event::Cut { reason } => {
                 self.live = None;
                 self.line(format!("session cut: {reason}"));
@@ -315,9 +339,20 @@ impl Ui {
 
     fn header(&self) -> String {
         let secs = self.started.elapsed().as_secs();
+        let link = match self.down {
+            Some(until) => {
+                let left = until.saturating_duration_since(Instant::now()).as_secs();
+                format!(
+                    " · RECONNECTING, gives up in {}:{:02} · Ctrl-C ends it",
+                    left / 60,
+                    left % 60
+                )
+            }
+            None => String::new(),
+        };
         fit(
             &format!(
-                " tether · {} · {} · code {} · {:02}:{:02}",
+                " tether · {} · {} · code {} · {:02}:{:02}{link}",
                 self.facts.operator,
                 self.facts.relay,
                 self.facts.code,
@@ -945,6 +980,7 @@ mod tests {
             transcript: VecDeque::new(),
             pending: String::new(),
             live: None,
+            down: None,
             tty: false,
             cols: 100,
             rows: 30,

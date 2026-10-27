@@ -123,6 +123,7 @@ async fn stage() -> Stage {
                         host: "altair".into(),
                         os: "linux".into(),
                         build: "test".into(),
+                        resume: false,
                     }))
                     .await;
                 let answer = loop {

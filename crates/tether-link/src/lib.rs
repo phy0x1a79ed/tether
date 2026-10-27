@@ -494,12 +494,32 @@ impl Link {
     /// Send a last frame, then close.
     pub async fn leave(&mut self, last: &Frame) {
         let _ = self.send(last).await;
+        self.close().await;
+    }
+
+    /// Close, and wait a moment for the far end to close too.
+    ///
+    /// Dropping a socket with unread bytes in its receive buffer makes the
+    /// kernel reset the connection rather than end it, and a reset lets the
+    /// relay's kernel discard what this end sent last and the relay had not
+    /// yet read: the reason a session ended, most often. Reading until the
+    /// far end's close arrives empties the buffer first.
+    pub async fn close(&mut self) {
         self.transport.close().await;
+        let _ = tokio::time::timeout(Duration::from_secs(2), async {
+            while self.transport.next().await.is_ok() {}
+        })
+        .await;
     }
 }
 
 async fn claim(relay: &Relay, slot: Slot) -> Result<String, LinkError> {
-    let answer = http::post_json(relay, &relay.claim_path(slot), None).await?;
+    // A held slot answers 404 here as well, so a second run of the launcher
+    // during a session is told to ask for a new code rather than let in.
+    let answer = match http::post_json(relay, &relay.claim_path(slot), None).await {
+        Err(http::HttpError::Status(404)) => return Err(LinkError::NoSuchSession),
+        other => other?,
+    };
     answer
         .get("token")
         .and_then(|t| t.as_str())

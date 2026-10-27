@@ -15,10 +15,21 @@
 //! run anything is not constructed until after. A task-shaped frame arriving
 //! early is not ignored — it ends the session, because a peer that sent one is
 //! not the peer this protocol describes.
+//!
+//! # A dropped link
+//!
+//! Once consent is given, and when both ends can, the session runs on a
+//! [`Resumable`] link. A drop is then a line on the screen and a countdown in
+//! the header rather than the end. Tasks keep running, and what they print is
+//! kept and sent once the link is back. Ending the session on purpose still
+//! ends it at once, gap or not: the cut key, a closed window and a stop signal
+//! each send a `Cut`, or end the held slot at the relay when the link is down.
+//! Consent is never asked again, because this process already has it, and a
+//! new run of the client cannot resume anything.
 
 use std::time::Duration;
 
-use tether_link::{Link, LinkError};
+use tether_link::{Incoming, Link, LinkError, Resumable};
 use tether_proto::frame::{Frame, Hello, Role, PROTOCOL_VERSION, VIEWPORT};
 use tether_proto::invite::InviteCode;
 use tokio::sync::mpsc;
@@ -237,7 +248,7 @@ async fn wait_for_hello(link: &mut Link, log: &mut Result<Log, String>) -> Resul
 
 /// Carry the session until either side ends it.
 pub async fn run(
-    mut link: Link,
+    mut link: Resumable,
     operator: Hello,
     relay: String,
     code: String,
@@ -269,30 +280,61 @@ pub async fn run(
             cols: advertised.0,
             rows: advertised.1,
         })
-        .await
         .is_err()
     {
         return Outcome::PeerLeft;
     }
 
+    let mut stops = Stops::new();
+
     let outcome = loop {
         enum Next {
             In(Result<Frame, LinkError>),
+            Down(String, std::time::SystemTime),
+            Up(std::time::Duration),
             Out(Frame),
             Term(crossterm::event::Event),
+            Stop(&'static str),
             Tick,
         }
+
+        // Task output waits while the link is keeping as much as it will for
+        // a resend. The task then blocks on its own write, and nothing it
+        // prints is lost.
+        let room = link.has_room();
 
         // The select ends before anything acts, because two of these branches
         // want the link and the borrow checker is right about that.
         let next = tokio::select! {
-            incoming = link.recv() => Next::In(incoming),
-            Some(frame) = out_rx.recv() => Next::Out(frame),
+            incoming = link.recv() => match incoming {
+                Incoming::Frame(frame) => Next::In(Ok(frame)),
+                Incoming::Down { why, gives_up_at } => Next::Down(why, gives_up_at),
+                Incoming::Up { gap, .. } => Next::Up(gap),
+                Incoming::Ended(e) => Next::In(Err(e)),
+            },
+            Some(frame) = out_rx.recv(), if room => Next::Out(frame),
             Some(Ok(ev)) = next_key(&mut keys) => Next::Term(ev),
+            why = stops.next() => Next::Stop(why),
             _ = tick.tick() => Next::Tick,
         };
 
         match next {
+            Next::Down(why, gives_up_at) => ui.apply(Event::LinkDown {
+                why,
+                gives_up_in: gives_up_at
+                    .duration_since(std::time::SystemTime::now())
+                    .unwrap_or_default(),
+            }),
+            Next::Up(gap) => ui.apply(Event::LinkUp { gap }),
+            Next::Stop(why) => {
+                runner.shutdown().await;
+                ui.apply(Event::Cut {
+                    reason: why.to_string(),
+                });
+                let _ = ui.draw();
+                link.cut(why).await;
+                break Outcome::Cut(why.to_string());
+            }
             Next::Out(frame) => {
                 if let Frame::Exit { task, .. } = &frame {
                     runner.forget(*task);
@@ -300,7 +342,7 @@ pub async fn run(
                 if let Some(event) = to_event(&frame) {
                     ui.apply(event);
                 }
-                if link.send(&frame).await.is_err() {
+                if link.send(&frame).is_err() {
                     break Outcome::PeerLeft;
                 }
             }
@@ -314,7 +356,7 @@ pub async fn run(
                         from_operator: false,
                         text: text.clone(),
                     });
-                    if link.send(&Frame::Say { text }).await.is_err() {
+                    if link.send(&Frame::Say { text }).is_err() {
                         break Outcome::PeerLeft;
                     }
                 }
@@ -344,7 +386,6 @@ pub async fn run(
                             cols: now.0,
                             rows: now.1,
                         })
-                        .await
                         .is_err()
                     {
                         break Outcome::PeerLeft;
@@ -354,6 +395,12 @@ pub async fn run(
             Next::In(Err(LinkError::Closed)) => {
                 runner.shutdown().await;
                 break Outcome::PeerLeft;
+            }
+            Next::In(Err(LinkError::Ended)) => {
+                runner.shutdown().await;
+                break Outcome::Cut(
+                    "the operator ended the session while the link was down".into(),
+                );
             }
             Next::In(Err(e)) => {
                 runner.shutdown().await;
@@ -405,11 +452,13 @@ pub async fn run(
                     break Outcome::Cut(reason);
                 }
                 Frame::Ping { nonce } => {
-                    if link.send(&Frame::Pong { nonce }).await.is_err() {
+                    if link.send(&Frame::Pong { nonce }).is_err() {
                         break Outcome::PeerLeft;
                     }
                 }
                 Frame::Pong { .. } | Frame::Hello(_) | Frame::Defer { .. } => {}
+                // The link's own frames. It never hands them up.
+                Frame::Hold(_) | Frame::Ack { .. } | Frame::Resume { .. } => {}
                 // Output and Exit are this side's to produce. A peer sending
                 // one is claiming something ran here that did not.
                 Frame::Output { .. } | Frame::Exit { .. } => {
@@ -428,6 +477,73 @@ pub async fn run(
 
     ui.restore();
     outcome
+}
+
+/// The ways the owner's machine asks this process to stop, other than the cut
+/// key: a closed terminal window, a stop signal, Ctrl-C with no raw terminal.
+///
+/// Each one ends the session on purpose, so the operator hears it at once
+/// rather than waiting out a gap for a client that is not coming back.
+struct Stops {
+    #[cfg(unix)]
+    signals: Vec<(tokio::signal::unix::Signal, &'static str)>,
+    #[cfg(windows)]
+    close: Option<tokio::signal::windows::CtrlClose>,
+}
+
+impl Stops {
+    fn new() -> Self {
+        #[cfg(unix)]
+        {
+            use tokio::signal::unix::{signal, SignalKind};
+            let signals = [
+                (SignalKind::hangup(), "the owner's terminal closed"),
+                (
+                    SignalKind::terminate(),
+                    "the owner's client was told to stop",
+                ),
+                (SignalKind::interrupt(), "the owner ended it"),
+            ]
+            .into_iter()
+            .filter_map(|(kind, why)| signal(kind).ok().map(|s| (s, why)))
+            .collect();
+            Self { signals }
+        }
+        #[cfg(windows)]
+        {
+            Self {
+                close: tokio::signal::windows::ctrl_close().ok(),
+            }
+        }
+    }
+
+    async fn next(&mut self) -> &'static str {
+        #[cfg(unix)]
+        {
+            if self.signals.is_empty() {
+                return std::future::pending().await;
+            }
+            let waits = self.signals.iter_mut().map(|(s, why)| {
+                Box::pin(async move {
+                    s.recv().await;
+                    *why
+                })
+            });
+            futures_util::future::select_all(waits).await.0
+        }
+        #[cfg(windows)]
+        {
+            match self.close.as_mut() {
+                // Windows allows a console-close handler a few seconds, which
+                // is enough to send a `Cut` and nothing that waits on a redial.
+                Some(close) => {
+                    close.recv().await;
+                    "the owner's window closed"
+                }
+                None => std::future::pending().await,
+            }
+        }
+    }
 }
 
 /// What the owner should see about a frame this side is sending.

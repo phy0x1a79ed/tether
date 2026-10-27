@@ -138,6 +138,8 @@ pub struct Resumable {
     out: mpsc::UnboundedSender<Out>,
     events: mpsc::Receiver<Incoming>,
     shared: Arc<Shared>,
+    /// Set once [`Self::recv`] has handed the session its ending.
+    told_end: AtomicBool,
     role: Role,
     polled: Option<String>,
 }
@@ -207,6 +209,7 @@ impl Resumable {
             out,
             events,
             shared,
+            told_end: AtomicBool::new(false),
             role,
             polled,
         }
@@ -244,25 +247,38 @@ impl Resumable {
     /// Queue a frame for the peer.
     ///
     /// During a gap a counted frame is kept and goes once the link is back,
-    /// and a keepalive is dropped. An error means the session is over.
+    /// and a keepalive is dropped. An error means the session has already
+    /// been told, through [`Self::recv`], that it is over.
+    ///
+    /// A frame sent after the link ended and before the session has read why
+    /// is dropped without an error. Failing it would let the session end on
+    /// "the other end went away" with the real reason, often the peer's `Cut`,
+    /// still waiting to be read.
     pub fn send(&self, frame: &Frame) -> Result<(), LinkError> {
-        if self.shared.ended.load(Ordering::Relaxed) {
+        if self.told_end.load(Ordering::Relaxed) {
             return Err(LinkError::Closed);
+        }
+        if self.shared.ended.load(Ordering::Relaxed) {
+            return Ok(());
         }
         if frame.counted() {
             self.shared.kept.fetch_add(weight(frame), Ordering::Relaxed);
         }
-        self.out
-            .send(Out::Frame(frame.clone()))
-            .map_err(|_| LinkError::Closed)
+        let _ = self.out.send(Out::Frame(frame.clone()));
+        Ok(())
     }
 
     /// The next thing that happened on the link.
     pub async fn recv(&mut self) -> Incoming {
-        self.events
+        let next = self
+            .events
             .recv()
             .await
-            .unwrap_or(Incoming::Ended(LinkError::Closed))
+            .unwrap_or(Incoming::Ended(LinkError::Closed));
+        if matches!(next, Incoming::Ended(_)) {
+            self.told_end.store(true, Ordering::Relaxed);
+        }
+        next
     }
 
     /// Say why, then go. See [`Self::leave`].
@@ -400,7 +416,7 @@ impl Actor {
             tokio::select! {
                 out = self.out.recv() => match out {
                     None => {
-                        link.transport.close().await;
+                        link.close().await;
                         return Stop::Exit;
                     }
                     Some(Out::Frame(frame)) => {
@@ -413,7 +429,7 @@ impl Actor {
                     }
                     Some(Out::Leave(frame, done)) => {
                         let _ = link.send(&frame).await;
-                        link.transport.close().await;
+                        link.close().await;
                         let _ = done.send(());
                         return Stop::Exit;
                     }
@@ -422,7 +438,7 @@ impl Actor {
                     Ok(frame) => {
                         heard = Instant::now();
                         if !self.take(frame).await {
-                            link.transport.close().await;
+                            link.close().await;
                             return Stop::Exit;
                         }
                     }
@@ -558,7 +574,7 @@ impl Actor {
                         tries += 1;
                     }
                     Err(Resent::Fatal(e)) => {
-                        link.transport.close().await;
+                        link.close().await;
                         self.end(e).await;
                         return None;
                     }
