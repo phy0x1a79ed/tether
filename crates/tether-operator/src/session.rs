@@ -22,14 +22,25 @@
 //! socket that waits and times out costs the slot nothing; only a *pairing*
 //! spends from the relay's budget, and that budget is the failure limit that
 //! makes a spoken phrase safe.
+//!
+//! # Why an open session survives a drop
+//!
+//! Once the owner consents, and when both ends can, the session holds its
+//! slot at the relay and runs on a [`Resumable`] link. A drop then moves the
+//! session to [`Phase::Reconnecting`] rather than ending it. Verbs that would
+//! put something on the wire are refused until the link is back, so nothing
+//! the operator asks for runs minutes after it was asked. Commands already
+//! running keep running at the owner's end, and their output arrives once the
+//! link returns. Their time limits stand still while the link is down.
 
 use std::collections::BTreeMap;
 use std::sync::{Arc, Mutex};
-use std::time::{Duration, Instant};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use serde_json::{json, Value};
 use tether_link::http::HttpError;
-use tether_link::{release, Link, LinkError};
+use tether_link::resume::{mint_keys, OperatorRejoin};
+use tether_link::{hold, release, Incoming, Link, LinkError, Resumable};
 use tether_proto::frame::{Ended, Frame, Hello, Kind, Stream, TaskId, VIEWPORT};
 use tether_proto::invite::{InviteCode, Phrase, Slot};
 use tokio::sync::{mpsc, oneshot};
@@ -126,6 +137,9 @@ pub enum Phase {
     Confirming,
     /// The owner said yes. The only phase in which work may be asked for.
     Open,
+    /// Open, with the link down. Both ends are redialling, and the session
+    /// ends if the link stays down for the whole resume window.
+    Reconnecting,
     Ended,
 }
 
@@ -136,6 +150,7 @@ impl Phase {
             Phase::Greeting => "greeting",
             Phase::Confirming => "confirming",
             Phase::Open => "open",
+            Phase::Reconnecting => "reconnecting",
             Phase::Ended => "ended",
         }
     }
@@ -166,6 +181,12 @@ pub struct State {
     /// that the person at the other end is trying to say something.
     pub heard: u32,
     pub last_said: Option<String>,
+    /// Whether this session survives a dropped link.
+    pub resumable: bool,
+    /// The gap in progress: when it started, why, and when it ends the session.
+    pub gap: Option<(Instant, String, SystemTime)>,
+    /// Gaps this session has come back from.
+    pub resumes: u32,
     pub ended: Option<String>,
     pub ended_at: Option<Instant>,
 }
@@ -184,6 +205,9 @@ impl State {
             viewport: None,
             heard: 0,
             last_said: None,
+            resumable: false,
+            gap: None,
+            resumes: 0,
             ended: None,
             ended_at: None,
         }
@@ -201,6 +225,14 @@ impl State {
             "viewport": self.viewport.map(|(c, r)| json!({"cols": c, "rows": r})),
             "heard": self.heard,
             "last_said": self.last_said,
+            "resumable": self.resumable,
+            "resumes": self.resumes,
+            "reconnecting": self.gap.as_ref().map(|(since, why, until)| json!({
+                "since_s": since.elapsed().as_secs(),
+                "why": why,
+                "gives_up_in_s": until.duration_since(SystemTime::now()).unwrap_or_default().as_secs(),
+                "gives_up_at_ms": unix_ms(*until),
+            })),
             "ended": self.ended,
             "owner": self.owner.as_ref().map(|h| json!({
                 "who": h.who,
@@ -222,6 +254,12 @@ impl State {
             None => false,
         }
     }
+}
+
+fn unix_ms(at: SystemTime) -> u64 {
+    at.duration_since(UNIX_EPOCH)
+        .map(|d| d.as_millis() as u64)
+        .unwrap_or(0)
 }
 
 /// A handle on one running session.
@@ -299,6 +337,7 @@ fn finish(track: &Track, why: impl Into<String>) {
             return;
         }
         s.phase = Phase::Ended;
+        s.gap = None;
         s.ended = Some(why.clone());
         s.ended_at = Some(Instant::now());
         s.owner
@@ -320,6 +359,7 @@ async fn serve(
     while let Some(mut link) = connect(&cfg, &code, &seat, deadline, &track, &mut rx).await {
         match consent(&cfg, &mut link, &track, &mut rx).await {
             Consent::Given => {
+                let mut link = carried(&cfg, code.slot, &seat, link, &track).await;
                 carry(&mut link, &track, &mut rx).await;
                 break;
             }
@@ -432,6 +472,43 @@ async fn connect(
         },
     );
     None
+}
+
+/// Put a consented session on the link it will run on.
+///
+/// Resumable when the owner's `Hello` says it can be and the relay agrees to
+/// hold the slot. An older relay refuses the hold, and an older client never
+/// asks, and either way the session runs as it always did.
+async fn carried(cfg: &Config, slot: Slot, seat: &str, link: Link, track: &Track) -> Resumable {
+    let owner_can = track
+        .state
+        .lock()
+        .ok()
+        .and_then(|s| s.owner.as_ref().map(|h| h.resume))
+        .unwrap_or(false);
+    if !owner_can {
+        return Resumable::plain(link);
+    }
+    let keys = mint_keys();
+    if let Err(e) = hold(&cfg.relay, slot, seat, &keys.token).await {
+        crate::log::info(format_args!(
+            "slot {slot} is not resumable: the relay would not hold it ({e})"
+        ));
+        return Resumable::plain(link);
+    }
+    if let Ok(mut s) = track.state.lock() {
+        s.resumable = true;
+    }
+    Resumable::operator(
+        link,
+        keys,
+        OperatorRejoin {
+            relay: cfg.relay.clone(),
+            bearer: cfg.issue_token.clone(),
+            slot,
+            seat: seat.to_string(),
+        },
+    )
 }
 
 /// How the wait for consent came out.
@@ -574,7 +651,7 @@ const MAX_OPEN_TASKS: usize = 8;
 const SILENCE: Duration = Duration::from_secs(3 * 45 + 30);
 
 /// Carry the open session until either side ends it.
-async fn carry(link: &mut Link, track: &Track, rx: &mut mpsc::Receiver<Command>) {
+async fn carry(link: &mut Resumable, track: &Track, rx: &mut mpsc::Receiver<Command>) {
     let mut tasks: BTreeMap<TaskId, Task> = BTreeMap::new();
     let mut next_task: TaskId = 1;
     let mut nonce: u64 = 0;
@@ -583,11 +660,20 @@ async fn carry(link: &mut Link, track: &Track, rx: &mut mpsc::Receiver<Command>)
     beat.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
     beat.tick().await; // the first tick is immediate; the socket is fresh
 
+    // Set while the link is down. A task's time limit does not run then,
+    // because the owner's machine is the one doing the work and nothing it
+    // says can arrive.
+    let mut paused: Option<tokio::time::Instant> = None;
+
     loop {
         // The earliest deadline among whatever is in flight, rebuilt each turn
         // because the set changes. A sleep is cheap and the loop only turns
         // when something happened.
-        let overrun = match tasks.values().filter_map(|t| t.deadline).min() {
+        let next_deadline = match paused {
+            Some(_) => None,
+            None => tasks.values().filter_map(|t| t.deadline).min(),
+        };
+        let overrun = match next_deadline {
             Some(at) => tokio::time::sleep_until(at),
             None => tokio::time::sleep(Duration::from_secs(3600)),
         };
@@ -596,6 +682,36 @@ async fn carry(link: &mut Link, track: &Track, rx: &mut mpsc::Receiver<Command>)
         tokio::select! {
             incoming = link.recv() => {
                 heard = tokio::time::Instant::now();
+                let incoming = match incoming {
+                    Incoming::Frame(frame) => Ok(frame),
+                    Incoming::Down { why, gives_up_at } => {
+                        paused = Some(tokio::time::Instant::now());
+                        if let Ok(mut s) = track.state.lock() {
+                            s.phase = Phase::Reconnecting;
+                            s.gap = Some((Instant::now(), why.clone(), gives_up_at));
+                        }
+                        track.note(journal::session_reconnecting(&why, unix_ms(gives_up_at)));
+                        continue;
+                    }
+                    Incoming::Up { gap, resent } => {
+                        if let Some(since) = paused.take() {
+                            let stood = since.elapsed();
+                            for t in tasks.values_mut() {
+                                if let Some(at) = t.deadline.as_mut() {
+                                    *at += stood;
+                                }
+                            }
+                        }
+                        if let Ok(mut s) = track.state.lock() {
+                            s.phase = Phase::Open;
+                            s.gap = None;
+                            s.resumes += 1;
+                        }
+                        track.note(journal::session_resumed(gap.as_secs(), resent));
+                        continue;
+                    }
+                    Incoming::Ended(e) => Err(e),
+                };
                 match incoming {
                     Ok(Frame::Output { task, stream, data }) => {
                         let name = match stream {
@@ -645,11 +761,19 @@ async fn carry(link: &mut Link, track: &Track, rx: &mut mpsc::Receiver<Command>)
                         }
                     }
                     Ok(Frame::Ping { nonce }) => {
-                        if link.send(&Frame::Pong { nonce }).await.is_err() {
+                        if link.send(&Frame::Pong { nonce }).is_err() {
                             break;
                         }
                     }
                     Ok(_) => {}
+                    Err(LinkError::GaveUp) => {
+                        finish(track, LinkError::GaveUp.to_string());
+                        return;
+                    }
+                    Err(LinkError::Ended) => {
+                        finish(track, "the owner ended the session while the link was down");
+                        return;
+                    }
                     Err(e) => {
                         finish(track, format!("the owner's end went away: {e}"));
                         return;
@@ -694,7 +818,7 @@ async fn carry(link: &mut Link, track: &Track, rx: &mut mpsc::Receiver<Command>)
                     }
                     task.closing = true;
                     task.deadline = Some(now + Duration::from_secs(30));
-                    if link.send(&Frame::Close { task: id }).await.is_err() {
+                    if link.send(&Frame::Close { task: id }).is_err() {
                         finish(track, "the session ended while stopping a command");
                         return;
                     }
@@ -702,14 +826,17 @@ async fn carry(link: &mut Link, track: &Track, rx: &mut mpsc::Receiver<Command>)
             }
 
             _ = beat.tick() => {
-                if heard.elapsed() > SILENCE {
+                // A resumable link watches for silence itself, and treats it
+                // as a gap rather than an ending.
+                let resumable = track.state.lock().is_ok_and(|s| s.resumable);
+                if !resumable && heard.elapsed() > SILENCE {
                     let why = "the owner's end stopped answering";
                     link.cut(why).await;
                     finish(track, why);
                     return;
                 }
                 nonce += 1;
-                if link.send(&Frame::Ping { nonce }).await.is_err() {
+                if link.send(&Frame::Ping { nonce }).is_err() {
                     break;
                 }
             }
@@ -732,13 +859,18 @@ enum Carry {
 /// tell the caller what it now knows, and say whether the session is still
 /// there.
 async fn run_verb(
-    link: &mut Link,
+    link: &mut Resumable,
     track: &Track,
     tasks: &mut BTreeMap<TaskId, Task>,
     next_task: &mut TaskId,
     what: What,
     reply: Ack,
 ) -> Carry {
+    let reaches_owner = !matches!(what, What::Cut { .. } | What::Tasks);
+    if reaches_owner && !link.is_up() {
+        let _ = reply.send(Err(reconnecting(link)));
+        return Carry::On;
+    }
     match what {
         What::Cut { reason } => {
             link.cut(&reason).await;
@@ -748,7 +880,7 @@ async fn run_verb(
 
         What::Say { text } => {
             track.note(journal::operator_said(&text));
-            let sent = link.send(&Frame::Say { text }).await;
+            let sent = link.send(&Frame::Say { text });
             let _ = reply.send(match sent {
                 Ok(()) => Ok(json!({"ok": true, "said": true})),
                 Err(e) => Err(e.to_string()),
@@ -787,19 +919,15 @@ async fn run_verb(
                     cols: 120,
                     rows: 40,
                 })
-                .await
                 // End-of-input immediately, because nothing will ever type at a
                 // command. Without this one that reads until its input runs out
                 // — `cat`, `sort`, anything in a pipeline — waits for a keyboard
                 // that does not exist. A terminal gets no such frame: it has no
                 // end of input to be told about.
-                .and(
-                    link.send(&Frame::Input {
-                        task,
-                        data: Vec::new(),
-                    })
-                    .await,
-                );
+                .and(link.send(&Frame::Input {
+                    task,
+                    data: Vec::new(),
+                }));
             match opened {
                 Ok(()) => {
                     if let Ok(mut s) = track.state.lock() {
@@ -873,7 +1001,6 @@ async fn run_verb(
                     cols,
                     rows,
                 })
-                .await
             {
                 Ok(()) => {
                     if let Ok(mut s) = track.state.lock() {
@@ -909,7 +1036,7 @@ async fn run_verb(
                 return Carry::On;
             }
             let bytes = data.len();
-            match link.send(&Frame::Input { task, data }).await {
+            match link.send(&Frame::Input { task, data }) {
                 Ok(()) => {
                     let _ = reply.send(Ok(json!({"ok": true, "task": task, "bytes": bytes})));
                     Carry::On
@@ -926,7 +1053,7 @@ async fn run_verb(
                 let _ = reply.send(Err(format!("task {task} is not open in this session")));
                 return Carry::On;
             }
-            match link.send(&Frame::Resize { task, cols, rows }).await {
+            match link.send(&Frame::Resize { task, cols, rows }) {
                 Ok(()) => {
                     let _ = reply.send(Ok(json!({
                         "ok": true, "task": task, "cols": cols, "rows": rows,
@@ -947,7 +1074,7 @@ async fn run_verb(
             };
             open.closing = true;
             open.deadline = Some(tokio::time::Instant::now() + Duration::from_secs(30));
-            match link.send(&Frame::Close { task }).await {
+            match link.send(&Frame::Close { task }) {
                 Ok(()) => {
                     let _ = reply.send(Ok(json!({"ok": true, "task": task})));
                     Carry::On
@@ -958,6 +1085,26 @@ async fn run_verb(
                 }
             }
         }
+    }
+}
+
+/// The refusal a verb gets while the link is down.
+///
+/// Starts with `link: reconnecting` so a caller can tell it from a verb that
+/// failed for its own reasons, and says when the session gives up.
+fn reconnecting(link: &Resumable) -> String {
+    match link.gives_up_at() {
+        Some(until) => format!(
+            "link: reconnecting; the owner's end is unreachable and both ends are redialling. \
+             Try again once the session is open. It ends in {}s, at unix ms {}, \
+             if the link does not come back",
+            until
+                .duration_since(SystemTime::now())
+                .unwrap_or_default()
+                .as_secs(),
+            unix_ms(until)
+        ),
+        None => "link: reconnecting; try again once the session is open".into(),
     }
 }
 

@@ -188,6 +188,9 @@ async fn own(address: Relay, code: InviteCode, how: Owner) -> Seen {
         host: "a mac".into(),
         os: "macos".into(),
         build: "test".into(),
+        // An owner from before resuming, so these tests also cover a new
+        // daemon with an old client.
+        resume: false,
     }))
     .await
     .unwrap();
@@ -257,6 +260,9 @@ fn name(frame: &Frame) -> String {
         Frame::Ping { .. } => "ping",
         Frame::Pong { .. } => "pong",
         Frame::Defer { .. } => "defer",
+        Frame::Hold(_) => "hold",
+        Frame::Ack { .. } => "ack",
+        Frame::Resume { .. } => "resume",
     }
     .into()
 }

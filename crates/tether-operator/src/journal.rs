@@ -328,6 +328,22 @@ pub fn session_phase(
 ///
 /// A phase change like any other, so a reader that follows phases needs nothing
 /// new; `why` is what the owner's end said.
+/// The link dropped, and the session waits for it until `gives_up_at_ms`.
+pub fn session_reconnecting(why: &str, gives_up_at_ms: u64) -> (&'static str, Value) {
+    (
+        "session.phase",
+        json!({"phase": "reconnecting", "why": why, "gives_up_at_ms": gives_up_at_ms}),
+    )
+}
+
+/// The link came back after `gap_s`, and `resent` frames went again.
+pub fn session_resumed(gap_s: u64, resent: u64) -> (&'static str, Value) {
+    (
+        "session.phase",
+        json!({"phase": "open", "resumed": {"gap_s": gap_s, "resent": resent}}),
+    )
+}
+
 pub fn session_confirming(why: &str) -> (&'static str, Value) {
     (
         "session.phase",
