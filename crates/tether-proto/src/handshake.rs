@@ -35,6 +35,15 @@
 //!    per direction and one confirmation tag per role.
 //! 4. Each end sends its tag and checks the peer's in constant time. A wrong
 //!    phrase fails here, at the peer, and the relay is not the one refusing.
+//!
+//! # Resuming
+//!
+//! A session that lost its link runs the same exchange again, with the resume
+//! secret from `Frame::Hold` in place of the phrase and under its own labels,
+//! so a resume message cannot stand in for a first one or the other way round.
+//! The secret is 256 random bits, so the relay's pairing budget has nothing
+//! left to protect, and each resume gets fresh keys and counters from fresh
+//! ephemeral values.
 
 use chacha20poly1305::{
     aead::{Aead, KeyInit, Payload},
@@ -78,7 +87,11 @@ pub struct Pending {
     state: Spake2<Ed25519Group>,
     slot: Slot,
     ours: Vec<u8>,
+    transcript: &'static [u8],
 }
+
+const TRANSCRIPT_FIRST: &[u8] = b"tether v1 transcript";
+const TRANSCRIPT_RESUME: &[u8] = b"tether v1 resume transcript";
 
 /// The keys a completed handshake produced, plus the tag each end owes the
 /// other. Nothing here outlives the session: the struct is consumed by
@@ -97,9 +110,36 @@ pub struct Confirming {
 /// captured on one slot cannot be replayed into another, even by a relay that
 /// knows every slot it ever issued.
 pub fn start(role: Role, slot: Slot, phrase: &Phrase) -> (Pending, Vec<u8>) {
+    begin(
+        role,
+        slot,
+        &phrase.as_password(),
+        slot.to_string().into_bytes(),
+        TRANSCRIPT_FIRST,
+    )
+}
+
+/// Begin a resume, with the secret from `Frame::Hold` as the password.
+pub fn start_resume(role: Role, slot: Slot, secret: &[u8; 32]) -> (Pending, Vec<u8>) {
+    begin(
+        role,
+        slot,
+        secret,
+        format!("resume {slot}").into_bytes(),
+        TRANSCRIPT_RESUME,
+    )
+}
+
+fn begin(
+    role: Role,
+    slot: Slot,
+    password: &[u8],
+    identity: Vec<u8>,
+    transcript: &'static [u8],
+) -> (Pending, Vec<u8>) {
     let (state, ours) = Spake2::<Ed25519Group>::start_symmetric(
-        &Password::new(phrase.as_password()),
-        &Identity::new(slot.to_string().as_bytes()),
+        &Password::new(password),
+        &Identity::new(&identity),
     );
     (
         Pending {
@@ -107,6 +147,7 @@ pub fn start(role: Role, slot: Slot, phrase: &Phrase) -> (Pending, Vec<u8>) {
             state,
             slot,
             ours: ours.clone(),
+            transcript,
         },
         ours,
     )
@@ -131,6 +172,7 @@ impl Pending {
         let slot = self.slot;
         let ours = self.ours.clone();
         let role = self.role;
+        let transcript = self.transcript;
         let key = self
             .state
             .finish(theirs)
@@ -145,7 +187,7 @@ impl Pending {
             (theirs, ours.as_slice())
         };
         let mut binding = Sha256::new();
-        binding.update(b"tether v1 transcript");
+        binding.update(transcript);
         binding.update(slot.to_string().as_bytes());
         binding.update(first);
         binding.update(second);
@@ -351,6 +393,53 @@ mod tests {
             data: vec![1, 2, 3],
         };
         assert_eq!(operator.open(&owner.seal(&back).unwrap()).unwrap(), back);
+    }
+
+    fn resume_pair(
+        slot: u32,
+        operator: &[u8; 32],
+        owner: &[u8; 32],
+    ) -> Result<(Channel, Channel), HandshakeError> {
+        let slot = Slot::new(slot).unwrap();
+        let (op, op_msg) = start_resume(Role::Operator, slot, operator);
+        let (ow, ow_msg) = start_resume(Role::Owner, slot, owner);
+        let (op, op_tag) = op.finish(&ow_msg)?;
+        let (ow, ow_tag) = ow.finish(&op_msg)?;
+        Ok((op.confirm(&ow_tag)?, ow.confirm(&op_tag)?))
+    }
+
+    #[test]
+    fn the_resume_secret_opens_a_fresh_channel() {
+        let secret = [3u8; 32];
+        let (mut operator, mut owner) = resume_pair(7, &secret, &secret).unwrap();
+        let sent = Frame::Resume { received: 4 };
+        assert_eq!(owner.open(&operator.seal(&sent).unwrap()).unwrap(), sent);
+    }
+
+    #[test]
+    fn a_wrong_resume_secret_is_refused() {
+        assert!(matches!(
+            resume_pair(7, &[3u8; 32], &[4u8; 32]),
+            Err(HandshakeError::WrongCode)
+        ));
+    }
+
+    /// A first exchange and a resume never complete against each other, even
+    /// when one end's phrase bytes happened to equal the other's secret.
+    #[test]
+    fn a_resume_message_cannot_answer_a_first_one() {
+        let slot = Slot::new(7).unwrap();
+        let p = phrase(&["anchor", "kettle"]);
+        let mut secret = [0u8; 32];
+        let bytes = p.as_password();
+        secret[..bytes.len().min(32)].copy_from_slice(&bytes[..bytes.len().min(32)]);
+        let (op, _) = start(Role::Operator, slot, &p);
+        let (ow, ow_msg) = start_resume(Role::Owner, slot, &secret);
+        let (op, op_tag) = op.finish(&ow_msg).unwrap();
+        let (_, op_msg) = start(Role::Operator, slot, &p);
+        let (ow, ow_tag) = ow.finish(&op_msg).unwrap();
+        assert!(op.confirm(&ow_tag).is_err());
+        assert!(ow.confirm(&op_tag).is_err());
     }
 
     #[test]

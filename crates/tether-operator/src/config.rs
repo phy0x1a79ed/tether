@@ -86,6 +86,7 @@ impl Config {
             host: self.host.clone(),
             os: std::env::consts::OS.to_string(),
             build: self.build.clone(),
+            resume: true,
         }
     }
 }

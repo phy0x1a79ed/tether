@@ -50,9 +50,11 @@ pub mod http;
 pub mod net;
 pub mod poll;
 pub mod relay;
+pub mod resume;
 
 pub use net::{DialError, Route};
 pub use relay::{Relay, RelayError};
+pub use resume::{Incoming, Resumable};
 
 /// How long the opening exchange may take.
 ///
@@ -74,6 +76,13 @@ pub enum LinkError {
     Socket(String),
     /// The chair is occupied, or the other one is still unwinding a pairing.
     Taken,
+    /// The relay has no such slot. To an owner who has just run the launcher,
+    /// the code expired or is in use. To an end redialling a held session, the
+    /// relay restarted.
+    NoSuchSession,
+    /// The relay says this held session was ended on purpose. Redialling is
+    /// pointless.
+    Ended,
     /// Nobody completed the exchange from the other side in time.
     NobodyThere,
     /// The peer's half of the exchange did not check out. In practice this is
@@ -81,6 +90,8 @@ pub enum LinkError {
     /// cryptographic failure to somebody trying to get help with a backup.
     Handshake(HandshakeError),
     Closed,
+    /// A held session's link stayed down for the whole resume window.
+    GaveUp,
     /// `TETHER_TRANSPORT` names neither transport.
     Transport(String),
 }
@@ -93,6 +104,12 @@ impl std::fmt::Display for LinkError {
             Self::Http(e) => write!(f, "{e}"),
             Self::Socket(e) => write!(f, "the relay would not open a socket: {e}"),
             Self::Taken => write!(f, "somebody is already in that seat"),
+            Self::NoSuchSession => write!(
+                f,
+                "there is no such session — the code may have expired or already be in use; \
+                 ask the operator for a new code"
+            ),
+            Self::Ended => write!(f, "the session was ended"),
             Self::NobodyThere => write!(
                 f,
                 "nobody answered on the other side of the session in time"
@@ -103,6 +120,11 @@ impl std::fmt::Display for LinkError {
             ),
             Self::Handshake(e) => write!(f, "the session could not be secured: {e}"),
             Self::Closed => write!(f, "the session ended"),
+            Self::GaveUp => write!(
+                f,
+                "the link did not come back within {} minutes",
+                tether_proto::RESUME_WINDOW.as_secs() / 60
+            ),
             Self::Transport(value) => write!(
                 f,
                 "TETHER_TRANSPORT is `{value}`, but it takes `socket` or `poll`"
@@ -222,7 +244,123 @@ pub async fn release(relay: &Relay, slot: Slot, seat_token: &str) -> Result<(), 
     Ok(())
 }
 
+/// Turn a slot into a resumable session for the owner whose token this is.
+///
+/// The operator calls this once, after consent and before it sends the owner
+/// `Frame::Hold`. An older relay answers `404`, and the session then runs as
+/// it always did, without resuming.
+pub async fn hold(
+    relay: &Relay,
+    slot: Slot,
+    seat_token: &str,
+    owner_token: &str,
+) -> Result<(), LinkError> {
+    let body = serde_json::json!({ "owner": owner_token }).to_string();
+    http::post_json_body(relay, &relay.hold_path(slot, seat_token), None, &body).await?;
+    Ok(())
+}
+
+/// Put a held slot back on a relay that restarted and forgot it.
+///
+/// `Ok` also when the slot is already back. A `409` means the number went to
+/// another session first, and a `410` that the session was ended.
+pub async fn restore(
+    relay: &Relay,
+    bearer: &str,
+    slot: Slot,
+    seat_token: &str,
+    owner_token: &str,
+) -> Result<(), LinkError> {
+    let body = serde_json::json!({
+        "slot": slot.to_string(),
+        "token": seat_token,
+        "owner": owner_token,
+    })
+    .to_string();
+    match http::post_json_body(relay, &relay.issue_path(), Some(bearer), &body).await {
+        Ok(_) => Ok(()),
+        Err(http::HttpError::Status(409)) => Err(LinkError::Taken),
+        Err(http::HttpError::Status(410)) => Err(LinkError::Ended),
+        Err(e) => Err(e.into()),
+    }
+}
+
 impl Link {
+    /// The owner's way back into a held session, with the token and secret
+    /// from `Frame::Hold`.
+    ///
+    /// The owner token takes the chair directly: a held slot mints no tickets.
+    /// A session that fell back to plain requests the first time goes straight
+    /// to them again.
+    pub async fn resume_owner(
+        relay: &Relay,
+        slot: Slot,
+        owner_token: &str,
+        secret: &[u8; 32],
+        choice: Carry,
+    ) -> Result<Self, LinkError> {
+        if choice != Carry::Poll {
+            match open_socket(relay, slot, owner_token).await {
+                Ok(socket) => {
+                    let transport = Transport::Socket(Box::new(socket));
+                    return Self::secure_resume(transport, slot, secret, Role::Owner).await;
+                }
+                Err(Upgrade::Refused(e)) => return Err(e),
+                Err(Upgrade::Failed(why)) if choice == Carry::Socket => {
+                    return Err(LinkError::Socket(why))
+                }
+                Err(Upgrade::Failed(_)) => {}
+            }
+        }
+        let polled = poll::Polled::open(relay, slot, owner_token).await?;
+        let mut link =
+            Self::secure_resume(Transport::Poll(polled), slot, secret, Role::Owner).await?;
+        link.polled = Some("the WebSocket did not open".into());
+        Ok(link)
+    }
+
+    /// The operator's way back into a held session.
+    pub async fn resume_operator(
+        relay: &Relay,
+        slot: Slot,
+        seat_token: &str,
+        secret: &[u8; 32],
+    ) -> Result<Self, LinkError> {
+        let socket = open_socket(relay, slot, seat_token)
+            .await
+            .map_err(|e| match e {
+                Upgrade::Refused(e) => e,
+                Upgrade::Failed(why) => LinkError::Socket(why),
+            })?;
+        Self::secure_resume(
+            Transport::Socket(Box::new(socket)),
+            slot,
+            secret,
+            Role::Operator,
+        )
+        .await
+    }
+
+    async fn secure_resume(
+        mut transport: Transport,
+        slot: Slot,
+        secret: &[u8; 32],
+        role: Role,
+    ) -> Result<Self, LinkError> {
+        let (pending, ours) = handshake::start_resume(role, slot, secret);
+        let channel = tokio::time::timeout(
+            HANDSHAKE_TIMEOUT,
+            finish_exchange(&mut transport, pending, ours),
+        )
+        .await
+        .map_err(|_| LinkError::NobodyThere)??;
+        Ok(Self {
+            transport,
+            channel,
+            polled: None,
+        })
+    }
+
     /// The owner's way in: claim a ticket, take the owner's chair, handshake.
     ///
     /// The claim is a separate plain request on purpose and must stay one. It
@@ -388,10 +526,9 @@ async fn open_socket(relay: &Relay, slot: Slot, token: &str) -> Result<Socket, U
     {
         Ok((socket, _)) => Ok(socket),
         Err(WsError::Http(response)) => match response.status().as_u16() {
-            404 => Err(Upgrade::Refused(LinkError::Socket(
-                "there is no such session — the code may have expired".into(),
-            ))),
+            404 => Err(Upgrade::Refused(LinkError::NoSuchSession)),
             409 => Err(Upgrade::Refused(LinkError::Taken)),
+            410 => Err(Upgrade::Refused(LinkError::Ended)),
             other => Err(Upgrade::Failed(format!("the path answered {other}"))),
         },
         Err(other) => Err(Upgrade::Failed(other.to_string())),
@@ -426,6 +563,14 @@ async fn exchange(
     role: Role,
 ) -> Result<Channel, LinkError> {
     let (pending, ours) = handshake::start(role, slot, phrase);
+    finish_exchange(transport, pending, ours).await
+}
+
+async fn finish_exchange(
+    transport: &mut Transport,
+    pending: handshake::Pending,
+    ours: Vec<u8>,
+) -> Result<Channel, LinkError> {
     transport.send(ours).await?;
 
     let theirs = transport.next().await?;

@@ -26,6 +26,13 @@
 //! underneath is ordered. Anything that moves output onto a second path — a
 //! thread with its own writer, a "fast path" for large chunks — breaks it
 //! without failing a test unless that test watches the order.
+//!
+//! # Resuming
+//!
+//! A session survives a dropped link only when both ends say so in their
+//! `Hello`. An older peer cannot decode a frame variant it does not know, so
+//! `Hold`, `Ack` and `Resume` are never sent to one. See `tether_link::resume`
+//! for how the two ends count frames and resend what a drop lost.
 
 use serde::{Deserialize, Serialize};
 
@@ -122,6 +129,29 @@ pub struct Hello {
     /// The build this end came from, so a stale download is visible as a fact
     /// rather than as behaviour nobody can explain.
     pub build: String,
+    /// This end can carry the session through a dropped link. Absent from an
+    /// older peer's `Hello`, which reads as false.
+    #[serde(default)]
+    pub resume: bool,
+}
+
+/// What lets the owner back into a session after a drop. See [`Frame::Hold`].
+///
+/// Redacted in `Debug`, because either half is enough to take the owner's chair
+/// or to speak in it, and the way a secret reaches a log is that something two
+/// layers away logged a frame whole.
+#[derive(Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct HoldKeys {
+    /// The owner's seat token at the relay, as hex.
+    pub token: String,
+    /// The password the two ends run the resume handshake with.
+    pub secret: [u8; 32],
+}
+
+impl std::fmt::Debug for HoldKeys {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("HoldKeys(redacted)")
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -204,6 +234,34 @@ pub enum Frame {
     Pong {
         nonce: u64,
     },
+
+    /// The operator to the owner, once, right after consent: how to come back.
+    ///
+    /// The relay knows the token and never the secret. The phrase is spent the
+    /// moment this is sent, because a resumed session authenticates with the
+    /// secret and nothing else.
+    Hold(HoldKeys),
+    /// How many counted frames this end has received. Sent on a timer, so the
+    /// peer can drop what it was keeping in case of a drop.
+    Ack {
+        received: u64,
+    },
+    /// The first frame on a resumed channel: how many counted frames this end
+    /// received before the drop. The peer resends everything after that.
+    Resume {
+        received: u64,
+    },
+}
+
+impl Frame {
+    /// Whether this frame is numbered for resending. Keepalives and the resume
+    /// layer's own frames are not, since a resend has no use for them.
+    pub fn counted(&self) -> bool {
+        !matches!(
+            self,
+            Frame::Ping { .. } | Frame::Pong { .. } | Frame::Ack { .. } | Frame::Resume { .. }
+        )
+    }
 }
 
 #[derive(Debug, thiserror::Error)]
@@ -252,6 +310,7 @@ mod tests {
             host: "altair".into(),
             os: "linux".into(),
             build: "deadbeef".into(),
+            resume: true,
         })
     }
 
@@ -296,6 +355,12 @@ mod tests {
             },
             Frame::Ping { nonce: 7 },
             Frame::Pong { nonce: 7 },
+            Frame::Hold(HoldKeys {
+                token: "0123456789abcdef0123456789abcdef".into(),
+                secret: [7u8; 32],
+            }),
+            Frame::Ack { received: 12 },
+            Frame::Resume { received: 12 },
         ];
         for f in frames {
             assert_eq!(Frame::decode(&f.encode().unwrap()).unwrap(), f);
@@ -328,6 +393,46 @@ mod tests {
             Frame::decode(&vec![0u8; MAX_FRAME + 1]),
             Err(FrameError::TooLarge(_))
         ));
+    }
+
+    /// An older peer's `Hello` has no `resume` field, and must still decode.
+    #[test]
+    fn a_hello_from_before_resume_reads_as_not_resuming() {
+        #[derive(Serialize)]
+        struct Old {
+            version: u16,
+            role: Role,
+            who: String,
+            host: String,
+            os: String,
+            build: String,
+        }
+        #[derive(Serialize)]
+        enum OldFrame {
+            Hello(Old),
+        }
+        let old = OldFrame::Hello(Old {
+            version: PROTOCOL_VERSION,
+            role: Role::Owner,
+            who: "pat".into(),
+            host: "laptop".into(),
+            os: "macos".into(),
+            build: "v0.1.1".into(),
+        });
+        match Frame::decode(&rmp_serde::to_vec_named(&old).unwrap()).unwrap() {
+            Frame::Hello(hello) => assert!(!hello.resume),
+            other => panic!("{other:?}"),
+        }
+    }
+
+    #[test]
+    fn hold_keys_never_print() {
+        let keys = HoldKeys {
+            token: "0123456789abcdef0123456789abcdef".into(),
+            secret: [0xab; 32],
+        };
+        let shown = format!("{:?}", Frame::Hold(keys));
+        assert!(!shown.contains("0123") && !shown.contains("171"), "{shown}");
     }
 
     #[test]

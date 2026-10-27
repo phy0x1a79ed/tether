@@ -67,6 +67,7 @@ fn hello(role: Role, who: &str) -> Hello {
         host: "altair".into(),
         os: "linux".into(),
         build: "test".into(),
+        resume: false,
     }
 }
 

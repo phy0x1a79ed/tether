@@ -6,6 +6,8 @@ description = "tether's transport: reaching the relay, and the sealed channel th
 
 [dependencies]
 futures-util = { workspace = true }
+getrandom = { workspace = true }
+hex = { workspace = true }
 rustls-pki-types = { workspace = true }
 serde_json = { workspace = true }
 tether-proto = { workspace = true }
@@ -13,3 +15,7 @@ tokio = { workspace = true }
 tokio-rustls = { workspace = true }
 tokio-tungstenite = { workspace = true }
 webpki-roots = { workspace = true }
+
+[dev-dependencies]
+# The resume tests stand a real relay up behind a proxy they can cut.
+tether-relay = { path = "../tether-relay" }

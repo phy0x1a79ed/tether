@@ -62,12 +62,9 @@ impl Polled {
             .await?;
         match status {
             200 => {}
-            404 => {
-                return Err(LinkError::Socket(
-                    "there is no such session — the code may have expired".into(),
-                ))
-            }
+            404 => return Err(LinkError::NoSuchSession),
             409 => return Err(LinkError::Taken),
+            410 => return Err(LinkError::Ended),
             other => return Err(HttpError::Status(other).into()),
         }
         let id = serde_json::from_slice::<serde_json::Value>(&body)

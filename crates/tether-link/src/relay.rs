@@ -145,6 +145,12 @@ impl Relay {
         format!("{}/release/{}/{}", self.prefix, slot, seat)
     }
 
+    /// The path that holds a slot for its consented owner. The owner's token
+    /// rides in the body, not here.
+    pub fn hold_path(&self, slot: Slot, seat: &str) -> String {
+        format!("{}/hold/{}/{}", self.prefix, slot, seat)
+    }
+
     /// Where a chair is taken for polling, with the same ticket `/join` takes.
     pub fn poll_path(&self, slot: Slot, ticket: &str) -> String {
         format!("{}/poll/{}/{}", self.prefix, slot, ticket)

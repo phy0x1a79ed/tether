@@ -70,18 +70,37 @@ pub async fn post_json(
     path: &str,
     bearer: Option<&str>,
 ) -> Result<serde_json::Value, HttpError> {
+    post_json_body(relay, path, bearer, "").await
+}
+
+/// [`post_json`] with a JSON body. The body is for a credential that must not
+/// ride in the path, where every access log on the way would keep it.
+pub async fn post_json_body(
+    relay: &Relay,
+    path: &str,
+    bearer: Option<&str>,
+    body: &str,
+) -> Result<serde_json::Value, HttpError> {
     let auth = match bearer {
         Some(token) => format!("Authorization: Bearer {token}\r\n"),
         None => String::new(),
+    };
+    let kind = if body.is_empty() {
+        ""
+    } else {
+        "Content-Type: application/json\r\n"
     };
     let request = format!(
         "POST {path} HTTP/1.1\r\n\
          Host: {}\r\n\
          User-Agent: tether\r\n\
          {auth}\
-         Content-Length: 0\r\n\
-         Connection: close\r\n\r\n",
-        relay.authority()
+         {kind}\
+         Content-Length: {}\r\n\
+         Connection: close\r\n\r\n\
+         {body}",
+        relay.authority(),
+        body.len()
     );
 
     let route = Route::for_relay(relay).map_err(HttpError::Dial)?;

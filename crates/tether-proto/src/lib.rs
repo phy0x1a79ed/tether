@@ -35,7 +35,7 @@ pub mod handshake;
 pub mod invite;
 pub mod words;
 
-pub use frame::{Ended, Frame, Hello, Kind, Role, Stream, TaskId, PROTOCOL_VERSION};
+pub use frame::{Ended, Frame, Hello, HoldKeys, Kind, Role, Stream, TaskId, PROTOCOL_VERSION};
 pub use handshake::{Channel, HandshakeError};
 pub use invite::{InviteCode, InviteError, Phrase, Slot, DEFAULT_WORDS, MAX_SLOT};
 

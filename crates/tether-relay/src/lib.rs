@@ -278,7 +278,8 @@ async fn claim(
     }
 }
 
-/// End a slot, because the operator that owns it is finished with it.
+/// End a slot, because the operator that owns it is finished with it, or
+/// because the owner of a held slot is.
 ///
 /// The seat token in the path is the authorisation, exactly as it is on
 /// `/join`: it is what this relay handed back when it issued the slot, and

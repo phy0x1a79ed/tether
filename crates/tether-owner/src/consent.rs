@@ -216,6 +216,7 @@ mod tests {
             host: "altair".into(),
             os: "linux".into(),
             build: "9fda69b".into(),
+            resume: false,
         }
     }
 

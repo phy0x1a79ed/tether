@@ -119,9 +119,11 @@ impl Session {
 ///
 /// Without it an owner redialling a released slot gets the same `404` a relay
 /// restart gives, and has to wait out the whole grace to learn the session is
-/// over. Keyed by the owner's token, so nobody else can tell it exists.
+/// over. The operator hears the same when the owner ended it. Keyed by the two
+/// seat tokens, so nobody else can tell it exists.
 struct Tombstone {
     slot: u32,
+    operator_token: Token,
     owner_token: Token,
     until: Instant,
 }
@@ -133,19 +135,23 @@ struct Table {
 }
 
 impl Table {
-    fn bury(&mut self, slot: u32, owner_token: Token, until: Instant) {
+    fn bury(&mut self, slot: u32, session: &Session, until: Instant) {
+        let Some(owner_token) = session.owner_token else {
+            return;
+        };
         self.ended.retain(|t| t.slot != slot);
         self.ended.push(Tombstone {
             slot,
+            operator_token: session.operator_token,
             owner_token,
             until,
         });
     }
 
     fn buried(&self, slot: u32, token: Token, now: Instant) -> bool {
-        self.ended
-            .iter()
-            .any(|t| t.slot == slot && t.until > now && t.owner_token == token)
+        self.ended.iter().any(|t| {
+            t.slot == slot && t.until > now && (t.owner_token == token || t.operator_token == token)
+        })
     }
 }
 
@@ -538,18 +544,19 @@ impl Sessions {
     /// back when it issued the slot, and it is already the secret that lets
     /// that operator take its chair. Anyone holding it could end the session
     /// by occupying it anyway.
+    ///
+    /// At a held slot the owner's token ends it too. That is how an owner who
+    /// quits during a gap tells an operator it cannot reach.
     pub fn destroy(&self, slot: Slot, token: Token, now: Instant) -> bool {
         let mut table = self.inner.lock().unwrap();
-        let Some(session) = table.live.get(&slot.get()) else {
+        let Some(session) = table.live.remove(&slot.get()) else {
             return false;
         };
-        if session.operator_token != token {
+        if session.operator_token != token && session.owner_token != Some(token) {
+            table.live.insert(slot.get(), session);
             return false;
         }
-        if let Some(owner_token) = session.owner_token {
-            table.bury(slot.get(), owner_token, now + self.limits.resume_grace);
-        }
-        table.live.remove(&slot.get());
+        table.bury(slot.get(), &session, now + self.limits.resume_grace);
         true
     }
 
@@ -573,16 +580,15 @@ impl Sessions {
     /// ended rather than that it is lost.
     fn reap_locked(&self, table: &mut Table, now: Instant) {
         table.ended.retain(|t| t.until > now);
-        let expired: Vec<(u32, Option<Token>)> = table
+        let expired: Vec<u32> = table
             .live
             .iter()
             .filter(|(_, s)| s.seats[Seat::Operator.index()].is_none() && s.deadline <= now)
-            .map(|(n, s)| (*n, s.owner_token))
+            .map(|(n, _)| *n)
             .collect();
-        for (n, owner_token) in expired {
-            table.live.remove(&n);
-            if let Some(owner_token) = owner_token {
-                table.bury(n, owner_token, now + self.limits.resume_grace);
+        for n in expired {
+            if let Some(session) = table.live.remove(&n) {
+                table.bury(n, &session, now + self.limits.resume_grace);
             }
         }
     }
@@ -1087,6 +1093,28 @@ mod tests {
             s.join(issued.slot, owner_token, chan(), now).err(),
             Some(JoinError::Ended)
         );
+    }
+
+    #[test]
+    fn an_owner_can_end_a_held_slot_and_the_operator_hears_it() {
+        let s = sessions();
+        let now = Instant::now();
+        let (issued, owner_token, _operator, _owner) = held(&s, now);
+        assert!(s.destroy(issued.slot, owner_token, now));
+        assert_eq!(
+            s.join(issued.slot, issued.token, chan(), now).err(),
+            Some(JoinError::Ended)
+        );
+    }
+
+    #[test]
+    fn an_owner_token_ends_nothing_before_the_slot_is_held() {
+        let s = sessions();
+        let now = Instant::now();
+        let issued = s.issue(now).unwrap();
+        let (ticket, _) = s.claim(issued.slot, now).unwrap();
+        assert!(!s.destroy(issued.slot, ticket, now));
+        assert_eq!(s.live(), 1);
     }
 
     #[test]
