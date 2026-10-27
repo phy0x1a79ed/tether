@@ -26,6 +26,7 @@ One set of words, used in the code, the verbs, the interface and these docs.
 | **seat** | one of the two chairs at a slot, taken with a single-use token |
 | **task** | one command or one terminal inside a session |
 | **cut** | to end a session, from either side |
+| **gap** | a dropped link that a consented session waits through, for up to 10 minutes |
 
 ## The five pieces
 
@@ -71,19 +72,76 @@ hold the secret.
    frame is how the operator learns consent was given. An owner with no
    terminal sends `Defer` instead and exits. The operator keeps the slot and
    waits at step 3 for the second run.
-9. Tasks run. The owner watches each one as it happens.
-10. Either side sends `Cut`. The other exits and says why.
-11. The daemon posts to `/release/{slot}/{seat token}`. The slot stops existing,
+9. The daemon mints an owner seat token and a resume secret. It posts the
+   token to `/hold/{slot}/{seat token}` and sends both to the client in `Hold`.
+   The slot is now **held**, and a drop on either side is a gap rather than an
+   end. See § Through a dropped link.
+10. Tasks run. The owner watches each one as it happens.
+11. Either side sends `Cut`. The other exits and says why.
+12. The daemon posts to `/release/{slot}/{seat token}`. The slot stops existing,
     so the next person to run that code is turned away at once rather than
     seated opposite nobody.
 
-The relay sees steps 1, 4, 5, 11 and the bytes. It sees none of 6 through 10.
+The relay sees steps 1, 4, 5, 9, 12 and the bytes. It sees none of 6 through
+11, and never the resume secret.
 
-Step 11 has to be the operator's to take. The relay pumps sealed bytes and holds
+Step 12 has to be the operator's to take. The relay pumps sealed bytes and holds
 no key, so a refusal and a mistyped phrase are the same event from where it
 stands — and one must end the slot while the other must leave it open for the
-retry. Only the daemon knows which happened. If it never says, the slot expires
-on its own a few seconds after its chair goes empty.
+retry. Only the daemon knows which happened. If it never says, an unheld slot
+expires on its own a few seconds after its chair goes empty, and a held slot
+after 10 minutes.
+
+## Through a dropped link
+
+Once the slot is held, both ends redial it for `RESUME_WINDOW`, 10 minutes,
+from the moment each one saw the drop. The relay's teardown cascade still ends
+both legs when one fails. The held slot is what makes the redial land.
+`tether-link/src/resume.rs` owns the redial, the numbering and the resend.
+`tether-relay/src/session.rs` owns the held slot.
+
+A held slot changes four rules at the relay:
+
+1. Either chair may stay empty for the window. A rejoining socket replaces a
+   stale one in its chair, so a sleeping laptop's dead socket blocks nothing.
+2. The owner's chair takes only the owner seat token, and takes it again on
+   every redial.
+3. `/claim` answers `404`, so no ticket can be minted for the slot.
+4. The pairing budget stops counting.
+
+Rules 3 and 4 hold because the phrase is dead after consent. A resumed channel
+runs the same handshake with the resume secret as its password, under a
+separate label, so it gets fresh keys and fresh counters and reuses no nonce. A
+second run of the launcher, or a stranger who overheard the code, gets `404` and
+"ask the operator for a new code". The budget protects a twenty-bit phrase, and
+that phrase no longer opens anything.
+
+Nothing sent is lost. Each end numbers the frames it sends, except `Ping`,
+`Pong`, `Ack` and `Resume`, and keeps each one until the peer's `Ack` covers it.
+A resumed channel starts with `Resume`, which says how many frames arrived, and
+each end then resends the rest in order. The kept frames are bounded at 8 MiB.
+When the bound is reached the owner stops reading a task's output, so the
+command blocks on its own write instead of losing it.
+
+An end notices a drop when its socket fails, when it hears nothing for a
+minute, or when its wall clock jumped past its monotonic clock, which is how a
+machine that slept looks from inside.
+
+A deliberate end stays immediate. `Cut` goes in band when the link is up.
+During a gap the leaving end posts `/release` with its own seat token instead.
+The relay then keeps a tombstone, the slot number and its two seat tokens, for
+the window, and answers the other end's next redial with `410`. A held slot
+that merely expires leaves no tombstone, so each end's own window decides and
+says why it ended.
+
+**CAUTION** The resume secret and the owner seat token live in process memory
+only. That is why nothing reconnects after a client exits and nothing starts at
+boot, and it is also why a restart of the operator's daemon still ends every
+session.
+
+Resume runs only when both `Hello` frames say `resume`. An older peer never says
+it, so it never receives `Hold`, `Ack` or `Resume`, which it could not decode,
+and its session ends at the first drop as before.
 
 ## Why the slot and the phrase are separate
 
@@ -105,7 +163,8 @@ form. The slot exists precisely so the phrase never has to travel.
 Twenty bits is defensible only because of what surrounds it. A session is
 one-shot. It expires in minutes. It is destroyed after a few failed pairings.
 Every guess must be a live attempt against a live session. Those three
-properties are load-bearing, not hardening. `tether-proto/src/invite.rs` owns
+properties are load-bearing, not hardening. They need to hold only until
+consent, because a held slot no longer takes the phrase. `tether-proto/src/invite.rs` owns
 this subject.
 
 **CAUTION** Never put the phrase in a URL, a header, a query string or a log.
@@ -154,7 +213,9 @@ comes back and `/bin` serves opaque bytes.
 The polled routes are in the same family. The door carries `/poll/{slot}/{token}`
 and `/seat/{id}/(recv|send|close)` because `tether-relay/src/poll.rs` serves
 them. A door without them answers `404`, and an owner behind a proxy that
-refuses WebSockets then has no transport left.
+refuses WebSockets then has no transport left. The door carries
+`/hold/{slot}/{token}` for the same reason. Without it the daemon's hold fails,
+and every session runs without resume, silently.
 
 A door looser than the parser forwards malformed input the door exists to
 refuse. A door tighter than the parser turns a legitimate invite into a `404`
@@ -288,7 +349,11 @@ when standard input is. Both are the person, and neither is the pipe.
 
 ## What the relay keeps
 
-Nothing. No session content, no key material, no record of a finished session.
-State lives in memory, so restarting the relay ends every live session. Its log
-records that a slot was issued and that it was released, and says nothing else
+No session content and no key material. State lives in memory. A restart
+forgets every slot, and an invite not yet consented to ends with it. A held
+session survives because its daemon puts the slot back: a bearer `/issue` that
+names the slot and both seat tokens recreates it, and the owner's redial finds
+it there. The only record of a finished session is a held slot's tombstone,
+which lasts the window. The log records that a slot was issued, held and
+released, and which leg of a pairing ended first and how. It says nothing else
 about the session.
