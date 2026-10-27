@@ -323,11 +323,6 @@ pub fn session_phase(
     )
 }
 
-/// The owner's machine had no terminal to answer the prompt at, and the
-/// person there was asked to confirm by running the client again.
-///
-/// A phase change like any other, so a reader that follows phases needs nothing
-/// new; `why` is what the owner's end said.
 /// The link dropped, and the session waits for it until `gives_up_at_ms`.
 pub fn session_reconnecting(why: &str, gives_up_at_ms: u64) -> (&'static str, Value) {
     (
@@ -344,6 +339,11 @@ pub fn session_resumed(gap_s: u64, resent: u64) -> (&'static str, Value) {
     )
 }
 
+/// The owner's machine had no terminal to answer the prompt at, and the
+/// person there was asked to confirm by running the client again.
+///
+/// A phase change like any other, so a reader that follows phases needs nothing
+/// new; `why` is what the owner's end said.
 pub fn session_confirming(why: &str) -> (&'static str, Value) {
     (
         "session.phase",

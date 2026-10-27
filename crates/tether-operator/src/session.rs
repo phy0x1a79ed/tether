@@ -507,6 +507,7 @@ async fn carried(cfg: &Config, slot: Slot, seat: &str, link: Link, track: &Track
             bearer: cfg.issue_token.clone(),
             slot,
             seat: seat.to_string(),
+            window: cfg.resume_window,
         },
     )
 }

@@ -253,7 +253,7 @@ impl Ui {
             Event::Note(text) => self.line(format!("· {text}")),
             Event::LinkDown { why, gives_up_in } => {
                 self.down = Some(Instant::now() + gives_up_in);
-                let mins = gives_up_in.as_secs() / 60;
+                let mins = gives_up_in.as_secs().div_ceil(60);
                 self.line(format!(
                     "· connection lost ({why}). Reconnecting for up to {mins} minutes; \
                      anything running here keeps running. Press Ctrl-C to end the session now."

@@ -50,3 +50,8 @@ libc = { workspace = true }
 # interesting failures in this client are between the pieces, not inside them.
 tether-relay = { path = "../tether-relay" }
 serde_json = { workspace = true }
+
+# The reconnect tests run the real daemon opposite the real client. The daemon
+# speaks on a Unix socket, so it builds only there.
+[target.'cfg(unix)'.dev-dependencies]
+tether-operator = { path = "../tether-operator" }

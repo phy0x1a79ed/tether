@@ -205,7 +205,12 @@ async fn own_via(
     carry: Carry,
 ) -> (Outcome, Option<std::path::PathBuf>, Option<String>) {
     log_into_a_directory_of_our_own();
-    let me = hello(Role::Owner, "the owner");
+    // A client that can resume, opposite an operator that never says so, so
+    // every test here also covers a new client with an old daemon.
+    let me = Hello {
+        resume: true,
+        ..hello(Role::Owner, "the owner")
+    };
     let mut link = match Link::dial_owner_via(&invite.relay, &invite.code, carry).await {
         Ok(link) => link,
         Err(e) => return (Outcome::Failed(e.to_string()), None, None),
@@ -224,8 +229,16 @@ async fn own_via(
                 return (outcome, path, polled);
             }
         };
+    let link = session::carried(
+        link,
+        &operator,
+        &me,
+        &invite.relay,
+        invite.code.slot,
+        tether_proto::RESUME_WINDOW,
+    );
     let outcome = session::run(
-        tether_link::Resumable::plain(link),
+        link,
         operator,
         invite.relay.to_string(),
         invite.code.slot.to_string(),

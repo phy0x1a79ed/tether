@@ -106,6 +106,11 @@ pub trait Rejoin: Send + 'static {
     fn abandon(&mut self, _keys: &HoldKeys) -> BoxFuture<'static, ()> {
         Box::pin(async {})
     }
+
+    /// How long a gap may last before the session ends.
+    fn window(&self) -> Duration {
+        RESUME_WINDOW
+    }
 }
 
 /// Mint the keys an operator hands its owner in `Frame::Hold`.
@@ -307,6 +312,14 @@ impl Drop for Resumable {
     }
 }
 
+/// Why the link dropped, in words that do not say the session ended.
+fn dropped(e: &LinkError) -> String {
+    match e {
+        LinkError::Closed => "the connection closed".into(),
+        e => e.to_string(),
+    }
+}
+
 /// What a frame costs to keep. An estimate is enough: it bounds memory, and
 /// the encoding adds a few dozen bytes to the payload.
 fn weight(frame: &Frame) -> usize {
@@ -424,7 +437,7 @@ impl Actor {
                             self.keep(frame.clone());
                         }
                         if let Err(e) = link.send(&frame).await {
-                            return Stop::Down(e.to_string());
+                            return Stop::Down(dropped(&e));
                         }
                     }
                     Some(Out::Leave(frame, done)) => {
@@ -442,7 +455,7 @@ impl Actor {
                             return Stop::Exit;
                         }
                     }
-                    Err(e) => return Stop::Down(e.to_string()),
+                    Err(e) => return Stop::Down(dropped(&e)),
                 },
                 _ = tick.tick() => {
                     if !self.resumable() {
@@ -463,7 +476,7 @@ impl Actor {
                         return Stop::Down("the other end stopped answering".into());
                     }
                     if let Err(e) = link.send(&Frame::Ack { received: self.received }).await {
-                        return Stop::Down(e.to_string());
+                        return Stop::Down(dropped(&e));
                     }
                 }
             }
@@ -501,9 +514,10 @@ impl Actor {
     /// Redial through a gap. The new link, or `None` once the session is over.
     async fn reconnect(&mut self, why: String) -> Option<Link> {
         self.shared.up.store(false, Ordering::Relaxed);
+        let window = self.rejoin.as_ref().map_or(RESUME_WINDOW, |r| r.window());
         let dropped = Instant::now();
-        let deadline = dropped + RESUME_WINDOW;
-        let gives_up_at = SystemTime::now() + RESUME_WINDOW;
+        let deadline = dropped + window;
+        let gives_up_at = SystemTime::now() + window;
         if let Ok(mut g) = self.shared.gives_up_at.lock() {
             *g = Some(gives_up_at);
         }
@@ -643,9 +657,15 @@ pub struct OperatorRejoin {
     pub bearer: Option<String>,
     pub slot: tether_proto::Slot,
     pub seat: String,
+    /// [`RESUME_WINDOW`] outside tests.
+    pub window: Duration,
 }
 
 impl Rejoin for OperatorRejoin {
+    fn window(&self) -> Duration {
+        self.window
+    }
+
     fn dial(&mut self, keys: &HoldKeys) -> BoxFuture<'static, Result<Link, LinkError>> {
         let (relay, bearer, slot, seat) = (
             self.relay.clone(),
@@ -683,9 +703,15 @@ pub struct OwnerRejoin {
     pub relay: crate::Relay,
     pub slot: tether_proto::Slot,
     pub carry: crate::Carry,
+    /// [`RESUME_WINDOW`] outside tests.
+    pub window: Duration,
 }
 
 impl Rejoin for OwnerRejoin {
+    fn window(&self) -> Duration {
+        self.window
+    }
+
     fn dial(&mut self, keys: &HoldKeys) -> BoxFuture<'static, Result<Link, LinkError>> {
         let (relay, slot, carry) = (self.relay.clone(), self.slot, self.carry);
         let (token, secret) = (keys.token.clone(), keys.secret);

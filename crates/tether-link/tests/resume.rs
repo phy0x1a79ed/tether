@@ -116,6 +116,7 @@ async fn pair(operator_path: &Proxy, owner_path: &Proxy) -> Pair {
             bearer: Some(BEARER.into()),
             slot,
             seat,
+            window: tether_proto::RESUME_WINDOW,
         },
     );
     let mut owner = Resumable::owner(
@@ -124,6 +125,7 @@ async fn pair(operator_path: &Proxy, owner_path: &Proxy) -> Pair {
             relay: ow_relay,
             slot,
             carry: Carry::Socket,
+            window: tether_proto::RESUME_WINDOW,
         },
     );
     // The owner can resume only once `Hold` has arrived, and `Hold` is not

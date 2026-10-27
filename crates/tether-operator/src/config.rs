@@ -46,6 +46,10 @@ pub struct Config {
     pub who: String,
     pub host: String,
     pub build: String,
+    /// How long a dropped session waits for its link. Not read from the
+    /// environment: the owner's client has a fixed window, and a daemon that
+    /// waited longer would hold a slot its owner had already given up on.
+    pub resume_window: Duration,
 }
 
 impl Config {
@@ -71,6 +75,7 @@ impl Config {
             build: option_env!("TETHER_BUILD")
                 .unwrap_or("unstamped")
                 .to_string(),
+            resume_window: tether_proto::RESUME_WINDOW,
         })
     }
 

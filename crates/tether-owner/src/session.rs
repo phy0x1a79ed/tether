@@ -29,9 +29,10 @@
 
 use std::time::Duration;
 
-use tether_link::{Incoming, Link, LinkError, Resumable};
+use tether_link::resume::OwnerRejoin;
+use tether_link::{Carry, Incoming, Link, LinkError, Relay, Resumable};
 use tether_proto::frame::{Frame, Hello, Role, PROTOCOL_VERSION, VIEWPORT};
-use tether_proto::invite::InviteCode;
+use tether_proto::invite::{InviteCode, Slot};
 use tokio::sync::mpsc;
 
 use crate::confirm::Pending;
@@ -244,6 +245,39 @@ async fn wait_for_hello(link: &mut Link, log: &mut Result<Log, String>) -> Resul
             Err(e) => return Err(Outcome::Failed(e.to_string())),
         }
     }
+}
+
+/// Put a consented session on the link it will run on.
+///
+/// Resumable only when both ends can be. The same transport carries the
+/// redials, so an owner behind a proxy that refused the socket goes straight
+/// back to plain requests. `window` is [`tether_proto::RESUME_WINDOW`] outside
+/// tests.
+pub fn carried(
+    link: Link,
+    operator: &Hello,
+    me: &Hello,
+    relay: &Relay,
+    slot: Slot,
+    window: Duration,
+) -> Resumable {
+    if !(operator.resume && me.resume) {
+        return Resumable::plain(link);
+    }
+    let carry = if link.polled().is_some() {
+        Carry::Poll
+    } else {
+        Carry::from_env().unwrap_or(Carry::Either)
+    };
+    Resumable::owner(
+        link,
+        OwnerRejoin {
+            relay: relay.clone(),
+            slot,
+            carry,
+            window,
+        },
+    )
 }
 
 /// Carry the session until either side ends it.

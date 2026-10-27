@@ -439,6 +439,7 @@ mod tests {
             who: "awm as tester".into(),
             host: "altair".into(),
             build: "test".into(),
+            resume_window: tether_proto::RESUME_WINDOW,
         })
     }
 

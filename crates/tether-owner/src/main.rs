@@ -21,8 +21,7 @@
 
 use std::process::ExitCode;
 
-use tether_link::resume::OwnerRejoin;
-use tether_link::{Carry, Link, Relay, Resumable};
+use tether_link::{Link, Relay};
 use tether_owner::confirm::{Pending, Refusal};
 use tether_owner::session::{self, Outcome};
 use tether_proto::frame::{Hello, Role, PROTOCOL_VERSION};
@@ -185,26 +184,14 @@ async fn connect(relay: Relay, code: InviteCode, agreed: Option<Pending>) -> Out
         }
     };
 
-    // Resumable only when both ends can be. The same transport carries the
-    // redials, so an owner behind a proxy that refused the socket goes straight
-    // back to plain requests.
-    let link = if operator.resume && me.resume {
-        let carry = if link.polled().is_some() {
-            Carry::Poll
-        } else {
-            Carry::from_env().unwrap_or(Carry::Either)
-        };
-        Resumable::owner(
-            link,
-            OwnerRejoin {
-                relay: relay.clone(),
-                slot: code.slot,
-                carry,
-            },
-        )
-    } else {
-        Resumable::plain(link)
-    };
+    let link = session::carried(
+        link,
+        &operator,
+        &me,
+        &relay,
+        code.slot,
+        tether_proto::RESUME_WINDOW,
+    );
 
     session::run(
         link,

@@ -51,18 +51,23 @@ async fn rig(limits: Limits) -> Rig {
     .expect("the relay should bind");
 
     let address = Relay::parse(&format!("http://{}", relay.addr)).unwrap();
-    let operator = Operator::new(Config {
-        relay: address.clone(),
+    let operator = Operator::new(config(&address));
+    Rig {
+        relay,
+        operator,
+        address,
+    }
+}
+
+fn config(relay: &Relay) -> Config {
+    Config {
+        relay: relay.clone(),
         issue_token: Some(BEARER.into()),
         socket: socket_path(),
         who: "awm as tony".into(),
         host: "altair".into(),
         build: "test".into(),
-    });
-    Rig {
-        relay,
-        operator,
-        address,
+        resume_window: tether_proto::RESUME_WINDOW,
     }
 }
 
@@ -685,16 +690,9 @@ async fn an_invite_nobody_redeems_ends_as_expired_rather_than_lingering() {
 #[tokio::test(flavor = "multi_thread")]
 async fn the_control_socket_answers_one_line_of_json_per_connection() {
     let rig = rig(Limits::default()).await;
-    let running = tether_operator::start(Config {
-        relay: rig.address.clone(),
-        issue_token: Some(BEARER.into()),
-        socket: socket_path(),
-        who: "awm as tony".into(),
-        host: "altair".into(),
-        build: "test".into(),
-    })
-    .await
-    .expect("the daemon should bind its socket");
+    let running = tether_operator::start(config(&rig.address))
+        .await
+        .expect("the daemon should bind its socket");
 
     let answer = ask(running.socket(), json!({"verb": "status", "args": {}})).await;
     assert_eq!(answer["ok"], json!(true));
@@ -725,12 +723,8 @@ async fn a_second_daemon_will_not_unlink_a_socket_that_is_being_served() {
     let rig = rig(Limits::default()).await;
     let path = socket_path();
     let config = Config {
-        relay: rig.address.clone(),
-        issue_token: Some(BEARER.into()),
         socket: path.clone(),
-        who: "awm as tony".into(),
-        host: "altair".into(),
-        build: "test".into(),
+        ..config(&rig.address)
     };
     let first = tether_operator::start(config.clone()).await.unwrap();
 

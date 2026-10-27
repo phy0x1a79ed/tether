@@ -576,8 +576,11 @@ impl Sessions {
     /// chair keeps a slot alive past its deadline, because only the operator
     /// can answer.
     ///
-    /// A held slot that expires leaves a tombstone, so its owner hears that it
-    /// ended rather than that it is lost.
+    /// A held slot that expires leaves no tombstone. Each end keeps its own
+    /// window and says why the session ended when that window closes. A
+    /// tombstone here would beat the ends' own clocks by up to a minute and
+    /// make an expiry read as the peer ending it. The operator may put the
+    /// slot back with [`Self::restore`] while its own window is still open.
     fn reap_locked(&self, table: &mut Table, now: Instant) {
         table.ended.retain(|t| t.until > now);
         let expired: Vec<u32> = table
@@ -587,9 +590,7 @@ impl Sessions {
             .map(|(n, _)| *n)
             .collect();
         for n in expired {
-            if let Some(session) = table.live.remove(&n) {
-                table.bury(n, &session, now + self.limits.resume_grace);
-            }
+            table.live.remove(&n);
         }
     }
 }
@@ -1118,7 +1119,7 @@ mod tests {
     }
 
     #[test]
-    fn a_held_slot_that_expires_tells_its_owner_it_ended() {
+    fn a_held_slot_that_expires_is_forgotten_and_its_operator_may_restore_it() {
         let s = sessions();
         let now = Instant::now();
         let (issued, owner_token, operator, owner) = held(&s, now);
@@ -1127,7 +1128,12 @@ mod tests {
         let late = now + s.limits.resume_grace + Duration::from_secs(1);
         assert_eq!(
             s.join(issued.slot, owner_token, chan(), late).err(),
-            Some(JoinError::Ended)
+            Some(JoinError::Unknown),
+            "the ends' own windows decide when it is over"
+        );
+        assert_eq!(
+            s.restore(issued.slot, issued.token, owner_token, late),
+            Ok(())
         );
     }
 
