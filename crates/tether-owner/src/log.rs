@@ -85,7 +85,10 @@ impl Log {
             written: 0,
             full: false,
         };
-        log.raw(&format!("tether session log\nstarted   {}\nslot      {slot}\n", stamp()));
+        log.raw(&format!(
+            "tether session log\nstarted   {}\nslot      {slot}\n",
+            stamp()
+        ));
         Ok(log)
     }
 
@@ -99,7 +102,11 @@ impl Log {
     /// One line of the transcript, exactly as the owner saw it.
     pub fn line(&mut self, text: &str) {
         let seconds = self.started.elapsed().as_secs();
-        self.raw(&format!("+{:02}:{:02}  {text}\n", seconds / 60, seconds % 60));
+        self.raw(&format!(
+            "+{:02}:{:02}  {text}\n",
+            seconds / 60,
+            seconds % 60
+        ));
     }
 
     /// Close the record with how long it ran.
@@ -240,7 +247,13 @@ mod tests {
             written: 0,
             full: false,
         };
-        log.peer("awm as tony", "altair", "linux", "9fda69b", "example/tether");
+        log.peer(
+            "awm as tony",
+            "altair",
+            "linux",
+            "9fda69b",
+            "example/tether",
+        );
         log.line("$ df -h");
         log.line("  done");
         log.line("them: all finished");

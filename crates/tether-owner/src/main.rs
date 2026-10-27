@@ -125,9 +125,11 @@ fn main() -> ExitCode {
 /// A second run's `--agree`, checked against what the first run left.
 fn agreement(words: &[String], code: &InviteCode, relay: &Relay) -> Result<Pending, String> {
     if tether_owner::consent::keyboard_here() {
-        return Err("--agree is for a machine with no terminal to answer at, and this one \
+        return Err(
+            "--agree is for a machine with no terminal to answer at, and this one \
                     has one — run the command without --agree and answer the prompt"
-            .into());
+                .into(),
+        );
     }
     if words.len() != tether_owner::confirm::WORDS_IN_CONFIRMATION {
         return Err(Refusal::Malformed.to_string());

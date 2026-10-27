@@ -27,6 +27,10 @@
 //! with the wrong bearer. A caller must not be able to map this service by the
 //! shape of its refusals: a live slot and a slot that never existed are the same
 //! answer, and so are an authenticated route and a path that is not there.
+//!
+//! The one exception is `410`, and only an owner can see it: a join that names
+//! a held slot the operator ended, with that slot's owner token. It tells the
+//! owner to stop redialling, and it tells anybody else nothing.
 
 use std::net::SocketAddr;
 use std::sync::Arc;
@@ -56,7 +60,7 @@ pub mod token;
 use crate::config::{Config, MAX_MESSAGE};
 use crate::poll::{Polls, Recv, Sent};
 use crate::rate::Limiter;
-use crate::session::{IssueError, JoinError, Sessions};
+use crate::session::{IssueError, JoinError, RestoreError, Sessions};
 use crate::token::{secret_eq, Token};
 
 /// How often expired slots are swept.
@@ -125,6 +129,7 @@ pub fn router(relay: Arc<Relay>) -> Router {
         .route("/issue", post(issue))
         .route("/claim/{slot}", post(claim))
         .route("/release/{slot}/{token}", post(release))
+        .route("/hold/{slot}/{token}", post(hold))
         .route("/join/{slot}/{token}", get(join))
         // The same chair as `/join`, held through plain requests instead of a
         // socket. See [`poll`].
@@ -172,11 +177,25 @@ async fn status(State(relay): State<Arc<Relay>>, headers: HeaderMap) -> Response
     .into_response()
 }
 
+/// What an operator sends to `/issue` to put back a held slot after a restart.
+#[derive(serde::Deserialize)]
+struct Restore {
+    slot: String,
+    token: String,
+    owner: String,
+}
+
 /// Create a session. The one action that allocates anything, and the one action
 /// no unauthenticated caller can reach.
-async fn issue(State(relay): State<Arc<Relay>>, headers: HeaderMap) -> Response {
+///
+/// With a body, this restores a held slot the relay forgot instead. See
+/// [`Sessions::restore`].
+async fn issue(State(relay): State<Arc<Relay>>, headers: HeaderMap, body: Bytes) -> Response {
     if !relay.operator(&headers) {
         return nothing_here();
+    }
+    if !body.is_empty() {
+        return restore(&relay, &body);
     }
     match relay.sessions.issue(Instant::now()) {
         Ok(issued) => {
@@ -189,6 +208,40 @@ async fn issue(State(relay): State<Arc<Relay>>, headers: HeaderMap) -> Response 
             .into_response()
         }
         Err(IssueError::Full) => (
+            StatusCode::SERVICE_UNAVAILABLE,
+            "no slot is free right now\n",
+        )
+            .into_response(),
+    }
+}
+
+fn restore(relay: &Relay, body: &[u8]) -> Response {
+    let Ok(asked) = serde_json::from_slice::<Restore>(body) else {
+        return (StatusCode::BAD_REQUEST, "not a restore request\n").into_response();
+    };
+    let (Ok(slot), Some(token), Some(owner)) = (
+        Slot::parse(&asked.slot),
+        Token::parse(&asked.token),
+        Token::parse(&asked.owner),
+    ) else {
+        return (StatusCode::BAD_REQUEST, "not a restore request\n").into_response();
+    };
+    match relay.sessions.restore(slot, token, owner, Instant::now()) {
+        Ok(()) => {
+            log::info(format_args!("restored held slot {slot}"));
+            Json(json!({
+                "slot": slot.get(),
+                "expires_in": relay.config.limits.resume_grace.as_secs(),
+            }))
+            .into_response()
+        }
+        Err(RestoreError::Taken) => (
+            StatusCode::CONFLICT,
+            "that slot belongs to another session\n",
+        )
+            .into_response(),
+        Err(RestoreError::Ended) => (StatusCode::GONE, "that session ended\n").into_response(),
+        Err(RestoreError::Full) => (
             StatusCode::SERVICE_UNAVAILABLE,
             "no slot is free right now\n",
         )
@@ -251,11 +304,58 @@ async fn release(
     };
     // A wrong token and an unknown slot answer identically, like every other
     // refusal on this surface: the shape of a decline must not map it.
-    if !relay.sessions.destroy(slot, token) {
+    if !relay.sessions.destroy(slot, token, Instant::now()) {
         return nothing_here();
     }
     log::info(format_args!("released slot {slot}"));
     Json(json!({"released": slot.get()})).into_response()
+}
+
+/// What the operator sends to `/hold`.
+#[derive(serde::Deserialize)]
+struct Hold {
+    owner: String,
+}
+
+/// Hold a slot for its consented owner. See [`Sessions::hold`].
+///
+/// Authorised by the seat token in the path, as `/release` is. The owner token
+/// rides in the body, because it is what lets the owner back in and a path
+/// lands in every access log on the way here.
+async fn hold(
+    State(relay): State<Arc<Relay>>,
+    Path((slot, token)): Path<(String, String)>,
+    headers: HeaderMap,
+    body: Bytes,
+) -> Response {
+    if !relay
+        .limiter
+        .allow(&relay.rate_key(&headers), Instant::now())
+    {
+        return (StatusCode::TOO_MANY_REQUESTS, "too many requests\n").into_response();
+    }
+    let (Ok(slot), Some(token)) = (Slot::parse(&slot), Token::parse(&token)) else {
+        return nothing_here();
+    };
+    let Some(owner) = serde_json::from_slice::<Hold>(&body)
+        .ok()
+        .and_then(|h| Token::parse(&h.owner))
+    else {
+        return nothing_here();
+    };
+    if !relay.sessions.hold(slot, token, owner, Instant::now()) {
+        return nothing_here();
+    }
+    log::info(format_args!("holding slot {slot} for its owner"));
+    Json(json!({
+        "held": slot.get(),
+        "grace": relay.config.limits.resume_grace.as_secs(),
+    }))
+    .into_response()
+}
+
+fn ended() -> Response {
+    (StatusCode::GONE, "that session ended\n").into_response()
 }
 
 /// Take a chair and start carrying bytes.
@@ -273,6 +373,7 @@ async fn join(
     let seated = match pump::seat(Arc::clone(&relay.sessions), slot, token) {
         Ok(seated) => seated,
         Err(JoinError::Unknown) => return nothing_here(),
+        Err(JoinError::Ended) => return ended(),
         Err(JoinError::Taken) | Err(JoinError::Busy) => {
             return (StatusCode::CONFLICT, "that seat is taken\n").into_response()
         }
@@ -295,6 +396,7 @@ async fn poll_open(
     match pump::seat(Arc::clone(&relay.sessions), slot, token) {
         Ok(seated) => Json(json!({ "id": relay.polls.open(seated) })).into_response(),
         Err(JoinError::Unknown) => nothing_here(),
+        Err(JoinError::Ended) => ended(),
         Err(JoinError::Taken) | Err(JoinError::Busy) => {
             (StatusCode::CONFLICT, "that seat is taken\n").into_response()
         }

@@ -79,10 +79,16 @@ impl Pen {
             *self = Self::default();
         }
         if self.fg != next.fg {
-            queue!(out, style::SetForegroundColor(next.fg.unwrap_or(style::Color::Reset)))?;
+            queue!(
+                out,
+                style::SetForegroundColor(next.fg.unwrap_or(style::Color::Reset))
+            )?;
         }
         if self.bg != next.bg {
-            queue!(out, style::SetBackgroundColor(next.bg.unwrap_or(style::Color::Reset)))?;
+            queue!(
+                out,
+                style::SetBackgroundColor(next.bg.unwrap_or(style::Color::Reset))
+            )?;
         }
         for (want, have, attr) in [
             (next.bold, self.bold, style::Attribute::Bold),
@@ -113,11 +119,7 @@ fn colour(c: vt100::Color) -> Option<style::Color> {
 /// Rows past the bottom and columns past the right are clipped rather than
 /// wrapped: the grid is the size the operator's terminal is, and reflowing it
 /// would show the owner something the operator is not looking at.
-pub fn draw(
-    screen: &vt100::Screen,
-    pane: Rect,
-    out: &mut impl Write,
-) -> std::io::Result<()> {
+pub fn draw(screen: &vt100::Screen, pane: Rect, out: &mut impl Write) -> std::io::Result<()> {
     let (grid_rows, grid_cols) = screen.size();
     for y in 0..pane.rows {
         queue!(out, cursor::MoveTo(pane.x, pane.y + y))?;
@@ -186,28 +188,47 @@ mod tests {
     /// matter what the far end drew.
     #[test]
     fn nothing_that_could_reach_outside_the_pane_is_ever_written() {
-        let pane = Rect { x: 0, y: 1, cols: 20, rows: 5 };
+        let pane = Rect {
+            x: 0,
+            y: 1,
+            cols: 20,
+            rows: 5,
+        };
         // A clear screen, a clear line, an absolute move, and a colour — the
         // things a full-screen program does constantly.
         let feed = b"\x1b[2J\x1b[3;5H\x1b[31mred\x1b[K\x1b[1;1Htop\x1b[0m";
         let bytes = rendered(feed, pane, (10, 40));
         let text = String::from_utf8_lossy(&bytes);
 
-        assert!(!text.contains("\x1b[K"), "a clear to end of line escaped: {text:?}");
-        assert!(!text.contains("\x1b[2J"), "a clear screen escaped: {text:?}");
+        assert!(
+            !text.contains("\x1b[K"),
+            "a clear to end of line escaped: {text:?}"
+        );
+        assert!(
+            !text.contains("\x1b[2J"),
+            "a clear screen escaped: {text:?}"
+        );
         // Every cursor move this writes is one of ours, at the pane's own
         // column, one per row and no more.
         let moves = text.matches("\x1b[").filter(|_| true).count();
         assert!(moves > 0);
         for row in 0..pane.rows {
             let expected = format!("\x1b[{};{}H", pane.y + row + 1, pane.x + 1);
-            assert!(text.contains(&expected), "row {row} was not placed: {text:?}");
+            assert!(
+                text.contains(&expected),
+                "row {row} was not placed: {text:?}"
+            );
         }
     }
 
     #[test]
     fn what_the_far_end_drew_is_what_the_pane_shows() {
-        let pane = Rect { x: 0, y: 0, cols: 20, rows: 2 };
+        let pane = Rect {
+            x: 0,
+            y: 0,
+            cols: 20,
+            rows: 2,
+        };
         let bytes = rendered(b"hello\r\nthere", pane, (2, 20));
         let text = String::from_utf8_lossy(&bytes);
         assert!(text.contains("hello"), "{text:?}");
@@ -218,7 +239,12 @@ mod tests {
     /// owner a screen the operator is not looking at.
     #[test]
     fn a_grid_wider_than_the_pane_is_clipped_rather_than_reflowed() {
-        let pane = Rect { x: 0, y: 0, cols: 5, rows: 1 };
+        let pane = Rect {
+            x: 0,
+            y: 0,
+            cols: 5,
+            rows: 1,
+        };
         let bytes = rendered(b"abcdefghij", pane, (1, 40));
         let text = String::from_utf8_lossy(&bytes);
         assert!(text.contains("abcde"), "{text:?}");
@@ -227,7 +253,12 @@ mod tests {
 
     #[test]
     fn every_row_puts_the_terminal_back_before_the_next_pane_is_drawn() {
-        let pane = Rect { x: 0, y: 0, cols: 8, rows: 3 };
+        let pane = Rect {
+            x: 0,
+            y: 0,
+            cols: 8,
+            rows: 3,
+        };
         let bytes = rendered(b"\x1b[41mred background", pane, (3, 40));
         let text = String::from_utf8_lossy(&bytes);
         let resets = text.matches("\x1b[0m").count();

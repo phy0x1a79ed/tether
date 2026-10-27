@@ -28,6 +28,8 @@
 //! that split is what makes everything else safe. Then [`handshake`], then
 //! [`frame`].
 
+use std::time::Duration;
+
 pub mod frame;
 pub mod handshake;
 pub mod invite;
@@ -36,3 +38,11 @@ pub mod words;
 pub use frame::{Ended, Frame, Hello, Kind, Role, Stream, TaskId, PROTOCOL_VERSION};
 pub use handshake::{Channel, HandshakeError};
 pub use invite::{InviteCode, InviteError, Phrase, Slot, DEFAULT_WORDS, MAX_SLOT};
+
+/// How long a consented session survives a dropped link.
+///
+/// One number for all three binaries. The relay keeps a held slot this long
+/// after a chair goes empty, and each end redials for this long before it gives
+/// up. If they disagreed, one side would give up on a session the other is
+/// still trying to reach.
+pub const RESUME_WINDOW: Duration = Duration::from_secs(600);

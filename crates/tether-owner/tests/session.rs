@@ -213,16 +213,16 @@ async fn own_via(
     let mut log = tether_owner::log::Log::open(invite.code.slot.get())
         .map_err(|why| format!("no record could be written to {why}"));
     let path = log.as_ref().ok().map(|l| l.path().to_path_buf());
-    let operator = match session::greet(&mut link, &invite.relay, &invite.code, &me, &mut log, None).await
-    {
-        Ok(operator) => operator,
-        Err(outcome) => {
-            if let Ok(log) = log {
-                log.discard();
+    let operator =
+        match session::greet(&mut link, &invite.relay, &invite.code, &me, &mut log, None).await {
+            Ok(operator) => operator,
+            Err(outcome) => {
+                if let Ok(log) = log {
+                    log.discard();
+                }
+                return (outcome, path, polled);
             }
-            return (outcome, path, polled);
-        }
-    };
+        };
     let outcome = session::run(
         link,
         operator,

@@ -77,7 +77,6 @@ fn socket_path() -> std::path::PathBuf {
     ))
 }
 
-
 /// Wait for a task to end, and gather what it produced.
 ///
 /// The test's stand-in for `drain --until`, and the shape every caller now has:
@@ -97,9 +96,7 @@ async fn finished(rig: &Rig, task: u64) -> (Value, String, String) {
                 let bytes: Vec<u8> = events
                     .iter()
                     .filter(|e| {
-                        e["type"] == "task.output"
-                            && e["task"] == task
-                            && e["stream"] == stream
+                        e["type"] == "task.output" && e["task"] == task && e["stream"] == stream
                     })
                     .filter_map(|e| e["data"].as_str().map(unbase64))
                     .flatten()
@@ -329,7 +326,9 @@ async fn an_invite_is_a_slot_from_the_relay_and_words_the_relay_never_sees() {
         )
     );
     assert!(
-        !tail.split(' ').any(|w| w.chars().all(|c| c.is_ascii_digit())),
+        !tail
+            .split(' ')
+            .any(|w| w.chars().all(|c| c.is_ascii_digit())),
         "a number is still read out: {tail}"
     );
 
@@ -398,7 +397,10 @@ async fn an_owner_confirming_with_a_second_run_finds_the_slot_still_held() {
         .operator
         .handle("run", &json!({"command": "true"}))
         .await;
-    assert!(early.is_err(), "work was accepted before consent: {early:?}");
+    assert!(
+        early.is_err(),
+        "work was accepted before consent: {early:?}"
+    );
 
     // The second run, on the same code, is let in by the same operator.
     let owner = tokio::spawn(own(rig.address.clone(), code, Owner::Report(0)));
@@ -434,7 +436,11 @@ async fn a_command_goes_out_with_its_input_already_closed_and_comes_back_whole()
     // The reply is the task's number and nothing else, and it arrives before
     // the command has done anything. That is the point: the caller is not
     // holding a socket open while somebody else's machine works.
-    assert_eq!(ran["ok"], json!(true), "the ask succeeded; the command has not run");
+    assert_eq!(
+        ran["ok"],
+        json!(true),
+        "the ask succeeded; the command has not run"
+    );
     assert_eq!(ran["kind"], json!("command"));
     assert!(ran["cursor"].is_number(), "and it says where to read from");
 
@@ -540,7 +546,10 @@ async fn a_terminal_opens_once_and_takes_what_is_typed_at_it() {
         .handle("shell", &json!({}))
         .await
         .expect_err("a second terminal is refused");
-    assert!(err.contains(&task.to_string()), "and it names the open one: {err}");
+    assert!(
+        err.contains(&task.to_string()),
+        "and it names the open one: {err}"
+    );
 
     // Typing at a program is a different verb from speaking to a person, and
     // the bytes go out as given so a key with no printable form survives.
@@ -773,7 +782,10 @@ async fn a_session_is_readable_afterwards_by_somebody_who_was_not_the_caller() {
     rig.operator.handle("cut", &json!({})).await.unwrap();
     owner.await.unwrap();
 
-    let (events, _, gap) = rig.operator.journal().since(0, tether_operator::journal::BATCH);
+    let (events, _, gap) = rig
+        .operator
+        .journal()
+        .since(0, tether_operator::journal::BATCH);
     assert!(gap.is_none(), "nothing should have been evicted");
     let kinds: Vec<&str> = events.iter().filter_map(|e| e["type"].as_str()).collect();
 
@@ -832,7 +844,10 @@ async fn the_phrase_is_in_no_event_the_stream_carries() {
         .collect();
     assert_eq!(phrase.len(), 2, "the fixture assumes a two-word phrase");
 
-    let (events, _, _) = rig.operator.journal().since(0, tether_operator::journal::BATCH);
+    let (events, _, _) = rig
+        .operator
+        .journal()
+        .since(0, tether_operator::journal::BATCH);
     // Values only. A field name is part of the vocabulary rather than part of
     // the session, and the word list is ordinary English — `signal` is both a
     // plausible phrase word and the name of a field on every task that ended.
@@ -919,8 +934,14 @@ async fn a_watcher_is_placed_in_the_stream_and_then_kept_up_to_date() {
     .expect("the minting should reach a watcher that was already attached");
 
     assert_eq!(seen["slot"], slot);
-    assert!(seen.get("code").is_none(), "the code is not a fact for subscribers");
-    assert!(seen.get("command").is_none(), "nor is the line that carries it");
+    assert!(
+        seen.get("code").is_none(),
+        "the code is not a fact for subscribers"
+    );
+    assert!(
+        seen.get("command").is_none(),
+        "nor is the line that carries it"
+    );
 
     running.stop();
     rig.stop();

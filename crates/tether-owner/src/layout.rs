@@ -68,7 +68,12 @@ const WORK_MIN: u16 = 40;
 const SIDE_MIN_COLS: u16 = WORK_MIN + 1 + CHAT_MIN;
 
 pub fn split(cols: u16, rows: u16) -> Layout {
-    let header = Rect { x: 0, y: 0, cols, rows: 1 };
+    let header = Rect {
+        x: 0,
+        y: 0,
+        cols,
+        rows: 1,
+    };
     let footer = Rect {
         x: 0,
         y: rows.saturating_sub(1),
@@ -76,7 +81,12 @@ pub fn split(cols: u16, rows: u16) -> Layout {
         rows: 1,
     };
     let body_rows = rows.saturating_sub(2).max(1);
-    let full = Rect { x: 0, y: 1, cols, rows: body_rows };
+    let full = Rect {
+        x: 0,
+        y: 1,
+        cols,
+        rows: body_rows,
+    };
 
     if rows < 8 || cols < 24 {
         return Layout {
@@ -101,7 +111,12 @@ pub fn split(cols: u16, rows: u16) -> Layout {
         let input_y = rows.saturating_sub(2);
         return Layout {
             header,
-            work: Rect { x: 0, y: 1, cols: work_cols, rows: body_rows },
+            work: Rect {
+                x: 0,
+                y: 1,
+                cols: work_cols,
+                rows: body_rows,
+            },
             rule: Some(rule),
             chat: Some(Rect {
                 x: chat_x,
@@ -109,7 +124,12 @@ pub fn split(cols: u16, rows: u16) -> Layout {
                 cols: chat_cols,
                 rows: body_rows.saturating_sub(2).max(1),
             }),
-            input: Some(Rect { x: chat_x, y: input_y, cols: chat_cols, rows: 1 }),
+            input: Some(Rect {
+                x: chat_x,
+                y: input_y,
+                cols: chat_cols,
+                rows: 1,
+            }),
             footer,
             shape: Shape::Side,
         };
@@ -122,7 +142,12 @@ pub fn split(cols: u16, rows: u16) -> Layout {
     let strip_y = 1 + work_rows;
     Layout {
         header,
-        work: Rect { x: 0, y: 1, cols, rows: work_rows },
+        work: Rect {
+            x: 0,
+            y: 1,
+            cols,
+            rows: work_rows,
+        },
         rule: None,
         chat: (strip > 2).then(|| Rect {
             x: 0,
@@ -130,7 +155,12 @@ pub fn split(cols: u16, rows: u16) -> Layout {
             cols,
             rows: strip - 2,
         }),
-        input: Some(Rect { x: 0, y: rows.saturating_sub(2), cols, rows: 1 }),
+        input: Some(Rect {
+            x: 0,
+            y: rows.saturating_sub(2),
+            cols,
+            rows: 1,
+        }),
         footer,
         shape: Shape::Stacked,
     }

@@ -25,8 +25,8 @@ use tokio::sync::mpsc;
 
 use crate::confirm::Pending;
 use crate::consent::{self, Answer, Ask};
-use crate::log::Log;
 use crate::exec::Runner;
+use crate::log::Log;
 use crate::ui::{self, Event, Facts, Typed, Ui};
 
 /// How often the header's clock is redrawn.

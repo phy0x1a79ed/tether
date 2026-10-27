@@ -83,16 +83,29 @@ pub enum What {
         rows: Option<u16>,
     },
     /// Type at a task. Talks to the program, not to the person — see `Say`.
-    Keys { task: TaskId, data: Vec<u8> },
-    Resize { task: TaskId, cols: u16, rows: u16 },
+    Keys {
+        task: TaskId,
+        data: Vec<u8>,
+    },
+    Resize {
+        task: TaskId,
+        cols: u16,
+        rows: u16,
+    },
     /// Stop a task. The protocol is careful that this kills rather than
     /// signalling end of input.
-    Close { task: TaskId },
+    Close {
+        task: TaskId,
+    },
     Tasks,
     /// Say a line to the person at the other keyboard. Talks to the person, not
     /// to the program — see `Keys`.
-    Say { text: String },
-    Cut { reason: String },
+    Say {
+        text: String,
+    },
+    Cut {
+        reason: String,
+    },
 }
 
 impl Command {
@@ -267,9 +280,9 @@ fn set_phase(track: &Track, phase: Phase) {
         if phase == Phase::Open {
             s.opened = Some(Instant::now());
         }
-        s.owner.as_ref().map(|h| {
-            json!({"who": h.who, "host": h.host, "os": h.os, "build": h.build})
-        })
+        s.owner
+            .as_ref()
+            .map(|h| json!({"who": h.who, "host": h.host, "os": h.os, "build": h.build}))
     };
     track.note(journal::session_phase(phase.as_str(), owner, None));
 }
@@ -288,9 +301,9 @@ fn finish(track: &Track, why: impl Into<String>) {
         s.phase = Phase::Ended;
         s.ended = Some(why.clone());
         s.ended_at = Some(Instant::now());
-        s.owner.as_ref().map(|h| {
-            json!({"who": h.who, "host": h.host, "os": h.os, "build": h.build})
-        })
+        s.owner
+            .as_ref()
+            .map(|h| json!({"who": h.who, "host": h.host, "os": h.os, "build": h.build}))
     };
     track.note(journal::session_phase("ended", owner, Some(&why)));
 }
@@ -759,7 +772,13 @@ async fn run_verb(
             }
             let task = *next_task;
             *next_task += 1;
-            let seq = track.note(journal::task_started(task, "command", Some(&command), 120, 40));
+            let seq = track.note(journal::task_started(
+                task,
+                "command",
+                Some(&command),
+                120,
+                40,
+            ));
             let opened = link
                 .send(&Frame::Open {
                     task,
@@ -774,7 +793,13 @@ async fn run_verb(
                 // — `cat`, `sort`, anything in a pipeline — waits for a keyboard
                 // that does not exist. A terminal gets no such frame: it has no
                 // end of input to be told about.
-                .and(link.send(&Frame::Input { task, data: Vec::new() }).await);
+                .and(
+                    link.send(&Frame::Input {
+                        task,
+                        data: Vec::new(),
+                    })
+                    .await,
+                );
             match opened {
                 Ok(()) => {
                     if let Ok(mut s) = track.state.lock() {
@@ -804,7 +829,11 @@ async fn run_verb(
             }
         }
 
-        What::Shell { command, cols, rows } => {
+        What::Shell {
+            command,
+            cols,
+            rows,
+        } => {
             // The owner's pane if they have advertised one, the caller's
             // number if they insisted, and a guess only when neither exists —
             // which now means an older client that does not say.
@@ -965,5 +994,4 @@ mod tests {
             "the invite code needs quoting: {code}"
         );
     }
-
 }

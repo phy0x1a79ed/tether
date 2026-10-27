@@ -10,17 +10,28 @@
 //! from any of them. The relay could not read a session if it wanted to, and
 //! this module is where that claim has to stay true.
 //!
-//! Everything lives in memory. Restarting the relay ends every session, which
-//! is a feature: there is no state to become stale, and no file to recover a
-//! session from.
+//! Everything lives in memory, and nothing is written to disk. A restart
+//! forgets every slot. An operator whose session was held puts its own slot
+//! back with [`Sessions::restore`], so a restart costs a held session a gap
+//! rather than its life, and the relay still has no file to recover from.
+//!
+//! # Held slots
+//!
+//! Once the owner has consented, the operator *holds* the slot: it names an
+//! owner seat token it minted itself, inside the sealed channel. From then on
+//! the slot is a resumable session rather than an open invite. Either chair may
+//! go empty for [`Limits::resume_grace`], the owner's chair takes only that
+//! token, `/claim` finds nothing, and the pairing budget no longer applies,
+//! because the phrase it protects grants nothing any more.
 
 use std::collections::HashMap;
-use std::sync::Mutex;
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use axum::body::Bytes;
 use tether_proto::invite::{Slot, MAX_SLOT};
-use tokio::sync::{mpsc, oneshot};
+use tokio::sync::{mpsc, oneshot, Notify};
 
 use crate::config::Limits;
 use crate::token::Token;
@@ -62,6 +73,11 @@ impl Seat {
 }
 
 struct Occupant {
+    /// Which socket this is, so a socket that was replaced cannot free the
+    /// chair its replacement now sits in.
+    id: u64,
+    /// Ends this socket's leg when a newer socket takes its chair.
+    kick: Arc<Notify>,
     /// While this socket waits, what the peer will be handed. Once paired,
     /// nothing: the peer's reader then holds the only sender for this socket's
     /// channel, so the channel closes the moment the peer goes. That is the
@@ -88,10 +104,54 @@ struct Session {
     /// flood cannot grow this: the oldest is evicted, which costs a genuine
     /// owner one more claim and costs an attacker the flood they wanted.
     tickets: Vec<(Token, Instant)>,
+    /// The owner's seat token, once the operator holds the slot.
+    owner_token: Option<Token>,
     seats: [Option<Occupant>; 2],
 }
 
+impl Session {
+    fn held(&self) -> bool {
+        self.owner_token.is_some()
+    }
+}
+
+/// What is left of a held slot after it ends: enough to tell its owner so.
+///
+/// Without it an owner redialling a released slot gets the same `404` a relay
+/// restart gives, and has to wait out the whole grace to learn the session is
+/// over. Keyed by the owner's token, so nobody else can tell it exists.
+struct Tombstone {
+    slot: u32,
+    owner_token: Token,
+    until: Instant,
+}
+
+#[derive(Default)]
+struct Table {
+    live: HashMap<u32, Session>,
+    ended: Vec<Tombstone>,
+}
+
+impl Table {
+    fn bury(&mut self, slot: u32, owner_token: Token, until: Instant) {
+        self.ended.retain(|t| t.slot != slot);
+        self.ended.push(Tombstone {
+            slot,
+            owner_token,
+            until,
+        });
+    }
+
+    fn buried(&self, slot: u32, token: Token, now: Instant) -> bool {
+        self.ended
+            .iter()
+            .any(|t| t.slot == slot && t.until > now && t.owner_token == token)
+    }
+}
+
 const MAX_TICKETS: usize = 8;
+
+static NEXT_OCCUPANT: AtomicU64 = AtomicU64::new(1);
 
 /// What `issue` hands back to the operator.
 #[derive(Debug)]
@@ -113,10 +173,14 @@ pub enum Join {
     Paired {
         seat: Seat,
         peer: Outbound,
+        id: u64,
+        kick: Arc<Notify>,
     },
     Waiting {
         seat: Seat,
         peer: oneshot::Receiver<Outbound>,
+        id: u64,
+        kick: Arc<Notify>,
     },
 }
 
@@ -130,10 +194,22 @@ pub enum JoinError {
     Taken,
     /// The other chair is in a pairing that is still unwinding.
     Busy,
+    /// A held slot that the operator ended, asked about with its owner token.
+    Ended,
+}
+
+#[derive(Debug, PartialEq, Eq)]
+pub enum RestoreError {
+    /// The number now belongs to another session.
+    Taken,
+    /// The session was ended, not lost.
+    Ended,
+    /// The concurrent cap is reached.
+    Full,
 }
 
 pub struct Sessions {
-    inner: Mutex<HashMap<u32, Session>>,
+    inner: Mutex<Table>,
     limits: Limits,
     max_sessions: usize,
 }
@@ -141,7 +217,7 @@ pub struct Sessions {
 impl Sessions {
     pub fn new(limits: Limits, max_sessions: usize) -> Self {
         Self {
-            inner: Mutex::new(HashMap::new()),
+            inner: Mutex::new(Table::default()),
             limits,
             max_sessions,
         }
@@ -152,7 +228,7 @@ impl Sessions {
     }
 
     pub fn live(&self) -> usize {
-        self.inner.lock().unwrap().len()
+        self.inner.lock().unwrap().live.len()
     }
 
     /// Allocate a slot for an operator who has already been authenticated.
@@ -163,22 +239,23 @@ impl Sessions {
     /// unpredictable and a real cost to making them long.
     pub fn issue(&self, now: Instant) -> Result<Issued, IssueError> {
         let mut table = self.inner.lock().unwrap();
-        Self::reap_locked(&mut table, now);
-        if table.len() >= self.max_sessions {
+        self.reap_locked(&mut table, now);
+        if table.live.len() >= self.max_sessions {
             return Err(IssueError::Full);
         }
         let n = (1..=MAX_SLOT)
-            .find(|n| !table.contains_key(n))
+            .find(|n| !table.live.contains_key(n))
             .ok_or(IssueError::Full)?;
         let slot = Slot::new(n).expect("the search range is the valid range");
         let token = Token::mint();
-        table.insert(
+        table.live.insert(
             n,
             Session {
                 deadline: now + self.limits.issue_ttl,
                 pairings_used: 0,
                 operator_token: token,
                 tickets: Vec::new(),
+                owner_token: None,
                 seats: [None, None],
             },
         );
@@ -195,10 +272,17 @@ impl Sessions {
     /// not the first thing a stranger touches: this request arrives on the
     /// plain leg, where the forwarded client address still exists, so the
     /// per-address limit can be applied somewhere it means something.
+    ///
+    /// A held slot mints nothing. Its owner already has a seat token, and a
+    /// ticket would only let a stranger with the phrase take the owner's chair
+    /// while the owner is away.
     pub fn claim(&self, slot: Slot, now: Instant) -> Option<(Token, Duration)> {
         let mut table = self.inner.lock().unwrap();
-        Self::reap_locked(&mut table, now);
-        let session = table.get_mut(&slot.get())?;
+        self.reap_locked(&mut table, now);
+        let session = table.live.get_mut(&slot.get())?;
+        if session.held() {
+            return None;
+        }
         session.tickets.retain(|(_, expiry)| *expiry > now);
         if session.tickets.len() >= MAX_TICKETS {
             session.tickets.remove(0);
@@ -208,8 +292,73 @@ impl Sessions {
         Some((token, self.limits.ticket_ttl))
     }
 
+    /// Turn a slot into a resumable session, because its owner has consented.
+    ///
+    /// Authorised by the operator's seat token, like [`Self::destroy`]. The
+    /// owner token is minted by the operator and reaches the owner only inside
+    /// the sealed channel, so the relay learns it here and nowhere else.
+    pub fn hold(&self, slot: Slot, token: Token, owner_token: Token, now: Instant) -> bool {
+        let mut table = self.inner.lock().unwrap();
+        self.reap_locked(&mut table, now);
+        let Some(session) = table.live.get_mut(&slot.get()) else {
+            return false;
+        };
+        if session.operator_token != token {
+            return false;
+        }
+        session.owner_token = Some(owner_token);
+        session.tickets.clear();
+        true
+    }
+
+    /// Put back a held slot this relay forgot, because it restarted.
+    ///
+    /// Reached only with the bearer `/issue` takes. Asking again for a slot
+    /// that is already back is not an error, so an operator that lost the
+    /// answer can repeat the request.
+    pub fn restore(
+        &self,
+        slot: Slot,
+        token: Token,
+        owner_token: Token,
+        now: Instant,
+    ) -> Result<(), RestoreError> {
+        let mut table = self.inner.lock().unwrap();
+        self.reap_locked(&mut table, now);
+        if let Some(session) = table.live.get(&slot.get()) {
+            return if session.operator_token == token && session.owner_token == Some(owner_token) {
+                Ok(())
+            } else {
+                Err(RestoreError::Taken)
+            };
+        }
+        if table.buried(slot.get(), owner_token, now) {
+            return Err(RestoreError::Ended);
+        }
+        if table.live.len() >= self.max_sessions {
+            return Err(RestoreError::Full);
+        }
+        table.live.insert(
+            slot.get(),
+            Session {
+                deadline: now + self.limits.resume_grace,
+                pairings_used: 0,
+                operator_token: token,
+                tickets: Vec::new(),
+                owner_token: Some(owner_token),
+                seats: [None, None],
+            },
+        );
+        Ok(())
+    }
+
     /// Take the chair this token names, pairing with the other end if it is
     /// already sitting there.
+    ///
+    /// At a held slot a token may take a chair that is still occupied, and
+    /// the socket sitting there is ended. That socket is the one this caller
+    /// lost: its far end went to sleep or changed network, and the relay will
+    /// not hear about it until a keepalive fails, minutes from now.
     pub fn join(
         &self,
         slot: Slot,
@@ -218,11 +367,28 @@ impl Sessions {
         now: Instant,
     ) -> Result<Join, JoinError> {
         let mut table = self.inner.lock().unwrap();
-        Self::reap_locked(&mut table, now);
-        let session = table.get_mut(&slot.get()).ok_or(JoinError::Unknown)?;
+        self.reap_locked(&mut table, now);
+        let n = slot.get();
+        let ended = table.buried(n, token, now);
+        let Some(session) = table.live.get_mut(&n) else {
+            return Err(if ended {
+                JoinError::Ended
+            } else {
+                JoinError::Unknown
+            });
+        };
 
         let seat = if session.operator_token == token {
             Seat::Operator
+        } else if let Some(owner_token) = session.owner_token {
+            if owner_token != token {
+                return Err(if ended {
+                    JoinError::Ended
+                } else {
+                    JoinError::Unknown
+                });
+            }
+            Seat::Owner
         } else {
             session.tickets.retain(|(_, expiry)| *expiry > now);
             let found = session.tickets.iter().position(|(t, _)| *t == token);
@@ -233,23 +399,44 @@ impl Sessions {
                     session.tickets.remove(i);
                     Seat::Owner
                 }
-                None => return Err(JoinError::Unknown),
+                None => {
+                    return Err(if ended {
+                        JoinError::Ended
+                    } else {
+                        JoinError::Unknown
+                    })
+                }
             }
         };
 
+        let held = session.held();
         if session.seats[seat.index()].is_some() {
-            return Err(JoinError::Taken);
+            if !held {
+                return Err(JoinError::Taken);
+            }
+            if let Some(stale) = session.seats[seat.index()].take() {
+                stale.kick.notify_one();
+            }
         }
 
-        match session.seats[seat.other().index()].as_mut() {
-            Some(peer) => {
-                let handoff = peer.handoff.take().ok_or(JoinError::Busy)?;
-                let peer_tx = peer.tx.take().ok_or(JoinError::Busy)?;
+        let id = NEXT_OCCUPANT.fetch_add(1, Ordering::Relaxed);
+        let kick = Arc::new(Notify::new());
+        let peer_ready = session.seats[seat.other().index()]
+            .as_ref()
+            .map(|peer| peer.handoff.is_some() && peer.tx.is_some());
+
+        match peer_ready {
+            Some(true) => {
+                let peer = session.seats[seat.other().index()].as_mut().unwrap();
+                let handoff = peer.handoff.take().unwrap();
+                let peer_tx = peer.tx.take().unwrap();
                 // Each end is handed the *other* end's channel. Handing back
                 // the channel a socket already owns wires it to itself, which
                 // looks exactly like a working pairing until a byte has to
                 // reach somebody.
                 session.seats[seat.index()] = Some(Occupant {
+                    id,
+                    kick: Arc::clone(&kick),
                     tx: None,
                     handoff: None,
                 });
@@ -265,15 +452,28 @@ impl Sessions {
                 Ok(Join::Paired {
                     seat,
                     peer: peer_tx,
+                    id,
+                    kick,
                 })
             }
-            None => {
+            // The other chair is still paired with the socket just replaced.
+            // That pairing is unwinding, and the other end will be back to
+            // find this one waiting.
+            Some(false) if !held => Err(JoinError::Busy),
+            _ => {
                 let (handoff, peer) = oneshot::channel();
                 session.seats[seat.index()] = Some(Occupant {
+                    id,
+                    kick: Arc::clone(&kick),
                     tx: Some(tx),
                     handoff: Some(handoff),
                 });
-                Ok(Join::Waiting { seat, peer })
+                Ok(Join::Waiting {
+                    seat,
+                    peer,
+                    id,
+                    kick,
+                })
             }
         }
     }
@@ -283,14 +483,28 @@ impl Sessions {
     /// Returns true if the session is gone. A slot dies here when its pairing
     /// budget is spent — that budget is the failure limit, and it is what makes
     /// a phrase short enough to say aloud safe to use.
-    pub fn leave(&self, slot: Slot, seat: Seat, now: Instant) -> bool {
+    ///
+    /// `id` is the socket leaving. A socket that was replaced at a held slot
+    /// leaves a chair that is no longer its own, and changes nothing.
+    pub fn leave(&self, slot: Slot, seat: Seat, id: u64, now: Instant) -> bool {
         let mut table = self.inner.lock().unwrap();
-        let Some(session) = table.get_mut(&slot.get()) else {
+        let Some(session) = table.live.get_mut(&slot.get()) else {
             return true;
         };
+        let ours = matches!(&session.seats[seat.index()], Some(occupant) if occupant.id == id);
+        if !ours {
+            return false;
+        }
         session.seats[seat.index()] = None;
+        if session.held() {
+            // Either end may be the one that dropped, and the other is about
+            // to drop too, because the pump's cascade ends both legs. Both are
+            // coming back, so both chairs get the same grace.
+            session.deadline = now + self.limits.resume_grace;
+            return false;
+        }
         if session.pairings_used >= self.limits.max_pairings {
-            table.remove(&slot.get());
+            table.live.remove(&slot.get());
             return true;
         }
         session.deadline = now
@@ -324,23 +538,26 @@ impl Sessions {
     /// back when it issued the slot, and it is already the secret that lets
     /// that operator take its chair. Anyone holding it could end the session
     /// by occupying it anyway.
-    pub fn destroy(&self, slot: Slot, token: Token) -> bool {
+    pub fn destroy(&self, slot: Slot, token: Token, now: Instant) -> bool {
         let mut table = self.inner.lock().unwrap();
-        let Some(session) = table.get(&slot.get()) else {
+        let Some(session) = table.live.get(&slot.get()) else {
             return false;
         };
         if session.operator_token != token {
             return false;
         }
-        table.remove(&slot.get());
+        if let Some(owner_token) = session.owner_token {
+            table.bury(slot.get(), owner_token, now + self.limits.resume_grace);
+        }
+        table.live.remove(&slot.get());
         true
     }
 
     pub fn reap(&self, now: Instant) -> usize {
         let mut table = self.inner.lock().unwrap();
-        let before = table.len();
-        Self::reap_locked(&mut table, now);
-        before - table.len()
+        let before = table.live.len();
+        self.reap_locked(&mut table, now);
+        before - table.live.len()
     }
 
     /// Drop every slot that has run out of reasons to exist.
@@ -351,8 +568,23 @@ impl Sessions {
     /// would pin that slot open for as long as they waited. Only the operator's
     /// chair keeps a slot alive past its deadline, because only the operator
     /// can answer.
-    fn reap_locked(table: &mut HashMap<u32, Session>, now: Instant) {
-        table.retain(|_, s| s.seats[Seat::Operator.index()].is_some() || s.deadline > now);
+    ///
+    /// A held slot that expires leaves a tombstone, so its owner hears that it
+    /// ended rather than that it is lost.
+    fn reap_locked(&self, table: &mut Table, now: Instant) {
+        table.ended.retain(|t| t.until > now);
+        let expired: Vec<(u32, Option<Token>)> = table
+            .live
+            .iter()
+            .filter(|(_, s)| s.seats[Seat::Operator.index()].is_none() && s.deadline <= now)
+            .map(|(n, s)| (*n, s.owner_token))
+            .collect();
+        for (n, owner_token) in expired {
+            table.live.remove(&n);
+            if let Some(owner_token) = owner_token {
+                table.bury(n, owner_token, now + self.limits.resume_grace);
+            }
+        }
     }
 }
 
@@ -366,6 +598,12 @@ mod tests {
 
     fn chan() -> Outbound {
         mpsc::channel(1).0
+    }
+
+    fn id(joined: &Join) -> u64 {
+        match joined {
+            Join::Paired { id, .. } | Join::Waiting { id, .. } => *id,
+        }
     }
 
     #[test]
@@ -409,8 +647,9 @@ mod tests {
         let now = Instant::now();
         let issued = s.issue(now).unwrap();
         let (ticket, _) = s.claim(issued.slot, now).unwrap();
+        let joined = s.join(issued.slot, ticket, chan(), now);
         assert!(matches!(
-            s.join(issued.slot, ticket, chan(), now),
+            joined,
             Ok(Join::Waiting {
                 seat: Seat::Owner,
                 ..
@@ -418,7 +657,7 @@ mod tests {
         ));
         // The chair is occupied now, but the point is the ticket itself: it
         // reports Unknown rather than Taken, because it no longer names a chair.
-        s.leave(issued.slot, Seat::Owner, now);
+        s.leave(issued.slot, Seat::Owner, id(&joined.unwrap()), now);
         assert_eq!(
             s.join(issued.slot, ticket, chan(), now).err(),
             Some(JoinError::Unknown)
@@ -443,14 +682,15 @@ mod tests {
         let s = sessions();
         let now = Instant::now();
         let issued = s.issue(now).unwrap();
+        let joined = s.join(issued.slot, issued.token, chan(), now);
         assert!(matches!(
-            s.join(issued.slot, issued.token, chan(), now),
+            joined,
             Ok(Join::Waiting {
                 seat: Seat::Operator,
                 ..
             })
         ));
-        s.leave(issued.slot, Seat::Operator, now);
+        s.leave(issued.slot, Seat::Operator, id(&joined.unwrap()), now);
         assert!(matches!(
             s.join(issued.slot, issued.token, chan(), now),
             Ok(Join::Waiting {
@@ -508,6 +748,7 @@ mod tests {
         let Ok(Join::Paired {
             seat,
             peer: handed_to_owner,
+            ..
         }) = s.join(issued.slot, ticket, owner_tx.clone(), now)
         else {
             panic!("the owner should pair with the operator");
@@ -546,11 +787,11 @@ mod tests {
         let now = Instant::now();
         let issued = s.issue(now).unwrap();
         for _ in 0..2 {
-            let _op = s.join(issued.slot, issued.token, chan(), now).unwrap();
+            let op = s.join(issued.slot, issued.token, chan(), now).unwrap();
             let (ticket, _) = s.claim(issued.slot, now).unwrap();
-            let _ow = s.join(issued.slot, ticket, chan(), now).unwrap();
-            s.leave(issued.slot, Seat::Owner, now);
-            s.leave(issued.slot, Seat::Operator, now);
+            let ow = s.join(issued.slot, ticket, chan(), now).unwrap();
+            s.leave(issued.slot, Seat::Owner, id(&ow), now);
+            s.leave(issued.slot, Seat::Operator, id(&op), now);
         }
         assert_eq!(s.live(), 0);
         assert_eq!(
@@ -606,10 +847,10 @@ mod tests {
         let issued = s.issue(now).unwrap();
         let _operator = s.join(issued.slot, issued.token, chan(), now).unwrap();
         let (ticket, _) = s.claim(issued.slot, now).unwrap();
-        let _owner = s.join(issued.slot, ticket, chan(), now).unwrap();
+        let owner = s.join(issued.slot, ticket, chan(), now).unwrap();
 
         let late = now + s.limits.issue_ttl + Duration::from_secs(60);
-        assert!(!s.leave(issued.slot, Seat::Owner, late));
+        assert!(!s.leave(issued.slot, Seat::Owner, id(&owner), late));
         assert_eq!(
             s.reap(late + s.limits.issue_ttl - Duration::from_secs(1)),
             0
@@ -625,10 +866,10 @@ mod tests {
         let s = sessions();
         let now = Instant::now();
         let issued = s.issue(now).unwrap();
-        let _waiting = s.join(issued.slot, issued.token, chan(), now).unwrap();
+        let waiting = s.join(issued.slot, issued.token, chan(), now).unwrap();
 
         let late = now + s.limits.issue_ttl + Duration::from_secs(60);
-        assert!(!s.leave(issued.slot, Seat::Operator, late));
+        assert!(!s.leave(issued.slot, Seat::Operator, id(&waiting), late));
 
         // Inside the grace the slot is still there, which is what lets the
         // dial loop drop its chair and take it straight back.
@@ -656,7 +897,7 @@ mod tests {
             "live, before the release"
         );
 
-        assert!(s.destroy(issued.slot, issued.token));
+        assert!(s.destroy(issued.slot, issued.token, now));
 
         assert!(
             s.claim(issued.slot, now).is_none(),
@@ -664,7 +905,7 @@ mod tests {
         );
         assert_eq!(s.live(), 0);
         assert!(
-            !s.destroy(issued.slot, issued.token),
+            !s.destroy(issued.slot, issued.token, now),
             "and it is gone for good"
         );
     }
@@ -674,7 +915,7 @@ mod tests {
         let s = sessions();
         let now = Instant::now();
         let issued = s.issue(now).unwrap();
-        assert!(!s.destroy(issued.slot, Token::mint()));
+        assert!(!s.destroy(issued.slot, Token::mint(), now));
         assert_eq!(s.live(), 1);
         assert!(s.claim(issued.slot, now).is_some());
     }
@@ -691,6 +932,227 @@ mod tests {
         assert_eq!(
             s.join(issued.slot, first, chan(), now).err(),
             Some(JoinError::Unknown)
+        );
+    }
+
+    /// An operator and an owner paired at a slot the operator then holds.
+    fn held(s: &Sessions, now: Instant) -> (Issued, Token, Join, Join) {
+        let issued = s.issue(now).unwrap();
+        let operator = s.join(issued.slot, issued.token, chan(), now).unwrap();
+        let (ticket, _) = s.claim(issued.slot, now).unwrap();
+        let owner = s.join(issued.slot, ticket, chan(), now).unwrap();
+        let owner_token = Token::mint();
+        assert!(s.hold(issued.slot, issued.token, owner_token, now));
+        (issued, owner_token, operator, owner)
+    }
+
+    #[test]
+    fn only_the_seat_token_can_hold_a_slot() {
+        let s = sessions();
+        let now = Instant::now();
+        let issued = s.issue(now).unwrap();
+        assert!(!s.hold(issued.slot, Token::mint(), Token::mint(), now));
+        assert!(!s.hold(Slot::new(9).unwrap(), issued.token, Token::mint(), now));
+        assert!(s.claim(issued.slot, now).is_some(), "still an open invite");
+    }
+
+    /// The phrase grants nothing once the owner has consented, so a stranger
+    /// who heard it can neither take the owner's chair nor spend the slot.
+    #[test]
+    fn a_held_slot_mints_no_tickets() {
+        let s = sessions();
+        let now = Instant::now();
+        let (issued, _, _operator, _owner) = held(&s, now);
+        assert!(s.claim(issued.slot, now).is_none());
+    }
+
+    #[test]
+    fn a_held_slot_survives_both_chairs_emptying_for_the_grace() {
+        let s = sessions();
+        let now = Instant::now();
+        let (issued, _, operator, owner) = held(&s, now);
+        assert!(!s.leave(issued.slot, Seat::Owner, id(&owner), now));
+        assert!(!s.leave(issued.slot, Seat::Operator, id(&operator), now));
+        let grace = s.limits.resume_grace;
+        assert_eq!(s.reap(now + grace - Duration::from_secs(1)), 0);
+        assert_eq!(s.reap(now + grace + Duration::from_secs(1)), 1);
+    }
+
+    #[test]
+    fn the_owner_comes_back_with_its_seat_token() {
+        let s = sessions();
+        let now = Instant::now();
+        let (issued, owner_token, operator, owner) = held(&s, now);
+        s.leave(issued.slot, Seat::Owner, id(&owner), now);
+        s.leave(issued.slot, Seat::Operator, id(&operator), now);
+        let later = now + Duration::from_secs(300);
+        let back = s.join(issued.slot, owner_token, chan(), later);
+        assert!(matches!(
+            back,
+            Ok(Join::Waiting {
+                seat: Seat::Owner,
+                ..
+            })
+        ));
+        assert!(matches!(
+            s.join(issued.slot, issued.token, chan(), later),
+            Ok(Join::Paired {
+                seat: Seat::Operator,
+                ..
+            })
+        ));
+    }
+
+    /// A flaky network pairs over and over. The pairing budget is for guessing
+    /// a phrase, and must not end a session the owner already consented to.
+    #[test]
+    fn a_held_slot_has_no_pairing_budget() {
+        let s = sessions();
+        let now = Instant::now();
+        let (issued, owner_token, mut operator, mut owner) = held(&s, now);
+        for _ in 0..s.limits.max_pairings * 2 {
+            assert!(!s.leave(issued.slot, Seat::Owner, id(&owner), now));
+            assert!(!s.leave(issued.slot, Seat::Operator, id(&operator), now));
+            operator = s.join(issued.slot, issued.token, chan(), now).unwrap();
+            owner = s.join(issued.slot, owner_token, chan(), now).unwrap();
+        }
+        assert_eq!(s.live(), 1);
+    }
+
+    #[test]
+    fn a_wrong_owner_token_at_a_held_slot_finds_nothing() {
+        let s = sessions();
+        let now = Instant::now();
+        let (issued, _, _operator, _owner) = held(&s, now);
+        assert_eq!(
+            s.join(issued.slot, Token::mint(), chan(), now).err(),
+            Some(JoinError::Unknown)
+        );
+    }
+
+    /// The far end of a socket went to sleep, and the relay has not noticed.
+    /// The owner coming back must not wait for it to.
+    #[test]
+    fn a_returning_owner_replaces_the_socket_it_lost() {
+        let s = sessions();
+        let now = Instant::now();
+        let (issued, owner_token, _operator, stale) = held(&s, now);
+        let (Join::Waiting {
+            kick: stale_kick, ..
+        }
+        | Join::Paired {
+            kick: stale_kick, ..
+        }) = &stale;
+        let fresh = s.join(issued.slot, owner_token, chan(), now).unwrap();
+        assert!(matches!(
+            fresh,
+            Join::Waiting {
+                seat: Seat::Owner,
+                ..
+            }
+        ));
+        assert!(
+            futures_util::FutureExt::now_or_never(stale_kick.notified()).is_some(),
+            "the stale socket is told to go"
+        );
+        // Its leaving does not free the chair its replacement sits in.
+        assert!(!s.leave(issued.slot, Seat::Owner, id(&stale), now));
+        assert_eq!(
+            s.join(issued.slot, owner_token, chan(), now)
+                .map(|j| id(&j) != id(&fresh)),
+            Ok(true),
+            "a third arrival replaces the second, which was still seated"
+        );
+    }
+
+    #[test]
+    fn an_owner_redialling_a_released_held_slot_hears_that_it_ended() {
+        let s = sessions();
+        let now = Instant::now();
+        let (issued, owner_token, _operator, _owner) = held(&s, now);
+        assert!(s.destroy(issued.slot, issued.token, now));
+        assert_eq!(
+            s.join(issued.slot, owner_token, chan(), now).err(),
+            Some(JoinError::Ended)
+        );
+        assert_eq!(
+            s.join(issued.slot, Token::mint(), chan(), now).err(),
+            Some(JoinError::Unknown),
+            "and nobody else can tell"
+        );
+        // Still true once the number belongs to somebody else.
+        let next = s.issue(now).unwrap();
+        assert_eq!(next.slot, issued.slot);
+        assert_eq!(
+            s.join(issued.slot, owner_token, chan(), now).err(),
+            Some(JoinError::Ended)
+        );
+    }
+
+    #[test]
+    fn a_held_slot_that_expires_tells_its_owner_it_ended() {
+        let s = sessions();
+        let now = Instant::now();
+        let (issued, owner_token, operator, owner) = held(&s, now);
+        s.leave(issued.slot, Seat::Owner, id(&owner), now);
+        s.leave(issued.slot, Seat::Operator, id(&operator), now);
+        let late = now + s.limits.resume_grace + Duration::from_secs(1);
+        assert_eq!(
+            s.join(issued.slot, owner_token, chan(), late).err(),
+            Some(JoinError::Ended)
+        );
+    }
+
+    #[test]
+    fn a_restarted_relay_takes_a_held_slot_back() {
+        let s = sessions();
+        let now = Instant::now();
+        let slot = Slot::new(4).unwrap();
+        let (token, owner_token) = (Token::mint(), Token::mint());
+        assert_eq!(s.restore(slot, token, owner_token, now), Ok(()));
+        assert_eq!(
+            s.restore(slot, token, owner_token, now),
+            Ok(()),
+            "twice is fine"
+        );
+        assert!(s.claim(slot, now).is_none(), "it comes back held");
+        let owner = s.join(slot, owner_token, chan(), now);
+        assert!(matches!(
+            owner,
+            Ok(Join::Waiting {
+                seat: Seat::Owner,
+                ..
+            })
+        ));
+        assert!(matches!(
+            s.join(slot, token, chan(), now),
+            Ok(Join::Paired {
+                seat: Seat::Operator,
+                ..
+            })
+        ));
+    }
+
+    #[test]
+    fn a_restore_cannot_take_a_number_another_session_holds() {
+        let s = sessions();
+        let now = Instant::now();
+        let issued = s.issue(now).unwrap();
+        assert_eq!(
+            s.restore(issued.slot, Token::mint(), Token::mint(), now),
+            Err(RestoreError::Taken)
+        );
+    }
+
+    #[test]
+    fn a_restore_cannot_revive_a_released_session() {
+        let s = sessions();
+        let now = Instant::now();
+        let (issued, owner_token, _operator, _owner) = held(&s, now);
+        s.destroy(issued.slot, issued.token, now);
+        assert_eq!(
+            s.restore(issued.slot, issued.token, owner_token, now),
+            Err(RestoreError::Ended)
         );
     }
 }

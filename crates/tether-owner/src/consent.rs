@@ -96,8 +96,14 @@ impl fmt::Display for Ask<'_> {
         )?;
         match self.log {
             Ok(_) => {
-                writeln!(f, "  What is kept is the log named above — everything you see,")?;
-                writeln!(f, "  on this machine only, for you to read or delete afterwards.")?;
+                writeln!(
+                    f,
+                    "  What is kept is the log named above — everything you see,"
+                )?;
+                writeln!(
+                    f,
+                    "  on this machine only, for you to read or delete afterwards."
+                )?;
             }
             Err(_) => {
                 writeln!(f, "  Nothing will be kept: there will be no record of this")?;

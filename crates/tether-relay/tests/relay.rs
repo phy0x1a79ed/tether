@@ -864,3 +864,178 @@ async fn a_poll_naming_nothing_is_refused_like_everything_else() {
     assert_eq!(status, 404);
     r.stop();
 }
+
+// ---------------------------------------------------------------------------
+// A held slot: the session an owner consented to, which survives a gap.
+// ---------------------------------------------------------------------------
+
+/// A request with a body and any headers, answered as text.
+async fn http_body(
+    addr: SocketAddr,
+    method: &str,
+    path: &str,
+    headers: &[(&str, &str)],
+    body: &str,
+) -> (u16, String) {
+    let mut stream = TcpStream::connect(addr).await.unwrap();
+    let mut request = format!(
+        "{method} {path} HTTP/1.1\r\nHost: relay.invalid\r\nConnection: close\r\nContent-Length: {}\r\n",
+        body.len()
+    );
+    for (name, value) in headers {
+        request.push_str(&format!("{name}: {value}\r\n"));
+    }
+    request.push_str("\r\n");
+    request.push_str(body);
+    stream.write_all(request.as_bytes()).await.unwrap();
+    let mut raw = Vec::new();
+    stream.read_to_end(&mut raw).await.unwrap();
+    let text = String::from_utf8_lossy(&raw).into_owned();
+    let status = text.split_whitespace().nth(1).unwrap().parse().unwrap();
+    let body = text.split("\r\n\r\n").nth(1).unwrap_or("").to_string();
+    (status, body)
+}
+
+const OWNER: &str = "0123456789abcdef0123456789abcdef";
+
+async fn hold(addr: SocketAddr, slot: u64, token: &str, owner: &str) -> u16 {
+    http_body(
+        addr,
+        "POST",
+        &format!("/hold/{slot}/{token}"),
+        &[("cf-connecting-ip", "203.0.113.9")],
+        &format!(r#"{{"owner":"{owner}"}}"#),
+    )
+    .await
+    .0
+}
+
+async fn restore(addr: SocketAddr, slot: u64, token: &str, owner: &str) -> u16 {
+    http_body(
+        addr,
+        "POST",
+        "/issue",
+        &[("Authorization", &format!("Bearer {BEARER}"))],
+        &format!(r#"{{"slot":"{slot}","token":"{token}","owner":"{owner}"}}"#),
+    )
+    .await
+    .0
+}
+
+/// A paired session whose operator has held the slot for `OWNER`.
+async fn held_pair(r: &Running) -> (u64, String, Socket, Socket) {
+    let (slot, token) = issue(r.addr).await;
+    let operator = join(r.addr, slot, &token).await.expect("the operator");
+    let ticket = claim(r.addr, slot).await;
+    let owner = join(r.addr, slot, &ticket).await.expect("the owner");
+    assert_eq!(hold(r.addr, slot, &token, OWNER).await, 200);
+    (slot, token, operator, owner)
+}
+
+#[tokio::test]
+async fn a_hold_without_the_seat_token_looks_like_nothing() {
+    let r = relay(Limits::default()).await;
+    let (slot, _token) = issue(r.addr).await;
+    assert_eq!(hold(r.addr, slot, OWNER, OWNER).await, 404);
+    r.stop();
+}
+
+#[tokio::test]
+async fn both_ends_of_a_held_session_come_back_after_a_drop() {
+    let r = relay(Limits::default()).await;
+    let (slot, token, operator, owner) = held_pair(&r).await;
+    drop(owner);
+    drop(operator);
+    tokio::time::sleep(Duration::from_millis(100)).await;
+
+    let (status, _) = http(r.addr, "POST", &format!("/claim/{slot}"), &[]).await;
+    assert_eq!(status, 404, "the phrase opens nothing now");
+
+    let mut owner = join(r.addr, slot, OWNER).await.expect("the owner, back");
+    let mut operator = join(r.addr, slot, &token)
+        .await
+        .expect("the operator, back");
+    operator
+        .send(Message::Binary(vec![1, 2, 3].into()))
+        .await
+        .unwrap();
+    let got = next_data(&mut owner, Duration::from_secs(5)).await.unwrap();
+    assert_eq!(got, Message::Binary(vec![1, 2, 3].into()));
+    r.stop();
+}
+
+/// The owner's laptop slept with its socket open. The relay still thinks the
+/// old socket is in the chair, and the owner must not have to wait for it to
+/// find out.
+#[tokio::test]
+async fn a_returning_owner_takes_its_chair_from_the_socket_it_lost() {
+    let r = relay(Limits::default()).await;
+    let (slot, token, mut operator, mut stale) = held_pair(&r).await;
+
+    let mut owner = join(r.addr, slot, OWNER)
+        .await
+        .expect("replaces the stale socket");
+    assert!(closed(next_data(&mut stale, Duration::from_secs(5)).await));
+    assert!(
+        closed(next_data(&mut operator, Duration::from_secs(5)).await),
+        "the cascade ends the operator's half, so it redials"
+    );
+
+    let mut operator = join(r.addr, slot, &token)
+        .await
+        .expect("the operator, back");
+    owner.send(Message::Binary(vec![9].into())).await.unwrap();
+    let got = next_data(&mut operator, Duration::from_secs(5))
+        .await
+        .unwrap();
+    assert_eq!(got, Message::Binary(vec![9].into()));
+    r.stop();
+}
+
+#[tokio::test]
+async fn an_owner_redialling_a_released_session_is_told_it_ended() {
+    let r = relay(Limits::default()).await;
+    let (slot, token, _operator, _owner) = held_pair(&r).await;
+    assert_eq!(release(r.addr, slot, &token).await.0, 200);
+    let e = join(r.addr, slot, OWNER).await.err().expect("refused");
+    assert_eq!(status_of(&e), 410);
+    let e = join(r.addr, slot, &"f".repeat(32))
+        .await
+        .err()
+        .expect("refused");
+    assert_eq!(status_of(&e), 404, "and a stranger learns nothing");
+    r.stop();
+}
+
+/// A restarted relay is an empty one. The operator puts its slot back, and
+/// both ends find each other there.
+#[tokio::test]
+async fn an_operator_puts_a_held_slot_back_on_a_restarted_relay() {
+    let r = relay(Limits::default()).await;
+    let token = "a".repeat(32);
+    assert_eq!(restore(r.addr, 12, &token, OWNER).await, 200);
+
+    let mut owner = join(r.addr, 12, OWNER).await.expect("the owner");
+    let mut operator = join(r.addr, 12, &token).await.expect("the operator");
+    owner.send(Message::Binary(vec![7].into())).await.unwrap();
+    let got = next_data(&mut operator, Duration::from_secs(5))
+        .await
+        .unwrap();
+    assert_eq!(got, Message::Binary(vec![7].into()));
+    r.stop();
+}
+
+#[tokio::test]
+async fn a_restore_without_the_bearer_looks_like_nothing() {
+    let r = relay(Limits::default()).await;
+    let (status, _) = http_body(
+        r.addr,
+        "POST",
+        "/issue",
+        &[],
+        &format!(r#"{{"slot":"3","token":"{OWNER}","owner":"{OWNER}"}}"#),
+    )
+    .await;
+    assert_eq!(status, 404);
+    r.stop();
+}

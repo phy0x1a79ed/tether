@@ -103,6 +103,14 @@ pub struct Limits {
     /// backstop for the case where nothing got to say anything.
     pub operator_grace: Duration,
 
+    /// How long a held slot outlives an empty chair, either chair.
+    ///
+    /// A held slot is a session the owner has already consented to, and the
+    /// two ends redial it after any drop. Ten minutes covers a laptop lid, a
+    /// network change and a node restart. Past that the session is over, and
+    /// both ends give up on the same clock.
+    pub resume_grace: Duration,
+
     /// The per-address window for public requests, and what fits in one.
     pub rate_window: Duration,
     pub rate_burst: u32,
@@ -120,6 +128,7 @@ impl Default for Limits {
             drain_grace: Duration::from_secs(5),
             max_pairings: 5,
             operator_grace: Duration::from_secs(10),
+            resume_grace: tether_proto::RESUME_WINDOW,
             rate_window: Duration::from_secs(60),
             rate_burst: 30,
         }

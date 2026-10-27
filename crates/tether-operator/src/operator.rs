@@ -79,8 +79,7 @@ impl Operator {
                 let limit_s = match args.get("limit_s") {
                     None | Some(Value::Null) => None,
                     Some(v) => Some(
-                        whole(v)
-                            .ok_or_else(|| "`limit_s` must be a whole number".to_string())?,
+                        whole(v).ok_or_else(|| "`limit_s` must be a whole number".to_string())?,
                     ),
                 };
                 self.put(args, What::Run { command, limit_s }).await

@@ -1,8 +1,8 @@
 pub mod confirm;
 pub mod consent;
-pub mod log;
 pub mod exec;
 pub mod layout;
+pub mod log;
 pub mod platform;
 pub mod screen;
 pub mod session;

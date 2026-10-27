@@ -312,7 +312,11 @@ pub fn session_minted(words: usize, expires_in_s: u64) -> (&'static str, Value) 
     )
 }
 
-pub fn session_phase(phase: &str, owner: Option<Value>, ended: Option<&str>) -> (&'static str, Value) {
+pub fn session_phase(
+    phase: &str,
+    owner: Option<Value>,
+    ended: Option<&str>,
+) -> (&'static str, Value) {
     (
         "session.phase",
         json!({"phase": phase, "owner": owner, "ended": ended}),
@@ -339,7 +343,13 @@ pub fn session_miss(misses: u32) -> (&'static str, Value) {
     ("session.miss", json!({"misses": misses}))
 }
 
-pub fn task_started(task: u32, kind: &str, command: Option<&str>, cols: u16, rows: u16) -> (&'static str, Value) {
+pub fn task_started(
+    task: u32,
+    kind: &str,
+    command: Option<&str>,
+    cols: u16,
+    rows: u16,
+) -> (&'static str, Value) {
     (
         "task.started",
         json!({"task": task, "kind": kind, "command": command, "cols": cols, "rows": rows}),
@@ -361,7 +371,11 @@ pub fn task_output(task: u32, stream: &str, data: &[u8]) -> (&'static str, Value
 
 /// Exactly one of these follows every `task.started`, and it is always last for
 /// that task. A task ends with a status or with a signal, never both.
-pub fn task_exited(task: u32, exit_code: Option<i32>, signal: Option<i32>) -> (&'static str, Value) {
+pub fn task_exited(
+    task: u32,
+    exit_code: Option<i32>,
+    signal: Option<i32>,
+) -> (&'static str, Value) {
     (
         "task.exited",
         json!({"task": task, "exit_code": exit_code, "signal": signal}),

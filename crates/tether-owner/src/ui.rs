@@ -365,7 +365,9 @@ impl Ui {
 
         let footer = fit(
             match plan.shape {
-                layout::Shape::NoChat => " ctrl-c cuts the session and ends everything running in it ",
+                layout::Shape::NoChat => {
+                    " ctrl-c cuts the session and ends everything running in it "
+                }
                 _ => " type to reply · enter sends · esc clears · ctrl-c cuts the session ",
             },
             self.cols,
@@ -414,7 +416,11 @@ impl Ui {
                 .unwrap_or("");
             region(
                 out,
-                layout::Rect { y: pane.y + grid_rows + i, rows: 1, ..pane },
+                layout::Rect {
+                    y: pane.y + grid_rows + i,
+                    rows: 1,
+                    ..pane
+                },
                 0,
                 &fit(text, pane.cols),
                 false,
@@ -433,7 +439,11 @@ impl Ui {
                 .unwrap_or("");
             region(
                 out,
-                layout::Rect { y: pane.y + i, rows: 1, ..pane },
+                layout::Rect {
+                    y: pane.y + i,
+                    rows: 1,
+                    ..pane
+                },
                 0,
                 &fit(text, pane.cols),
                 false,
@@ -455,7 +465,10 @@ impl Ui {
         let rest = &self.compose.text[self.compose.caret..];
         let mut line = String::from(PROMPT);
         line.push_str(shown_before);
-        line.push_str(&fit(rest, room.saturating_sub(width_of(shown_before)) as u16));
+        line.push_str(&fit(
+            rest,
+            room.saturating_sub(width_of(shown_before)) as u16,
+        ));
 
         region(out, pane, 0, &fit(&line, pane.cols), false)?;
         Ok(pane.x + PROMPT.len() as u16 + width_of(shown_before) as u16)
@@ -466,7 +479,11 @@ impl Ui {
         let width = cols.max(4) as usize;
         let mut out = Vec::new();
         for said in &self.chat {
-            let who = if said.from_operator { "them: " } else { "you: " };
+            let who = if said.from_operator {
+                "them: "
+            } else {
+                "you: "
+            };
             let mut first = true;
             let mut rest = said.text.as_str();
             while !rest.is_empty() || first {
@@ -941,14 +958,20 @@ mod tests {
     fn a_line_is_composed_and_sent_on_enter() {
         let mut ui = typing();
         for c in "hello".chars() {
-            assert!(matches!(ui.typed(press(event::KeyCode::Char(c))), Typed::Changed));
+            assert!(matches!(
+                ui.typed(press(event::KeyCode::Char(c))),
+                Typed::Changed
+            ));
         }
         match ui.typed(press(event::KeyCode::Enter)) {
             Typed::Send(line) => assert_eq!(line, "hello"),
             _ => panic!("enter should send"),
         }
         // And the line is gone, rather than sent twice.
-        assert!(matches!(ui.typed(press(event::KeyCode::Enter)), Typed::Changed));
+        assert!(matches!(
+            ui.typed(press(event::KeyCode::Enter)),
+            Typed::Changed
+        ));
     }
 
     #[test]
@@ -987,7 +1010,8 @@ mod tests {
     #[test]
     fn a_key_being_released_is_not_a_key_being_typed() {
         let mut ui = typing();
-        let mut release = event::KeyEvent::new(event::KeyCode::Char('a'), event::KeyModifiers::NONE);
+        let mut release =
+            event::KeyEvent::new(event::KeyCode::Char('a'), event::KeyModifiers::NONE);
         release.kind = event::KeyEventKind::Release;
         ui.typed(event::Event::Key(release));
         assert_eq!(ui.compose.text, "", "a release typed a character");
