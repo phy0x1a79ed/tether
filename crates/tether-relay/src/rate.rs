@@ -1,15 +1,12 @@
 //! A per-address budget for the public requests.
 //!
-//! This lives on the plain request leg and nowhere else, and the reason is a
-//! property of the path rather than a preference. The edge forwards only three
-//! headers across a WebSocket upgrade — cookie, authorization and origin — so
-//! there is no forwarded client address on the socket at all. An address-keyed
-//! limit applied there would be keyed on the same proxy every time.
-//!
-//! So the public flow is arranged to put a plain request in front of the
-//! upgrade: the owner's launcher claims a ticket, and that claim is what is
-//! counted here. A caller cannot skip it, because the socket will not open
-//! without the ticket the claim returns.
+//! A tether's flow puts a plain request in front of its upgrade: the owner's
+//! launcher claims a ticket, and that claim is what is counted here. A caller
+//! cannot skip it, because the socket will not open without the ticket the
+//! claim returns. A room's websocket has no such claim, so it is counted on
+//! the upgrade itself. That works because the edge forwards the client address
+//! on a relay upgrade as on a plain request. An edge that dropped it would key
+//! every room socket on the one "unattributed" bucket.
 //!
 //! A fixed window rather than a token bucket: the numbers involved are a
 //! handful of requests a minute from one person running one command, and a
