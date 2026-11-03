@@ -54,12 +54,14 @@ pub mod log;
 pub mod poll;
 pub mod pump;
 pub mod rate;
+pub mod room;
 pub mod session;
 pub mod token;
 
 use crate::config::{Config, MAX_MESSAGE};
 use crate::poll::{Polls, Recv, Sent};
 use crate::rate::Limiter;
+use crate::room::{Room, Rooms, SendError, Who, MAX_ROOM_MESSAGE};
 use crate::session::{IssueError, JoinError, RestoreError, Sessions};
 use crate::token::{secret_eq, Token};
 
@@ -73,6 +75,7 @@ const REAP_INTERVAL: Duration = Duration::from_secs(5);
 pub struct Relay {
     pub sessions: Arc<Sessions>,
     pub polls: Arc<Polls>,
+    pub rooms: Arc<Rooms>,
     limiter: Limiter,
     config: Config,
     started: Instant,
@@ -85,6 +88,7 @@ impl Relay {
         Self {
             sessions,
             polls: Arc::default(),
+            rooms: Arc::new(Rooms::new(config.limits.clone())),
             limiter,
             config,
             started: Instant::now(),
@@ -152,6 +156,18 @@ pub fn router(relay: Arc<Relay>) -> Router {
         // `/bin` serves opaque bytes.
         .route("/win", get(launcher_windows))
         .route("/bin/{name}", get(binary))
+        // Rooms, for an agent of another system. See [`room`].
+        .route("/room", post(room_open))
+        .route("/r/{name}", get(room_how_to))
+        .route(
+            "/r/{name}/send",
+            post(room_send).layer(DefaultBodyLimit::max(MAX_ROOM_MESSAGE)),
+        )
+        .route("/r/{name}/recv", get(room_recv))
+        .route("/r/{name}/ws", get(room_ws))
+        .route("/r/{name}/leave", post(room_leave))
+        // A path that is not here answers exactly as a refusal does.
+        .fallback(|| async { nothing_here() })
         .with_state(relay)
 }
 
@@ -170,6 +186,7 @@ async fn status(State(relay): State<Arc<Relay>>, headers: HeaderMap) -> Response
         "build": relay.config.build,
         "sessions": relay.sessions.live(),
         "polled": relay.polls.live(),
+        "rooms": relay.rooms.live(),
         "max_sessions": relay.config.max_sessions,
         "uptime_s": relay.started.elapsed().as_secs(),
         "assets": relay.config.assets.is_some(),
@@ -513,6 +530,283 @@ fn serve_asset(
     }
 }
 
+/// Open a room. Operator only, like `/issue`.
+async fn room_open(State(relay): State<Arc<Relay>>, headers: HeaderMap) -> Response {
+    if !relay.operator(&headers) {
+        return nothing_here();
+    }
+    match relay.rooms.open(Instant::now()) {
+        Some((room, host)) => {
+            // The name is a capability, like a seat token, so it is not logged.
+            log::info(format_args!("opened a room"));
+            Json(json!({
+                "name": room.name,
+                "host": host.to_hex(),
+                "idle_s": relay.config.limits.room_idle.as_secs(),
+                "life_s": relay.config.limits.room_life.as_secs(),
+            }))
+            .into_response()
+        }
+        None => (
+            StatusCode::SERVICE_UNAVAILABLE,
+            "no room is free right now\n",
+        )
+            .into_response(),
+    }
+}
+
+/// The room a request names, and which side is asking.
+///
+/// A name that is no room spends the caller's rate budget. A caller with no
+/// budget left is refused for every name, a live one included, or running out
+/// of budget would leave guessing free and the answers still telling. A host
+/// token that is not this room's is the same miss as a name that is no room.
+fn room_for(
+    relay: &Relay,
+    headers: &HeaderMap,
+    name: &str,
+) -> Result<(Arc<Room>, Who), Box<Response>> {
+    let now = Instant::now();
+    let key = relay.rate_key(headers);
+    if relay.limiter.spent(&key, now) {
+        return Err(Box::new(
+            (StatusCode::TOO_MANY_REQUESTS, "too many requests\n").into_response(),
+        ));
+    }
+    let miss = || {
+        relay.limiter.allow(&key, now);
+        Box::new(nothing_here())
+    };
+    let Some(room) = relay.rooms.get(name, now) else {
+        return Err(miss());
+    };
+    let bearer = headers
+        .get(header::AUTHORIZATION)
+        .and_then(|v| v.to_str().ok())
+        .and_then(|v| v.strip_prefix("Bearer "));
+    match bearer {
+        None => Ok((room, Who::Guest)),
+        Some(got) => match Token::parse(got) {
+            Some(token) if room.is_host(&token) => {
+                room.host_seen(now);
+                Ok((room, Who::Host))
+            }
+            _ => Err(miss()),
+        },
+    }
+}
+
+fn room_ended(why: room::Ended) -> Response {
+    (StatusCode::GONE, Json(json!({ "ended": why.as_str() }))).into_response()
+}
+
+async fn room_how_to(
+    State(relay): State<Arc<Relay>>,
+    Path(name): Path<String>,
+    headers: HeaderMap,
+) -> Response {
+    let (room, _) = match room_for(&relay, &headers, &name) {
+        Ok(found) => found,
+        Err(refused) => return *refused,
+    };
+    // Reading the how-to is a guest's first contact, so it is counted as the
+    // claim of a tether chair is.
+    if !relay
+        .limiter
+        .allow(&relay.rate_key(&headers), Instant::now())
+    {
+        return (StatusCode::TOO_MANY_REQUESTS, "too many requests\n").into_response();
+    }
+    (
+        [
+            (header::CONTENT_TYPE, "text/plain; charset=utf-8"),
+            (header::CACHE_CONTROL, "no-store"),
+        ],
+        room::how_to(&room.name),
+    )
+        .into_response()
+}
+
+async fn room_send(
+    State(relay): State<Arc<Relay>>,
+    Path(name): Path<String>,
+    headers: HeaderMap,
+    body: Bytes,
+) -> Response {
+    let (room, who) = match room_for(&relay, &headers, &name) {
+        Ok(found) => found,
+        Err(refused) => return *refused,
+    };
+    match room.post(who, &body, Instant::now()) {
+        Ok(seq) => Json(json!({ "seq": seq })).into_response(),
+        Err(SendError::Malformed) => (
+            StatusCode::BAD_REQUEST,
+            "send one JSON object with a \"from\" of 1 to 64 characters\n",
+        )
+            .into_response(),
+        Err(SendError::TooLarge) => (
+            StatusCode::PAYLOAD_TOO_LARGE,
+            "a message is at most 65536 bytes\n",
+        )
+            .into_response(),
+        Err(SendError::Busy) => (
+            StatusCode::TOO_MANY_REQUESTS,
+            "this room is taking too many messages\n",
+        )
+            .into_response(),
+        Err(SendError::Ended) => room_ended(room.ended().expect("an ended room has a reason")),
+    }
+}
+
+#[derive(serde::Deserialize)]
+struct RoomRecv {
+    #[serde(default)]
+    after: u64,
+    #[serde(default)]
+    wait: u64,
+}
+
+async fn room_recv(
+    State(relay): State<Arc<Relay>>,
+    Path(name): Path<String>,
+    Query(RoomRecv { after, wait }): Query<RoomRecv>,
+    headers: HeaderMap,
+) -> Response {
+    let (room, who) = match room_for(&relay, &headers, &name) {
+        Ok(found) => found,
+        Err(refused) => return *refused,
+    };
+    let batch = room.wait(after, Duration::from_secs(wait)).await;
+    if who == Who::Host {
+        room.host_seen(Instant::now());
+    }
+    (
+        [(header::CACHE_CONTROL, "no-store")],
+        Json(json!({
+            "messages": batch.messages,
+            "next": batch.next,
+            "ended": batch.ended.map(|why| why.as_str()),
+        })),
+    )
+        .into_response()
+}
+
+async fn room_leave(
+    State(relay): State<Arc<Relay>>,
+    Path(name): Path<String>,
+    headers: HeaderMap,
+) -> Response {
+    let (room, who) = match room_for(&relay, &headers, &name) {
+        Ok(found) => found,
+        Err(refused) => return *refused,
+    };
+    let why = match who {
+        Who::Host => room::Ended::HostClosed,
+        Who::Guest => room::Ended::GuestLeft,
+    };
+    room.end(why, Instant::now());
+    Json(json!({ "ended": room.ended().unwrap_or(why).as_str() })).into_response()
+}
+
+#[derive(serde::Deserialize)]
+struct After {
+    #[serde(default)]
+    after: u64,
+}
+
+async fn room_ws(
+    State(relay): State<Arc<Relay>>,
+    Path(name): Path<String>,
+    Query(After { after }): Query<After>,
+    headers: HeaderMap,
+    ws: WebSocketUpgrade,
+) -> Response {
+    let (room, who) = match room_for(&relay, &headers, &name) {
+        Ok(found) => found,
+        Err(refused) => return *refused,
+    };
+    let keepalive = relay.config.limits.keepalive;
+    ws.max_message_size(MAX_ROOM_MESSAGE)
+        .max_frame_size(MAX_ROOM_MESSAGE)
+        .on_upgrade(move |socket| room_socket(room, who, after, socket, keepalive))
+}
+
+/// One side of a room held over a websocket: each message out as a text frame,
+/// each text frame in as a send.
+async fn room_socket(
+    room: Arc<Room>,
+    who: Who,
+    mut after: u64,
+    socket: axum::extract::ws::WebSocket,
+    keepalive: Duration,
+) {
+    use axum::extract::ws::Message;
+    use futures_util::{SinkExt, StreamExt};
+
+    let (mut sink, mut stream) = socket.split();
+    let mut tick = tokio::time::interval(keepalive);
+    tick.tick().await;
+    loop {
+        let changed = room.changed().notified();
+        tokio::pin!(changed);
+        changed.as_mut().enable();
+
+        let batch = room.read(after);
+        for message in batch.messages {
+            if sink
+                .send(Message::Text(message.to_string().into()))
+                .await
+                .is_err()
+            {
+                return;
+            }
+        }
+        after = batch.next;
+        if let Some(why) = batch.ended {
+            let last = json!({ "ended": why.as_str() }).to_string();
+            let _ = sink.send(Message::Text(last.into())).await;
+            let _ = sink.send(Message::Close(None)).await;
+            return;
+        }
+
+        tokio::select! {
+            _ = &mut changed => {}
+            _ = tick.tick() => {
+                if who == Who::Host {
+                    room.host_seen(Instant::now());
+                }
+                if sink.send(Message::Ping(Bytes::new())).await.is_err() {
+                    return;
+                }
+            }
+            incoming = stream.next() => match incoming {
+                Some(Ok(Message::Text(text))) => {
+                    if let Err(e) = room.post(who, text.as_bytes(), Instant::now()) {
+                        let why = match e {
+                            SendError::Malformed => "send one JSON object with a \"from\" of 1 to 64 characters",
+                            SendError::TooLarge => "a message is at most 65536 bytes",
+                            SendError::Busy => "this room is taking too many messages",
+                            SendError::Ended => continue,
+                        };
+                        let refused = json!({ "refused": why }).to_string();
+                        if sink.send(Message::Text(refused.into())).await.is_err() {
+                            return;
+                        }
+                    }
+                }
+                Some(Ok(Message::Ping(_))) | Some(Ok(Message::Pong(_))) => {}
+                Some(Ok(Message::Binary(_))) => {
+                    let refused = json!({ "refused": "send text frames of JSON" }).to_string();
+                    if sink.send(Message::Text(refused.into())).await.is_err() {
+                        return;
+                    }
+                }
+                Some(Ok(Message::Close(_))) | Some(Err(_)) | None => return,
+            },
+        }
+    }
+}
+
 /// A bound relay, and the task serving it.
 pub struct Running {
     pub addr: SocketAddr,
@@ -541,6 +835,7 @@ pub async fn start(config: Config) -> std::io::Result<Running> {
     let app = router(Arc::clone(&relay));
 
     let sessions = Arc::clone(&relay.sessions);
+    let rooms = Arc::clone(&relay.rooms);
     let reaper = tokio::spawn(async move {
         let mut tick = tokio::time::interval(REAP_INTERVAL);
         loop {
@@ -548,6 +843,10 @@ pub async fn start(config: Config) -> std::io::Result<Running> {
             let gone = sessions.reap(Instant::now());
             if gone > 0 {
                 log::info(format_args!("{gone} slot(s) expired unredeemed"));
+            }
+            let gone = rooms.reap(Instant::now());
+            if gone > 0 {
+                log::info(format_args!("{gone} room(s) ended and forgotten"));
             }
         }
     });

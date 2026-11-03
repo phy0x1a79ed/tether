@@ -630,7 +630,10 @@ mod tests {
         let slots: std::collections::HashSet<u32> =
             (0..32).map(|_| s.issue(now).unwrap().slot.get()).collect();
         assert_eq!(slots.len(), 32, "a live slot was handed out twice");
-        assert!(slots.iter().any(|n| *n > 32), "slots came out in order: {slots:?}");
+        assert!(
+            slots.iter().any(|n| *n > 32),
+            "slots came out in order: {slots:?}"
+        );
     }
 
     #[test]

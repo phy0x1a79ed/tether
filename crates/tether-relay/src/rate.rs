@@ -75,6 +75,14 @@ impl Limiter {
         }
     }
 
+    /// Whether `key` has no budget left in its window, without spending any.
+    pub fn spent(&self, key: &str, now: Instant) -> bool {
+        let table = self.inner.lock().unwrap();
+        table
+            .get(key)
+            .is_some_and(|w| now.duration_since(w.started) < self.window && w.used >= self.burst)
+    }
+
     #[cfg(test)]
     fn tracked(&self) -> usize {
         self.inner.lock().unwrap().len()

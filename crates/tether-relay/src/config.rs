@@ -114,6 +114,26 @@ pub struct Limits {
     /// The per-address window for public requests, and what fits in one.
     pub rate_window: Duration,
     pub rate_burst: u32,
+
+    /// How long a room outlives its host's silence.
+    ///
+    /// The host long-polls its room the whole time it holds it, so a quiet
+    /// host is a host that is gone. A guest's requests do not keep a room
+    /// alive: a room exists for our side, and a guest alone in it is talking
+    /// to nobody.
+    pub room_idle: Duration,
+
+    /// The longest a room lives, however busy it is. A room name is three
+    /// words, guessable online at the rate limit, so no name stays valid
+    /// forever.
+    pub room_life: Duration,
+
+    /// How long an ended room still answers, so each side can read the last
+    /// messages and why it ended before its name stops existing.
+    pub room_linger: Duration,
+
+    /// How many rooms may be open at once.
+    pub max_rooms: usize,
 }
 
 impl Default for Limits {
@@ -131,6 +151,10 @@ impl Default for Limits {
             resume_grace: tether_proto::RESUME_WINDOW,
             rate_window: Duration::from_secs(60),
             rate_burst: 30,
+            room_idle: Duration::from_secs(600),
+            room_life: Duration::from_secs(24 * 3600),
+            room_linger: Duration::from_secs(30),
+            max_rooms: 64,
         }
     }
 }
