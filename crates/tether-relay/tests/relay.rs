@@ -182,7 +182,7 @@ async fn creating_a_session_without_the_bearer_looks_like_a_route_that_is_not_th
 async fn an_authenticated_operator_gets_a_slot_and_a_seat_token() {
     let r = relay(Limits::default()).await;
     let (slot, token) = issue(r.addr).await;
-    assert_eq!(slot, 1, "the first slot should be the shortest to read out");
+    assert!((1..=999).contains(&slot), "slot {slot} is out of range");
     assert_eq!(token.len(), 32);
     assert_eq!(r.relay.sessions.live(), 1);
     r.stop();

@@ -239,19 +239,16 @@ impl Sessions {
 
     /// Allocate a slot for an operator who has already been authenticated.
     ///
-    /// The smallest free number wins, because the code is read aloud and a
-    /// one-digit slot is a shorter sentence than a three-digit one. Slots are
-    /// public by design, so there is nothing to gain by making them
-    /// unpredictable and a real cost to making them long.
+    /// The slot is the first word of the code, and every word reads out alike,
+    /// so a free slot is drawn at random. The smallest free slot made every
+    /// code start with the same word.
     pub fn issue(&self, now: Instant) -> Result<Issued, IssueError> {
         let mut table = self.inner.lock().unwrap();
         self.reap_locked(&mut table, now);
         if table.live.len() >= self.max_sessions {
             return Err(IssueError::Full);
         }
-        let n = (1..=MAX_SLOT)
-            .find(|n| !table.live.contains_key(n))
-            .ok_or(IssueError::Full)?;
+        let n = random_free_slot(|n| table.live.contains_key(&n)).ok_or(IssueError::Full)?;
         let slot = Slot::new(n).expect("the search range is the valid range");
         let token = Token::mint();
         table.live.insert(
@@ -595,6 +592,19 @@ impl Sessions {
     }
 }
 
+/// A free slot drawn at random, or None when every slot is taken.
+///
+/// A random start, then the first free slot from there, wrapping round. One
+/// draw stays fast with the table nearly full.
+fn random_free_slot(taken: impl Fn(u32) -> bool) -> Option<u32> {
+    let mut seed = [0u8; 4];
+    getrandom::getrandom(&mut seed).expect("the OS randomness source failed");
+    let start = u32::from_le_bytes(seed) % MAX_SLOT;
+    (0..MAX_SLOT)
+        .map(|i| (start + i) % MAX_SLOT + 1)
+        .find(|n| !taken(*n))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -614,23 +624,36 @@ mod tests {
     }
 
     #[test]
-    fn the_first_slot_issued_is_the_shortest_one() {
-        let s = sessions();
-        assert_eq!(s.issue(Instant::now()).unwrap().slot.get(), 1);
-        assert_eq!(s.issue(Instant::now()).unwrap().slot.get(), 2);
+    fn slots_are_drawn_at_random_so_codes_start_with_different_words() {
+        let s = Sessions::new(Limits::default(), 64);
+        let now = Instant::now();
+        let slots: std::collections::HashSet<u32> =
+            (0..32).map(|_| s.issue(now).unwrap().slot.get()).collect();
+        assert_eq!(slots.len(), 32, "a live slot was handed out twice");
+        assert!(slots.iter().any(|n| *n > 32), "slots came out in order: {slots:?}");
     }
 
     #[test]
-    fn a_freed_slot_is_handed_out_again() {
-        let s = sessions();
+    fn a_random_draw_finds_the_last_free_slot() {
+        for _ in 0..50 {
+            assert_eq!(random_free_slot(|n| n != 517), Some(517));
+        }
+        assert_eq!(random_free_slot(|_| true), None);
+        for _ in 0..200 {
+            let n = random_free_slot(|_| false).unwrap();
+            assert!((1..=MAX_SLOT).contains(&n));
+        }
+    }
+
+    #[test]
+    fn a_freed_slot_can_be_handed_out_again() {
+        let s = Sessions::new(Limits::default(), 1);
         let now = Instant::now();
-        let first = s.issue(now).unwrap();
-        let second = s.issue(now).unwrap();
-        assert_eq!(second.slot.get(), 2);
+        s.issue(now).unwrap();
+        assert!(s.issue(now).is_err(), "the cap of one was not kept");
         // Let the first expire unredeemed.
         s.reap(now + s.limits.issue_ttl + Duration::from_secs(1));
-        assert_eq!(s.issue(now).unwrap().slot.get(), 1);
-        assert_eq!(first.slot.get(), 1);
+        assert!(s.issue(now).is_ok());
     }
 
     #[test]
@@ -1088,7 +1111,14 @@ mod tests {
             "and nobody else can tell"
         );
         // Still true once the number belongs to somebody else.
-        let next = s.issue(now).unwrap();
+        // Slots are drawn at random, so draw and hand back until it comes up.
+        let next = loop {
+            let n = s.issue(now).unwrap();
+            if n.slot == issued.slot {
+                break n;
+            }
+            assert!(s.destroy(n.slot, n.token, now));
+        };
         assert_eq!(next.slot, issued.slot);
         assert_eq!(
             s.join(issued.slot, owner_token, chan(), now).err(),

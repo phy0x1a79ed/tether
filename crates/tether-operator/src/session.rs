@@ -447,8 +447,8 @@ async fn connect(
                         return None;
                     }
                     Some(Command { what: What::Cut { reason }, reply }) => {
+                        finish(track, reason.clone());
                         let _ = reply.send(Ok(json!({"ok": true, "cut": reason})));
-                        finish(track, reason);
                         return None;
                     }
                     Some(other) => other.refuse(
@@ -577,8 +577,8 @@ async fn consent(
                 }
                 Some(Command { what: What::Cut { reason }, reply }) => {
                     link.cut(&reason).await;
+                    finish(track, reason.clone());
                     let _ = reply.send(Ok(json!({"ok": true, "cut": reason})));
-                    finish(track, reason);
                     return Consent::Ended;
                 }
                 // Worth allowing, and the reason the owner's side accepts it
@@ -875,6 +875,8 @@ async fn run_verb(
     match what {
         What::Cut { reason } => {
             link.cut(&reason).await;
+            // Ended before the answer, so a status right after it says so.
+            finish(track, reason.clone());
             let _ = reply.send(Ok(json!({"ok": true, "cut": reason})));
             Carry::Ended(reason)
         }
