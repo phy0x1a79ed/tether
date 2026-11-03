@@ -361,8 +361,7 @@ def test_the_powershell_launcher_installs_nothing_either():
     for forbidden in ("schtasks", "New-Service", "Register-ScheduledTask",
                       "CurrentVersion\\Run", "Startup", "$PROFILE", "setx"):
         assert forbidden not in text, f"the PowerShell launcher mentions {forbidden}"
-    # It runs the client and hands back whatever the client said, so a refused
-    # session is a non-zero exit on Windows as it is everywhere else.
+    # It runs the client and leaves its code in $LASTEXITCODE. It never calls
+    # `exit`, which would close the owner's PowerShell (test_launcher_ps1.py).
     assert re.search(r"^& \$bin @code$", text, re.M)
-    assert re.search(r"^exit \$LASTEXITCODE$", text, re.M)
     assert "delete $dir when you are done" in text

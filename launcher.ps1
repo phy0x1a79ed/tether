@@ -40,12 +40,23 @@
 # every client is baked into this file when the release is cut, and a download
 # whose hash does not match is refused rather than run.
 
+# # Why the whole launcher is one script block that never calls exit
+#
+# The owner runs this inside their own PowerShell, not as a script file. There
+# `exit` ends the owner's PowerShell itself, on both lines above, and closes the
+# window they typed into. So the body runs in a script block of its own: a
+# failure throws to the one catch at the bottom, the client's exit code is left
+# in $LASTEXITCODE, and the owner is back at their prompt, as they are after the
+# sh launcher. The block also keeps this file's variables and its
+# $ErrorActionPreference out of the owner's session on the `iex` route.
+
+& {
 $ErrorActionPreference = 'Stop'
 
-function Die($message) {
-    Write-Error "tether: $message"
-    exit 1
-}
+function Say($message) { $Host.UI.WriteErrorLine("tether: $message") }
+function Die($message) { throw "tether: $message" }
+
+try {
 
 # --- baked by release.sh (do not edit between the markers) ---
 # Empty here means this is the source copy, not a released launcher. The source
@@ -125,9 +136,9 @@ foreach ($url in $sources) {
     if (-not (Test-Path $bin) -or (Get-Item $bin).Length -eq 0) { continue }
     $have = (Get-FileHash -Algorithm SHA256 -Path $bin).Hash.ToLower()
     if ($have -ne $want) {
-        Write-Error "tether: $url does not match the checksum this release published."
-        Write-Error "tether: expected $want"
-        Write-Error "tether: received $have"
+        Say "$url does not match the checksum this release published."
+        Say "expected $want"
+        Say "received $have"
         Die 'the download was altered or corrupted; nothing was run.'
     }
     $got = "fetched $url"
@@ -146,4 +157,8 @@ Write-Host "tether: running $bin"
 Write-Host "tether: delete $dir when you are done - the client and its log are in it."
 
 & $bin @code
-exit $LASTEXITCODE
+} catch {
+    $Host.UI.WriteErrorLine($_.Exception.Message)
+    $global:LASTEXITCODE = 1
+}
+} @args
