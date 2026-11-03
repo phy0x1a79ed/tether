@@ -2,7 +2,7 @@
 //!
 //! A tether pairs two chairs and pumps sealed bytes. A room is looser, because
 //! its guest is an agent somebody else runs, holding nothing of ours but the
-//! three words it was told. It speaks plain HTTPS and JSON from a how-to it
+//! words it was told. It speaks plain HTTPS and JSON from a how-to it
 //! reads at the room's own address, so any agent that can make a request can
 //! join, with no client to install.
 //!
@@ -23,13 +23,19 @@
 //! other field. A room that encrypts carries sealed text it has no key for, the
 //! same as a tether.
 //!
-//! # Why three words are enough
+//! # Two kinds
 //!
-//! A name is 30 bits. That is guessable only online, so the room is protected
-//! by what limits the guessing: every request that names no room spends the
-//! caller's rate budget, a caller with no budget left is refused for every
-//! name alike, and a room ends when its host goes quiet or when it reaches
-//! [`Limits::room_life`].
+//! A task room is held for one task. Its name is three words, about 30 bits,
+//! because a person may type it. That is guessable only online, so the room is
+//! protected by what limits the guessing: every request that names no room
+//! spends the caller's rate budget, a caller with no budget left is refused
+//! for every name alike, and a room ends when its host goes quiet or when it
+//! reaches [`Limits::room_life`].
+//!
+//! A persistent room serves a long-lived link and outlives any one task. It
+//! has neither deadline, so it ends only when a side leaves or the relay
+//! stops. Its name is six words, about 60 bits, because nothing bounds how
+//! long a guesser has, and a persistent link is pasted, never typed.
 
 use std::collections::{HashMap, VecDeque};
 use std::sync::{Arc, Mutex};
@@ -42,8 +48,42 @@ use tokio::sync::Notify;
 use crate::config::Limits;
 use crate::token::Token;
 
-/// How many words a room name has.
+/// How many words a task room's name has.
 pub const NAME_WORDS: usize = 3;
+
+/// How many words a persistent room's name has.
+pub const PERSISTENT_WORDS: usize = 6;
+
+/// Which deadlines a room keeps. See the module docs.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Kind {
+    Task,
+    Persistent,
+}
+
+impl Kind {
+    pub fn parse(s: &str) -> Option<Kind> {
+        match s {
+            "task" => Some(Kind::Task),
+            "persistent" => Some(Kind::Persistent),
+            _ => None,
+        }
+    }
+
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Kind::Task => "task",
+            Kind::Persistent => "persistent",
+        }
+    }
+
+    fn words(self) -> usize {
+        match self {
+            Kind::Task => NAME_WORDS,
+            Kind::Persistent => PERSISTENT_WORDS,
+        }
+    }
+}
 
 /// The largest message a room carries, as JSON.
 pub const MAX_ROOM_MESSAGE: usize = 64 * 1024;
@@ -123,6 +163,7 @@ pub struct Batch {
 
 pub struct Room {
     pub name: String,
+    pub kind: Kind,
     host: Token,
     state: Mutex<State>,
     changed: Notify,
@@ -266,14 +307,14 @@ impl Rooms {
 
     /// Open a room with a fresh name. `None` when [`Limits::max_rooms`] are
     /// open already.
-    pub fn open(&self, now: Instant) -> Option<(Arc<Room>, Token)> {
+    pub fn open(&self, kind: Kind, now: Instant) -> Option<(Arc<Room>, Token)> {
         let mut table = self.inner.lock().unwrap();
         self.expire(&mut table, now);
         if table.len() >= self.limits.max_rooms {
             return None;
         }
         let name = loop {
-            let name = mint_name();
+            let name = mint_name(kind.words());
             if !table.contains_key(&name) {
                 break name;
             }
@@ -281,6 +322,7 @@ impl Rooms {
         let host = Token::mint();
         let room = Arc::new(Room {
             name: name.clone(),
+            kind,
             host,
             state: Mutex::new(State {
                 backlog: VecDeque::new(),
@@ -331,6 +373,7 @@ impl Rooms {
             };
             match ended {
                 Some((_, at)) => now.duration_since(at) < self.limits.room_linger,
+                None if room.kind == Kind::Persistent => true,
                 None => {
                     if now.duration_since(born) >= self.limits.room_life {
                         room.end(Ended::TooOld, now);
@@ -345,10 +388,10 @@ impl Rooms {
     }
 }
 
-/// Three random words from the tether list, joined by hyphens so the name
+/// `words` random words from the tether list, joined by hyphens so the name
 /// sits in a URL as it is.
-fn mint_name() -> String {
-    let mut raw = [0u8; 2 * NAME_WORDS];
+fn mint_name(words: usize) -> String {
+    let mut raw = vec![0u8; 2 * words];
     getrandom::getrandom(&mut raw).expect("the OS randomness source failed");
     raw.chunks(2)
         .map(|b| WORDS[u16::from_le_bytes([b[0], b[1]]) as usize % WORDS.len()])
@@ -356,18 +399,19 @@ fn mint_name() -> String {
         .join("-")
 }
 
-/// A name exactly as the relay mints it: three list words, lowercase, joined
-/// by hyphens. Exactly, because the public edge forwards only that shape, and
-/// a parser looser than the edge accepts names no guest can reach.
+/// A name exactly as the relay mints it: three or six list words, lowercase,
+/// joined by hyphens. Exactly, because the public edge forwards only that
+/// shape, and a parser looser than the edge accepts names no guest can reach.
 pub fn parse_name(s: &str) -> Option<String> {
     let words: Vec<&str> = s.split('-').collect();
-    if words.len() != NAME_WORDS || !words.iter().all(|w| WORDS.contains(w)) {
+    let count_ok = words.len() == NAME_WORDS || words.len() == PERSISTENT_WORDS;
+    if !count_ok || !words.iter().all(|w| WORDS.contains(w)) {
         return None;
     }
     Some(s.to_string())
 }
 
-/// What `GET /r/<name>` answers: everything a guest needs, in plain text.
+/// What `GET /room/<name>` answers: everything a guest needs, in plain text.
 pub fn how_to(name: &str) -> String {
     HOW_TO.replace("{name}", name)
 }
@@ -452,7 +496,7 @@ mod tests {
     #[test]
     fn a_name_is_three_list_words_and_parses_back() {
         let r = rooms();
-        let (room, _) = r.open(Instant::now()).unwrap();
+        let (room, _) = r.open(Kind::Task, Instant::now()).unwrap();
         assert_eq!(room.name.split('-').count(), 3);
         assert_eq!(parse_name(&room.name).as_deref(), Some(room.name.as_str()));
     }
@@ -465,6 +509,9 @@ mod tests {
         assert!(parse_name("acre--anchor-kettle").is_none());
         assert!(parse_name("acre-anchor").is_none());
         assert!(parse_name("acre-anchor-kettle-acre").is_none());
+        assert!(parse_name("acre-anchor-kettle-acre-anchor-kettle").is_some());
+        assert!(parse_name("acre-anchor-kettle-acre-anchor").is_none());
+        assert!(parse_name("acre-anchor-kettle-acre-anchor-kettle-acre").is_none());
         assert!(parse_name("acre-anchor-notaword").is_none());
         assert!(parse_name("../../etc").is_none());
     }
@@ -477,7 +524,7 @@ mod tests {
         });
         let firsts: std::collections::HashSet<String> = (0..50)
             .map(|_| {
-                let (room, _) = r.open(Instant::now()).unwrap();
+                let (room, _) = r.open(Kind::Task, Instant::now()).unwrap();
                 room.name.split('-').next().unwrap().to_string()
             })
             .collect();
@@ -487,7 +534,7 @@ mod tests {
     #[test]
     fn the_relay_stamps_the_side_whatever_the_body_says() {
         let r = rooms();
-        let (room, _) = r.open(Instant::now()).unwrap();
+        let (room, _) = r.open(Kind::Task, Instant::now()).unwrap();
         room.post(
             Who::Guest,
             br#"{"from":"x","text":"hi","by":"host","seq":99}"#,
@@ -503,7 +550,7 @@ mod tests {
     #[test]
     fn a_message_without_a_from_or_not_an_object_is_refused() {
         let r = rooms();
-        let (room, _) = r.open(Instant::now()).unwrap();
+        let (room, _) = r.open(Kind::Task, Instant::now()).unwrap();
         let now = Instant::now();
         assert_eq!(
             room.post(Who::Guest, br#"{"text":"hi"}"#, now),
@@ -535,7 +582,7 @@ mod tests {
     #[test]
     fn the_backlog_keeps_the_newest_and_the_gap_shows() {
         let r = rooms();
-        let (room, _) = r.open(Instant::now()).unwrap();
+        let (room, _) = r.open(Kind::Task, Instant::now()).unwrap();
         let mut now = Instant::now();
         for i in 0..(BACKLOG + 10) {
             if i % 100 == 0 {
@@ -553,7 +600,7 @@ mod tests {
     #[test]
     fn a_flooded_room_refuses_until_the_window_turns() {
         let r = rooms();
-        let (room, _) = r.open(Instant::now()).unwrap();
+        let (room, _) = r.open(Kind::Task, Instant::now()).unwrap();
         let now = Instant::now();
         for _ in 0..SEND_BURST {
             room.post(Who::Guest, br#"{"from":"g"}"#, now).unwrap();
@@ -572,7 +619,7 @@ mod tests {
         let limits = Limits::default();
         let r = rooms();
         let t0 = Instant::now();
-        let (room, _) = r.open(t0).unwrap();
+        let (room, _) = r.open(Kind::Task, t0).unwrap();
         // A guest's messages do not keep it alive.
         room.post(Who::Guest, br#"{"from":"g"}"#, t0 + limits.room_idle / 2)
             .unwrap();
@@ -590,10 +637,40 @@ mod tests {
         let limits = Limits::default();
         let r = rooms();
         let t0 = Instant::now();
-        let (room, _) = r.open(t0).unwrap();
+        let (room, _) = r.open(Kind::Task, t0).unwrap();
         room.host_seen(t0 + limits.room_life - Duration::from_secs(1));
         r.reap(t0 + limits.room_life);
         assert_eq!(room.ended(), Some(Ended::TooOld));
+    }
+
+    #[test]
+    fn a_persistent_room_has_six_words_and_no_deadline() {
+        let limits = Limits::default();
+        let r = rooms();
+        let t0 = Instant::now();
+        let (room, _) = r.open(Kind::Persistent, t0).unwrap();
+        assert_eq!(room.name.split('-').count(), PERSISTENT_WORDS);
+        assert_eq!(parse_name(&room.name).as_deref(), Some(room.name.as_str()));
+        let late = t0 + limits.room_life + limits.room_idle * 10;
+        r.reap(late);
+        assert_eq!(room.ended(), None);
+        assert!(r.get(&room.name, late).is_some());
+        // It still ends when a side leaves, and is forgotten after its linger.
+        room.end(Ended::GuestLeft, late);
+        assert_eq!(r.reap(late + limits.room_linger), 1);
+    }
+
+    #[test]
+    fn a_task_room_and_a_persistent_room_live_side_by_side() {
+        let limits = Limits::default();
+        let r = rooms();
+        let t0 = Instant::now();
+        let (task, _) = r.open(Kind::Task, t0).unwrap();
+        let (kept, _) = r.open(Kind::Persistent, t0).unwrap();
+        r.reap(t0 + limits.room_idle);
+        assert_eq!(task.ended(), Some(Ended::HostSilent));
+        assert_eq!(kept.ended(), None);
+        assert_eq!(r.live(), 1);
     }
 
     #[test]
@@ -603,15 +680,15 @@ mod tests {
             ..Limits::default()
         });
         let now = Instant::now();
-        assert!(r.open(now).is_some());
-        assert!(r.open(now).is_some());
-        assert!(r.open(now).is_none());
+        assert!(r.open(Kind::Task, now).is_some());
+        assert!(r.open(Kind::Task, now).is_some());
+        assert!(r.open(Kind::Task, now).is_none());
     }
 
     #[test]
     fn an_ended_room_takes_no_message_and_keeps_its_first_reason() {
         let r = rooms();
-        let (room, _) = r.open(Instant::now()).unwrap();
+        let (room, _) = r.open(Kind::Task, Instant::now()).unwrap();
         assert!(room.end(Ended::GuestLeft, Instant::now()));
         assert!(!room.end(Ended::HostClosed, Instant::now()));
         assert_eq!(room.ended(), Some(Ended::GuestLeft));
@@ -624,7 +701,7 @@ mod tests {
     #[test]
     fn only_the_host_token_is_the_host() {
         let r = rooms();
-        let (room, host) = r.open(Instant::now()).unwrap();
+        let (room, host) = r.open(Kind::Task, Instant::now()).unwrap();
         assert!(room.is_host(&host));
         assert!(!room.is_host(&Token::mint()));
     }
@@ -632,7 +709,7 @@ mod tests {
     #[tokio::test]
     async fn a_waiting_receive_wakes_on_a_message() {
         let r = rooms();
-        let (room, _) = r.open(Instant::now()).unwrap();
+        let (room, _) = r.open(Kind::Task, Instant::now()).unwrap();
         let waiter = {
             let room = Arc::clone(&room);
             tokio::spawn(async move { room.wait(0, Duration::from_secs(5)).await })
@@ -650,7 +727,7 @@ mod tests {
     #[tokio::test]
     async fn a_waiting_receive_wakes_when_the_room_ends() {
         let r = rooms();
-        let (room, _) = r.open(Instant::now()).unwrap();
+        let (room, _) = r.open(Kind::Task, Instant::now()).unwrap();
         let waiter = {
             let room = Arc::clone(&room);
             tokio::spawn(async move { room.wait(0, Duration::from_secs(5)).await })

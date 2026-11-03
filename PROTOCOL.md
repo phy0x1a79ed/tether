@@ -217,13 +217,16 @@ refuses WebSockets then has no transport left. The door carries
 `/hold/{slot}/{token}` for the same reason. Without it the daemon's hold fails,
 and every session runs without resume, silently.
 
-Rooms join the family too. The door carries `/room` for the operator, and
-`/r/{name}` with `/send`, `/recv`, `/ws` and `/leave` for the guest. A name is
-three list words, lowercase and joined by hyphens, and `room::parse_name`
-accepts that shape and no other, so the door's pattern can match it exactly.
-Without these routes the how-to a guest is sent to answers `404`.
-`tether-relay/src/room.rs` owns the rest: who may do what, the limits, and the
-how-to text that is the guest's whole protocol.
+Rooms sit beside the family, not inside it. The edge serves them at its own
+root, so a link spells out its kind: `/tether/` is a machine, `/room/` a room.
+The door carries `POST /room` for the operator, and `/room/{name}` with
+`/send`, `/recv`, `/ws` and `/leave` for the guest, all forwarded with the path
+unchanged. A name is three list words for a task room and six for a persistent
+one, lowercase and joined by hyphens. `room::parse_name` accepts those two
+shapes and no other, so the door's pattern can match them exactly. Without
+these routes the how-to a guest is sent to answers `404`.
+`tether-relay/src/room.rs` owns the rest: who may do what, the two kinds and
+their deadlines, the limits, and the how-to text that is the guest's whole protocol.
 
 A door looser than the parser forwards malformed input the door exists to
 refuse. A door tighter than the parser turns a legitimate invite into a `404`

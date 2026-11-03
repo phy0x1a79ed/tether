@@ -115,19 +115,55 @@ async fn opening_a_room_needs_the_operator_bearer() {
 }
 
 #[tokio::test]
+async fn an_operator_opens_a_persistent_room_with_six_words_and_no_deadline() {
+    let r = relay(Limits::default()).await;
+    let auth = format!("Bearer {BEARER}");
+    let (status, body) = http(
+        r.addr,
+        "POST",
+        "/room",
+        &[("Authorization", &auth)],
+        r#"{"kind":"persistent"}"#,
+    )
+    .await;
+    assert_eq!(status, 200, "{body}");
+    let v = json(&body);
+    assert_eq!(v["kind"], "persistent");
+    assert!(v["idle_s"].is_null() && v["life_s"].is_null(), "{body}");
+    let name = v["name"].as_str().unwrap();
+    assert_eq!(name.split('-').count(), 6);
+    let (status, how_to) = guest(r.addr, "GET", &format!("/room/{name}"), "").await;
+    assert_eq!(status, 200);
+    assert!(how_to.contains(name));
+
+    let (status, _) = http(
+        r.addr,
+        "POST",
+        "/room",
+        &[("Authorization", &auth)],
+        r#"{"kind":"forever"}"#,
+    )
+    .await;
+    assert_eq!(status, 400);
+    let (_, body) = http(r.addr, "POST", "/room", &[("Authorization", &auth)], "").await;
+    assert_eq!(json(&body)["kind"], "task");
+    r.stop();
+}
+
+#[tokio::test]
 async fn a_guest_with_only_the_name_reads_the_how_to_and_talks_with_the_host() {
     let r = relay(Limits::default()).await;
     let room = open(r.addr).await;
     assert_eq!(room.name.split('-').count(), 3);
 
-    let (status, how_to) = guest(r.addr, "GET", &format!("/r/{}", room.name), "").await;
+    let (status, how_to) = guest(r.addr, "GET", &format!("/room/{}", room.name), "").await;
     assert_eq!(status, 200);
     assert!(how_to.contains("ROOM/recv?after="), "{how_to}");
 
     let (status, body) = guest(
         r.addr,
         "POST",
-        &format!("/r/{}/send", room.name),
+        &format!("/room/{}/send", room.name),
         r#"{"from":"visitor","text":"hello host"}"#,
     )
     .await;
@@ -138,7 +174,7 @@ async fn a_guest_with_only_the_name_reads_the_how_to_and_talks_with_the_host() {
         r.addr,
         &room,
         "GET",
-        &format!("/r/{}/recv?after=0", room.name),
+        &format!("/room/{}/recv?after=0", room.name),
         "",
     )
     .await;
@@ -153,11 +189,11 @@ async fn a_guest_with_only_the_name_reads_the_how_to_and_talks_with_the_host() {
         r.addr,
         &room,
         "POST",
-        &format!("/r/{}/send", room.name),
+        &format!("/room/{}/send", room.name),
         r#"{"from":"opal","text":"hello guest"}"#,
     )
     .await;
-    let (_, body) = guest(r.addr, "GET", &format!("/r/{}/recv?after=1", room.name), "").await;
+    let (_, body) = guest(r.addr, "GET", &format!("/room/{}/recv?after=1", room.name), "").await;
     let got = json(&body);
     assert_eq!(got["messages"][0]["text"], "hello guest");
     assert_eq!(got["messages"][0]["by"], "host");
@@ -169,14 +205,14 @@ async fn a_long_poll_answers_as_soon_as_the_other_side_speaks() {
     let r = relay(Limits::default()).await;
     let room = open(r.addr).await;
     let addr = r.addr;
-    let path = format!("/r/{}/recv?after=0&wait=20", room.name);
+    let path = format!("/room/{}/recv?after=0&wait=20", room.name);
     let waiting = tokio::spawn(async move { guest(addr, "GET", &path, "").await });
     tokio::time::sleep(Duration::from_millis(100)).await;
     host(
         r.addr,
         &room,
         "POST",
-        &format!("/r/{}/send", room.name),
+        &format!("/room/{}/send", room.name),
         r#"{"from":"opal","text":"now"}"#,
     )
     .await;
@@ -197,12 +233,12 @@ async fn a_guest_on_a_websocket_hears_and_speaks() {
         r.addr,
         &room,
         "POST",
-        &format!("/r/{}/send", room.name),
+        &format!("/room/{}/send", room.name),
         r#"{"from":"opal","text":"before you came"}"#,
     )
     .await;
 
-    let (mut ws, _) = connect_async(format!("ws://{}/r/{}/ws?after=0", r.addr, room.name))
+    let (mut ws, _) = connect_async(format!("ws://{}/room/{}/ws?after=0", r.addr, room.name))
         .await
         .expect("the guest socket should open");
     let first = next_text(&mut ws).await;
@@ -221,7 +257,7 @@ async fn a_guest_on_a_websocket_hears_and_speaks() {
         r.addr,
         &room,
         "GET",
-        &format!("/r/{}/recv?after=1", room.name),
+        &format!("/room/{}/recv?after=1", room.name),
         "",
     )
     .await;
@@ -231,7 +267,7 @@ async fn a_guest_on_a_websocket_hears_and_speaks() {
         r.addr,
         &room,
         "POST",
-        &format!("/r/{}/leave", room.name),
+        &format!("/room/{}/leave", room.name),
         "",
     )
     .await;
@@ -244,7 +280,7 @@ async fn a_guest_on_a_websocket_hears_and_speaks() {
 async fn the_host_on_a_websocket_is_stamped_host() {
     let r = relay(Limits::default()).await;
     let room = open(r.addr).await;
-    let mut request = format!("ws://{}/r/{}/ws", r.addr, room.name)
+    let mut request = format!("ws://{}/room/{}/ws", r.addr, room.name)
         .into_client_request()
         .unwrap();
     request.headers_mut().insert(
@@ -283,7 +319,7 @@ async fn a_guest_leaving_ends_the_room_for_both_and_the_name_then_stops_answerin
     let r = relay(limits).await;
     let room = open(r.addr).await;
 
-    let (status, body) = guest(r.addr, "POST", &format!("/r/{}/leave", room.name), "").await;
+    let (status, body) = guest(r.addr, "POST", &format!("/room/{}/leave", room.name), "").await;
     assert_eq!(status, 200);
     assert_eq!(json(&body)["ended"], "the guest left");
 
@@ -291,7 +327,7 @@ async fn a_guest_leaving_ends_the_room_for_both_and_the_name_then_stops_answerin
         r.addr,
         &room,
         "GET",
-        &format!("/r/{}/recv?after=0&wait=10", room.name),
+        &format!("/room/{}/recv?after=0&wait=10", room.name),
         "",
     )
     .await;
@@ -302,7 +338,7 @@ async fn a_guest_leaving_ends_the_room_for_both_and_the_name_then_stops_answerin
         r.addr,
         &room,
         "POST",
-        &format!("/r/{}/send", room.name),
+        &format!("/room/{}/send", room.name),
         r#"{"from":"opal"}"#,
     )
     .await;
@@ -310,7 +346,7 @@ async fn a_guest_leaving_ends_the_room_for_both_and_the_name_then_stops_answerin
 
     tokio::time::sleep(Duration::from_millis(300)).await;
     r.relay.rooms.reap(std::time::Instant::now());
-    let (status, _) = guest(r.addr, "GET", &format!("/r/{}", room.name), "").await;
+    let (status, _) = guest(r.addr, "GET", &format!("/room/{}", room.name), "").await;
     assert_eq!(status, 404);
     r.stop();
 }
@@ -324,7 +360,7 @@ async fn a_room_whose_host_goes_quiet_ends() {
     let r = relay(limits).await;
     let room = open(r.addr).await;
     tokio::time::sleep(Duration::from_millis(300)).await;
-    let (status, body) = guest(r.addr, "GET", &format!("/r/{}/recv?after=0", room.name), "").await;
+    let (status, body) = guest(r.addr, "GET", &format!("/room/{}/recv?after=0", room.name), "").await;
     assert_eq!(status, 200);
     assert_eq!(json(&body)["ended"], "the host went quiet");
     r.stop();
@@ -334,8 +370,8 @@ async fn a_room_whose_host_goes_quiet_ends() {
 async fn an_unknown_name_and_a_wrong_host_token_look_like_a_path_that_is_not_there() {
     let r = relay(Limits::default()).await;
     let room = open(r.addr).await;
-    let (unknown, unknown_body) = guest(r.addr, "GET", "/r/acre-anchor-kettle", "").await;
-    let (nonsense, nonsense_body) = guest(r.addr, "GET", "/r/not-a-room", "").await;
+    let (unknown, unknown_body) = guest(r.addr, "GET", "/room/acre-anchor-kettle", "").await;
+    let (nonsense, nonsense_body) = guest(r.addr, "GET", "/room/not-a-room", "").await;
     let (missing, missing_body) = guest(r.addr, "GET", "/no/such/path", "").await;
     assert_eq!((unknown, nonsense, missing), (404, 404, 404));
     assert_eq!(unknown_body, missing_body);
@@ -345,7 +381,7 @@ async fn an_unknown_name_and_a_wrong_host_token_look_like_a_path_that_is_not_the
     let (status, body) = http(
         r.addr,
         "POST",
-        &format!("/r/{}/leave", room.name),
+        &format!("/room/{}/leave", room.name),
         &[("Authorization", &wrong)],
         "",
     )
@@ -370,7 +406,7 @@ async fn a_guesser_out_of_budget_is_refused_for_every_name_alike() {
     let room = open(r.addr).await;
     let mut guesses = 0;
     loop {
-        let (status, _) = guest(r.addr, "GET", "/r/acre-anchor-kettle/recv", "").await;
+        let (status, _) = guest(r.addr, "GET", "/room/acre-anchor-kettle/recv", "").await;
         if status == 429 {
             break;
         }
@@ -378,7 +414,7 @@ async fn a_guesser_out_of_budget_is_refused_for_every_name_alike() {
         guesses += 1;
         assert!(guesses <= 3, "the budget should run out");
     }
-    let (status, _) = guest(r.addr, "GET", &format!("/r/{}/recv", room.name), "").await;
+    let (status, _) = guest(r.addr, "GET", &format!("/room/{}/recv", room.name), "").await;
     assert_eq!(
         status, 429,
         "a live name must answer like a miss once the budget is gone"
@@ -388,7 +424,7 @@ async fn a_guesser_out_of_budget_is_refused_for_every_name_alike() {
     let (status, _) = http(
         r.addr,
         "GET",
-        &format!("/r/{}/recv", room.name),
+        &format!("/room/{}/recv", room.name),
         &[("cf-connecting-ip", "192.0.2.1")],
         "",
     )
@@ -409,7 +445,7 @@ async fn a_guest_in_a_live_room_does_not_spend_its_budget_talking() {
         let (status, _) = guest(
             r.addr,
             "POST",
-            &format!("/r/{}/send", room.name),
+            &format!("/room/{}/send", room.name),
             &format!(r#"{{"from":"visitor","text":"{i}"}}"#),
         )
         .await;
@@ -425,7 +461,7 @@ async fn a_bad_message_is_refused_with_a_reason() {
     let (status, body) = guest(
         r.addr,
         "POST",
-        &format!("/r/{}/send", room.name),
+        &format!("/room/{}/send", room.name),
         r#"{"text":"no from"}"#,
     )
     .await;

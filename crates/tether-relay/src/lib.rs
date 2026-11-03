@@ -61,7 +61,7 @@ pub mod token;
 use crate::config::{Config, MAX_MESSAGE};
 use crate::poll::{Polls, Recv, Sent};
 use crate::rate::Limiter;
-use crate::room::{Room, Rooms, SendError, Who, MAX_ROOM_MESSAGE};
+use crate::room::{Kind as RoomKind, Room, Rooms, SendError, Who, MAX_ROOM_MESSAGE};
 use crate::session::{IssueError, JoinError, RestoreError, Sessions};
 use crate::token::{secret_eq, Token};
 
@@ -156,16 +156,18 @@ pub fn router(relay: Arc<Relay>) -> Router {
         // `/bin` serves opaque bytes.
         .route("/win", get(launcher_windows))
         .route("/bin/{name}", get(binary))
-        // Rooms, for an agent of another system. See [`room`].
+        // Rooms, for an agent of another system. See [`room`]. The edge serves
+        // them at its root, beside its `/tether` mount, so a link spells out
+        // its kind.
         .route("/room", post(room_open))
-        .route("/r/{name}", get(room_how_to))
+        .route("/room/{name}", get(room_how_to))
         .route(
-            "/r/{name}/send",
+            "/room/{name}/send",
             post(room_send).layer(DefaultBodyLimit::max(MAX_ROOM_MESSAGE)),
         )
-        .route("/r/{name}/recv", get(room_recv))
-        .route("/r/{name}/ws", get(room_ws))
-        .route("/r/{name}/leave", post(room_leave))
+        .route("/room/{name}/recv", get(room_recv))
+        .route("/room/{name}/ws", get(room_ws))
+        .route("/room/{name}/leave", post(room_leave))
         // A path that is not here answers exactly as a refusal does.
         .fallback(|| async { nothing_here() })
         .with_state(relay)
@@ -530,20 +532,50 @@ fn serve_asset(
     }
 }
 
+/// What an operator may send to `/room`. An empty body opens a task room.
+#[derive(serde::Deserialize, Default)]
+struct OpenRoom {
+    #[serde(default)]
+    kind: Option<String>,
+}
+
 /// Open a room. Operator only, like `/issue`.
-async fn room_open(State(relay): State<Arc<Relay>>, headers: HeaderMap) -> Response {
+async fn room_open(State(relay): State<Arc<Relay>>, headers: HeaderMap, body: Bytes) -> Response {
     if !relay.operator(&headers) {
         return nothing_here();
     }
-    match relay.rooms.open(Instant::now()) {
+    let asked: OpenRoom = if body.iter().all(u8::is_ascii_whitespace) {
+        OpenRoom::default()
+    } else {
+        match serde_json::from_slice(&body) {
+            Ok(asked) => asked,
+            Err(_) => return (StatusCode::BAD_REQUEST, "the body is not JSON\n").into_response(),
+        }
+    };
+    let kind = match asked.kind.as_deref() {
+        None => RoomKind::Task,
+        Some(k) => match RoomKind::parse(k) {
+            Some(kind) => kind,
+            None => {
+                return (StatusCode::BAD_REQUEST, "kind is task or persistent\n").into_response()
+            }
+        },
+    };
+    match relay.rooms.open(kind, Instant::now()) {
         Some((room, host)) => {
             // The name is a capability, like a seat token, so it is not logged.
-            log::info(format_args!("opened a room"));
+            log::info(format_args!("opened a {} room", kind.as_str()));
+            let limits = &relay.config.limits;
+            let (idle_s, life_s) = match kind {
+                RoomKind::Task => (Some(limits.room_idle.as_secs()), Some(limits.room_life.as_secs())),
+                RoomKind::Persistent => (None, None),
+            };
             Json(json!({
                 "name": room.name,
+                "kind": kind.as_str(),
                 "host": host.to_hex(),
-                "idle_s": relay.config.limits.room_idle.as_secs(),
-                "life_s": relay.config.limits.room_life.as_secs(),
+                "idle_s": idle_s,
+                "life_s": life_s,
             }))
             .into_response()
         }

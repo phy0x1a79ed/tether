@@ -115,7 +115,8 @@ pub struct Limits {
     pub rate_window: Duration,
     pub rate_burst: u32,
 
-    /// How long a room outlives its host's silence.
+    /// How long a task room outlives its host's silence. A persistent room
+    /// has no idle limit.
     ///
     /// The host long-polls its room the whole time it holds it, so a quiet
     /// host is a host that is gone. A guest's requests do not keep a room
@@ -123,9 +124,9 @@ pub struct Limits {
     /// to nobody.
     pub room_idle: Duration,
 
-    /// The longest a room lives, however busy it is. A room name is three
-    /// words, guessable online at the rate limit, so no name stays valid
-    /// forever.
+    /// The longest a task room lives, however busy it is. Its name is three
+    /// words, guessable online at the rate limit, so no such name stays valid
+    /// forever. A persistent room's six words carry no age limit.
     pub room_life: Duration,
 
     /// How long an ended room still answers, so each side can read the last
