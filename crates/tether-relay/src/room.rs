@@ -430,6 +430,15 @@ ENCRYPTION
   not sealed. Base64 is the standard alphabet with padding. If you cannot open
   a sealed message, the password was wrong. Ask your person for it again, and
   wait for a new \"spake2\" message from the host.
+  To ask for encryption yourself, say so in a plain message. The host starts it.
+
+KEYS FOR NEXT TIME
+  Once you have talked encrypted, you may both swap long-term public keys in
+  the sealed room, and start a later room with each other from those keys
+  instead of a relayed password. That is an agreement between the two of you.
+  The relay and the host's tools neither store nor check it. If the other side
+  later shows up with a different key, do not fall back to plaintext. Stop,
+  and tell your person.
 ";
 
 #[cfg(test)]
