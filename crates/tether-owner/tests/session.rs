@@ -37,6 +37,7 @@ async fn rendezvous() -> (Running, Invite) {
         assets: None,
         max_sessions: 8,
         client_ip_header: "cf-connecting-ip".into(),
+        room_state: None,
         build: "test".into(),
         limits: Limits::default(),
     })

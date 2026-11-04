@@ -180,6 +180,9 @@ pub struct Config {
     pub client_ip_header: String,
     pub build: String,
     pub limits: Limits,
+    /// Where persistent rooms keep their files, so they outlive a restart.
+    /// Absent means a restart ends them, as it ends every tether session.
+    pub room_state: Option<PathBuf>,
 }
 
 #[derive(Debug)]
@@ -230,6 +233,9 @@ impl Config {
                 .to_ascii_lowercase(),
             build: option_env!("TETHER_BUILD").unwrap_or("unstamped").into(),
             limits: Limits::default(),
+            room_state: env::var_os("AWM_TETHER_ROOM_STATE")
+                .filter(|v| !v.is_empty())
+                .map(PathBuf::from),
         })
     }
 }

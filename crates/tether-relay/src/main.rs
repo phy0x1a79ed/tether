@@ -1,10 +1,11 @@
 //! Run the relay until something tells it to stop.
 //!
-//! Stopping is the whole of the cleanup story. Every session lives in memory,
-//! so the process exiting ends all of them and there is nothing to reconcile on
-//! the way back up. A relay that could resume a session across a restart would
-//! be a relay with a session on disk, and that is a thing this tool refuses to
-//! have.
+//! Stopping is the whole of the cleanup story. Every session and every task
+//! room lives in memory, so the process exiting ends all of them and there is
+//! nothing to reconcile on the way back up. A relay that could resume a tether
+//! session across a restart would be a relay with a session on disk, and that
+//! is a thing this tool refuses to have. A persistent room is the one
+//! exception, and its file holds no message (see [`tether_relay::room`]).
 
 use std::process::ExitCode;
 

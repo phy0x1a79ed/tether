@@ -17,12 +17,17 @@ use tokio_tungstenite::tungstenite::Message;
 const BEARER: &str = "a-test-bearer-nothing-guards";
 
 async fn relay(limits: Limits) -> Running {
+    relay_with_state(limits, None).await
+}
+
+async fn relay_with_state(limits: Limits, room_state: Option<std::path::PathBuf>) -> Running {
     start(Config {
         port: 0,
         issue_token: BEARER.into(),
         assets: None,
         max_sessions: 64,
         client_ip_header: "cf-connecting-ip".into(),
+        room_state,
         build: "test".into(),
         limits,
     })
@@ -148,6 +153,48 @@ async fn an_operator_opens_a_persistent_room_with_six_words_and_no_deadline() {
     let (_, body) = http(r.addr, "POST", "/room", &[("Authorization", &auth)], "").await;
     assert_eq!(json(&body)["kind"], "task");
     r.stop();
+}
+
+#[tokio::test]
+async fn a_persistent_room_comes_back_after_a_relay_restart() {
+    let dir = std::env::temp_dir().join(format!("tether-rooms-restart-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    let r = relay_with_state(Limits::default(), Some(dir.clone())).await;
+    let auth = format!("Bearer {BEARER}");
+    let (_, body) = http(
+        r.addr,
+        "POST",
+        "/room",
+        &[("Authorization", &auth)],
+        r#"{"kind":"persistent"}"#,
+    )
+    .await;
+    let v = json(&body);
+    let room = Opened {
+        name: v["name"].as_str().unwrap().into(),
+        host: v["host"].as_str().unwrap().into(),
+    };
+    let task = open(r.addr).await;
+    let send = format!("/room/{}/send", room.name);
+    let (_, body) = guest(r.addr, "POST", &send, r#"{"from":"g","text":"before"}"#).await;
+    let before = json(&body)["seq"].as_u64().unwrap();
+    r.stop();
+
+    let r = relay_with_state(Limits::default(), Some(dir.clone())).await;
+    let (status, _) = guest(r.addr, "GET", &format!("/room/{}", task.name), "").await;
+    assert_eq!(status, 404, "a task room ends with the relay");
+    let recv = format!("/room/{}/recv?after={before}", room.name);
+    let (status, body) = host(r.addr, &room, "GET", &recv, "").await;
+    assert_eq!(status, 200, "the host token still holds: {body}");
+    assert!(json(&body)["ended"].is_null());
+    let (_, body) = host(r.addr, &room, "POST", &send, r#"{"from":"opal","text":"after"}"#).await;
+    assert!(json(&body)["seq"].as_u64().unwrap() > before);
+    let (_, body) = guest(r.addr, "GET", &recv, "").await;
+    let got = json(&body);
+    assert_eq!(got["messages"][0]["text"], "after");
+    assert_eq!(got["messages"][0]["by"], "host");
+    r.stop();
+    let _ = std::fs::remove_dir_all(&dir);
 }
 
 #[tokio::test]

@@ -19,6 +19,7 @@ getrandom = { workspace = true }
 hex = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
+sha2 = { workspace = true }
 subtle = { workspace = true }
 tether-proto = { workspace = true }
 tokio = { workspace = true }

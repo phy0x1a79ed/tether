@@ -86,6 +86,7 @@ async fn stage() -> Stage {
         assets: None,
         max_sessions: 4,
         client_ip_header: "cf-connecting-ip".into(),
+        room_state: None,
         build: "test".into(),
         limits: Limits::default(),
     })

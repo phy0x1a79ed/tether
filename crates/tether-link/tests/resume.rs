@@ -24,6 +24,7 @@ fn config(port: u16) -> Config {
         assets: None,
         max_sessions: 64,
         client_ip_header: "cf-connecting-ip".into(),
+        room_state: None,
         build: "test".into(),
         limits: Limits::default(),
     }

@@ -11,6 +11,7 @@
 
 use std::fmt;
 
+use sha2::{Digest as _, Sha256};
 use subtle::ConstantTimeEq;
 
 const LEN: usize = 16;
@@ -41,7 +42,40 @@ impl Token {
     pub fn to_hex(self) -> String {
         hex::encode(self.0)
     }
+
+    /// What a persistent room keeps on disk in place of its host token.
+    pub fn digest(self) -> Digest {
+        Digest(Sha256::digest(self.0).into())
+    }
 }
+
+/// The SHA-256 of a token. A file that holds one cannot be used to act as the
+/// token's holder.
+#[derive(Clone, Copy)]
+pub struct Digest([u8; 32]);
+
+impl Digest {
+    pub fn parse(s: &str) -> Option<Self> {
+        if s.len() != 64 {
+            return None;
+        }
+        let mut bytes = [0u8; 32];
+        hex::decode_to_slice(s, &mut bytes).ok()?;
+        Some(Self(bytes))
+    }
+
+    pub fn to_hex(self) -> String {
+        hex::encode(self.0)
+    }
+}
+
+impl PartialEq for Digest {
+    fn eq(&self, other: &Self) -> bool {
+        self.0.ct_eq(&other.0).into()
+    }
+}
+
+impl Eq for Digest {}
 
 impl PartialEq for Token {
     fn eq(&self, other: &Self) -> bool {
@@ -94,6 +128,15 @@ mod tests {
         assert!(Token::parse(&"z".repeat(32)).is_none());
         assert!(Token::parse(&"0".repeat(33)).is_none());
         assert!(Token::parse("../../etc/passwd").is_none());
+    }
+
+    #[test]
+    fn a_digest_survives_a_round_trip_and_matches_only_its_token() {
+        let t = Token::mint();
+        let d = Digest::parse(&t.digest().to_hex()).unwrap();
+        assert!(d == t.digest());
+        assert!(d != Token::mint().digest());
+        assert!(!t.digest().to_hex().contains(&t.to_hex()));
     }
 
     #[test]

@@ -23,6 +23,15 @@
 //! other field. A room that encrypts carries sealed text it has no key for, the
 //! same as a tether.
 //!
+//! A persistent room also keeps one file in the state directory, when the relay
+//! has one, so that it outlives a relay restart. The file holds the name, the
+//! digest of the host token and a sequence floor, never a message: a room that
+//! encrypts leaves nothing on disk that its key would open, and a room that
+//! does not leaves nothing a reader of the disk could not learn by joining.
+//! The backlog does not survive a restart. A restored room numbers its next
+//! message above every number it gave out before, so a reader's cursor stays
+//! valid and the gap shows in the sequence numbers.
+//!
 //! # Two kinds
 //!
 //! A task room is held for one task. Its name is three words, about 30 bits,
@@ -33,20 +42,23 @@
 //! reaches [`Limits::room_life`].
 //!
 //! A persistent room serves a long-lived link and outlives any one task. It
-//! has neither deadline, so it ends only when a side leaves or the relay
-//! stops. Its name is six words, about 60 bits, because nothing bounds how
+//! has neither deadline, so it ends only when a side leaves. Its name is six words, about 60 bits, because nothing bounds how
 //! long a guesser has, and a persistent link is pasted, never typed.
 
 use std::collections::{HashMap, VecDeque};
+use std::fs;
+use std::io::{self, Write};
+use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
-use serde_json::{Map, Value};
+use serde_json::{json, Map, Value};
 use tether_proto::words::WORDS;
 use tokio::sync::Notify;
 
 use crate::config::Limits;
-use crate::token::Token;
+use crate::log;
+use crate::token::{Digest, Token};
 
 /// How many words a task room's name has.
 pub const NAME_WORDS: usize = 3;
@@ -101,6 +113,11 @@ const BACKLOG_BYTES: usize = 1024 * 1024;
 /// How many messages one room accepts in [`SEND_WINDOW`].
 const SEND_BURST: u32 = 120;
 const SEND_WINDOW: Duration = Duration::from_secs(60);
+
+/// How many sequence numbers a persistent room reserves on disk at a time.
+/// The file is rewritten once per this many messages, before the first of
+/// them is numbered.
+const SEQ_RESERVE: u64 = 64;
 
 /// The longest a receive may wait for a message before it answers empty.
 ///
@@ -164,7 +181,10 @@ pub struct Batch {
 pub struct Room {
     pub name: String,
     pub kind: Kind,
-    host: Token,
+    host: Digest,
+    /// The room's file in the state directory. Only a persistent room on a
+    /// relay with a state directory has one.
+    file: Option<PathBuf>,
     state: Mutex<State>,
     changed: Notify,
 }
@@ -173,6 +193,9 @@ struct State {
     backlog: VecDeque<(u64, Value, usize)>,
     bytes: usize,
     last: u64,
+    /// The highest sequence number the room's file allows. Only read when the
+    /// room has a file.
+    reserved: u64,
     born: Instant,
     host_seen: Instant,
     ended: Option<(Ended, Instant)>,
@@ -181,8 +204,54 @@ struct State {
 }
 
 impl Room {
+    fn new(name: String, kind: Kind, host: Digest, file: Option<PathBuf>, last: u64,
+           now: Instant) -> Self {
+        Room {
+            name,
+            kind,
+            host,
+            file,
+            state: Mutex::new(State {
+                backlog: VecDeque::new(),
+                bytes: 0,
+                last,
+                reserved: last,
+                born: now,
+                host_seen: now,
+                ended: None,
+                window_start: now,
+                window_used: 0,
+            }),
+            changed: Notify::new(),
+        }
+    }
+
     pub fn is_host(&self, token: &Token) -> bool {
-        self.host == *token
+        self.host == token.digest()
+    }
+
+    /// Write the room's file with a sequence floor of `reserved`.
+    fn save(&self, reserved: u64) {
+        let Some(file) = &self.file else { return };
+        let record = json!({
+            "name": self.name,
+            "kind": self.kind.as_str(),
+            "host": self.host.to_hex(),
+            "reserved": reserved,
+        });
+        if let Err(e) = write_private(file, record.to_string().as_bytes()) {
+            log::warn(format_args!("could not save a persistent room: {e}"));
+        }
+    }
+
+    fn forget(&self) {
+        if let Some(file) = &self.file {
+            if let Err(e) = fs::remove_file(file) {
+                if e.kind() != io::ErrorKind::NotFound {
+                    log::warn(format_args!("could not remove a persistent room's file: {e}"));
+                }
+            }
+        }
     }
 
     /// Note that the host is still there, which is what keeps a room alive.
@@ -221,6 +290,10 @@ impl Room {
 
         st.last += 1;
         let seq = st.last;
+        if self.file.is_some() && seq > st.reserved {
+            st.reserved = seq + SEQ_RESERVE;
+            self.save(st.reserved);
+        }
         message.insert("seq".into(), seq.into());
         message.insert("by".into(), who.as_str().into());
         st.bytes += body.len();
@@ -277,6 +350,7 @@ impl Room {
         }
         st.ended = Some((why, now));
         drop(st);
+        self.forget();
         self.changed.notify_waiters();
         true
     }
@@ -295,6 +369,8 @@ impl Room {
 pub struct Rooms {
     inner: Mutex<HashMap<String, Arc<Room>>>,
     limits: Limits,
+    /// Where persistent rooms keep their files, if anywhere.
+    state: Option<PathBuf>,
 }
 
 impl Rooms {
@@ -302,7 +378,36 @@ impl Rooms {
         Self {
             inner: Mutex::default(),
             limits,
+            state: None,
         }
+    }
+
+    /// Rooms whose persistent rooms keep a file in `state`, with every
+    /// persistent room a file there names already open again.
+    pub fn with_state(limits: Limits, state: Option<PathBuf>) -> Self {
+        let rooms = Self {
+            inner: Mutex::default(),
+            limits,
+            state,
+        };
+        if let Some(dir) = &rooms.state {
+            match restore(dir, Instant::now()) {
+                Ok(found) => {
+                    if !found.is_empty() {
+                        log::info(format_args!("restored {} persistent room(s)", found.len()));
+                    }
+                    let mut table = rooms.inner.lock().unwrap();
+                    for room in found {
+                        table.insert(room.name.clone(), Arc::new(room));
+                    }
+                }
+                Err(e) => log::warn(format_args!(
+                    "could not read the room state at {}: {e}",
+                    dir.display()
+                )),
+            }
+        }
+        rooms
     }
 
     /// Open a room with a fresh name. `None` when [`Limits::max_rooms`] are
@@ -320,22 +425,12 @@ impl Rooms {
             }
         };
         let host = Token::mint();
-        let room = Arc::new(Room {
-            name: name.clone(),
-            kind,
-            host,
-            state: Mutex::new(State {
-                backlog: VecDeque::new(),
-                bytes: 0,
-                last: 0,
-                born: now,
-                host_seen: now,
-                ended: None,
-                window_start: now,
-                window_used: 0,
-            }),
-            changed: Notify::new(),
-        });
+        let file = match (&self.state, kind) {
+            (Some(dir), Kind::Persistent) => Some(dir.join(format!("{name}.json"))),
+            _ => None,
+        };
+        let room = Arc::new(Room::new(name.clone(), kind, host.digest(), file, 0, now));
+        room.save(0);
         table.insert(name, Arc::clone(&room));
         Some((room, host))
     }
@@ -386,6 +481,75 @@ impl Rooms {
         });
         before - table.len()
     }
+}
+
+/// The persistent rooms whose files are in `dir`. A file that does not read
+/// as one is left alone and named in the log.
+fn restore(dir: &Path, now: Instant) -> io::Result<Vec<Room>> {
+    let entries = match fs::read_dir(dir) {
+        Ok(entries) => entries,
+        Err(e) if e.kind() == io::ErrorKind::NotFound => return Ok(Vec::new()),
+        Err(e) => return Err(e),
+    };
+    let mut found = Vec::new();
+    for entry in entries {
+        let path = entry?.path();
+        if path.extension().and_then(|e| e.to_str()) != Some("json") {
+            continue;
+        }
+        match read_room(&path) {
+            Some((name, host, reserved)) => {
+                // Numbered from the floor, so no number is given out twice.
+                let room = Room::new(name, Kind::Persistent, host, Some(path), reserved, now);
+                found.push(room);
+            }
+            None => log::warn(format_args!(
+                "skipped {}: not a persistent room's file",
+                path.display()
+            )),
+        }
+    }
+    Ok(found)
+}
+
+fn read_room(path: &Path) -> Option<(String, Digest, u64)> {
+    let record: Value = serde_json::from_slice(&fs::read(path).ok()?).ok()?;
+    let name = parse_name(record.get("name")?.as_str()?)?;
+    if name.split('-').count() != PERSISTENT_WORDS
+        || record.get("kind")?.as_str()? != Kind::Persistent.as_str()
+        || path.file_stem()?.to_str()? != name
+    {
+        return None;
+    }
+    let host = Digest::parse(record.get("host")?.as_str()?)?;
+    let reserved = record.get("reserved")?.as_u64()?;
+    Some((name, host, reserved))
+}
+
+/// Replace `path` with `bytes`, readable by this user alone. The new file is
+/// written beside it and renamed over it, so a crash leaves the old or the new.
+fn write_private(path: &Path, bytes: &[u8]) -> io::Result<()> {
+    let dir = path.parent().ok_or(io::ErrorKind::InvalidInput)?;
+    let mut builder = fs::DirBuilder::new();
+    builder.recursive(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::DirBuilderExt;
+        builder.mode(0o700);
+    }
+    builder.create(dir)?;
+    let tmp = path.with_extension("json.tmp");
+    let mut options = fs::OpenOptions::new();
+    options.write(true).create(true).truncate(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        options.mode(0o600);
+    }
+    let mut file = options.open(&tmp)?;
+    file.write_all(bytes)?;
+    file.sync_all()?;
+    fs::rename(&tmp, path)
 }
 
 /// `words` random words from the tether list, joined by hyphens so the name
@@ -671,6 +835,74 @@ mod tests {
         assert_eq!(task.ended(), Some(Ended::HostSilent));
         assert_eq!(kept.ended(), None);
         assert_eq!(r.live(), 1);
+    }
+
+    fn state_dir(tag: &str) -> PathBuf {
+        let dir = std::env::temp_dir().join(format!(
+            "tether-room-state-{tag}-{}",
+            Token::mint().to_hex()
+        ));
+        let _ = fs::remove_dir_all(&dir);
+        dir
+    }
+
+    #[test]
+    fn a_persistent_room_outlives_a_restart_and_its_file_holds_no_message() {
+        let dir = state_dir("restart");
+        let t0 = Instant::now();
+        let before = Rooms::with_state(Limits::default(), Some(dir.clone()));
+        let (kept, host) = before.open(Kind::Persistent, t0).unwrap();
+        let (task, _) = before.open(Kind::Task, t0).unwrap();
+        let mut last = 0;
+        for i in 0..(SEQ_RESERVE + 3) {
+            let body = format!(r#"{{"from":"h","text":"plain-{i}","sealed":"c2VhbGVk"}}"#);
+            last = kept.post(Who::Host, body.as_bytes(), t0).unwrap();
+        }
+        let files: Vec<_> = fs::read_dir(&dir).unwrap().map(|e| e.unwrap().path()).collect();
+        assert_eq!(files.len(), 1, "{files:?}");
+        let text = fs::read_to_string(&files[0]).unwrap();
+        for needle in ["plain-", "c2VhbGVk", "sealed", &host.to_hex()] {
+            assert!(!text.contains(needle), "{needle} in {text}");
+        }
+        drop(before);
+
+        let after = Rooms::with_state(Limits::default(), Some(dir.clone()));
+        let back = after.get(&kept.name, t0).expect("the persistent room is back");
+        assert_eq!(back.kind, Kind::Persistent);
+        assert!(back.is_host(&host));
+        assert!(!back.is_host(&Token::mint()));
+        assert!(after.get(&task.name, t0).is_none(), "a task room ends with the relay");
+        let batch = back.read(last);
+        assert!(batch.messages.is_empty() && batch.ended.is_none());
+        let seq = back.post(Who::Guest, br#"{"from":"g"}"#, t0).unwrap();
+        assert!(seq > last, "{seq} after {last}");
+        assert_eq!(back.read(last).messages[0]["seq"], seq);
+
+        back.end(Ended::GuestLeft, t0);
+        assert_eq!(fs::read_dir(&dir).unwrap().count(), 0);
+        let again = Rooms::with_state(Limits::default(), Some(dir.clone()));
+        assert!(again.get(&kept.name, t0).is_none());
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_file_that_is_not_a_persistent_room_is_skipped() {
+        let dir = state_dir("skip");
+        fs::create_dir_all(&dir).unwrap();
+        fs::write(dir.join("acre-anchor-kettle.json"),
+                  r#"{"name":"acre-anchor-kettle","kind":"persistent","host":"00","reserved":1}"#)
+            .unwrap();
+        fs::write(dir.join("junk.json"), "not json").unwrap();
+        let rooms = Rooms::with_state(Limits::default(), Some(dir.clone()));
+        assert_eq!(rooms.live(), 0);
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn without_a_state_directory_nothing_is_written() {
+        let r = rooms();
+        let (room, _) = r.open(Kind::Persistent, Instant::now()).unwrap();
+        assert!(room.file.is_none());
     }
 
     #[test]

@@ -368,3 +368,11 @@ it there. The only record of a finished session is a held slot's tombstone,
 which lasts the window. The log records that a slot was issued, held and
 released, and which leg of a pairing ended first and how. It says nothing else
 about the session.
+
+A persistent room is the one thing on disk, and only when `AWM_TETHER_ROOM_STATE`
+names a directory. Each one keeps a file there with its name, the SHA-256 of its
+host token and a sequence floor. No message is written, so an encrypted room
+leaves nothing its key would open. After a restart the room answers again with
+an empty backlog, and its next message is numbered above every one it gave out,
+so a cursor from before the restart stays valid. A task room still ends with the
+relay.

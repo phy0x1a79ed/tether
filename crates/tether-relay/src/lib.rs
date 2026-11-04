@@ -88,7 +88,10 @@ impl Relay {
         Self {
             sessions,
             polls: Arc::default(),
-            rooms: Arc::new(Rooms::new(config.limits.clone())),
+            rooms: Arc::new(Rooms::with_state(
+                config.limits.clone(),
+                config.room_state.clone(),
+            )),
             limiter,
             config,
             started: Instant::now(),
