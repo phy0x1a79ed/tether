@@ -185,6 +185,8 @@ pub struct State {
     pub resumable: bool,
     /// The gap in progress: when it started, why, and when it ends the session.
     pub gap: Option<(Instant, String, SystemTime)>,
+    /// Why the gap's last failed redial failed, when one has.
+    pub redial: Option<String>,
     /// Gaps this session has come back from.
     pub resumes: u32,
     pub ended: Option<String>,
@@ -207,6 +209,7 @@ impl State {
             last_said: None,
             resumable: false,
             gap: None,
+            redial: None,
             resumes: 0,
             ended: None,
             ended_at: None,
@@ -230,6 +233,7 @@ impl State {
             "reconnecting": self.gap.as_ref().map(|(since, why, until)| json!({
                 "since_s": since.elapsed().as_secs(),
                 "why": why,
+                "redial_failed": self.redial,
                 "gives_up_in_s": until.duration_since(SystemTime::now()).unwrap_or_default().as_secs(),
                 "gives_up_at_ms": unix_ms(*until),
             })),
@@ -745,8 +749,19 @@ async fn carry(link: &mut Resumable, track: &Track, rx: &mut mpsc::Receiver<Comm
                         if let Ok(mut s) = track.state.lock() {
                             s.phase = Phase::Reconnecting;
                             s.gap = Some((Instant::now(), why.clone(), gives_up_at));
+                            s.redial = None;
                         }
                         track.note(journal::session_reconnecting(&why, unix_ms(gives_up_at)));
+                        continue;
+                    }
+                    Incoming::Redialling { why } => {
+                        crate::log::info(format_args!(
+                            "slot {} redial failed ({why}); still trying",
+                            track.slot
+                        ));
+                        if let Ok(mut s) = track.state.lock() {
+                            s.redial = Some(why);
+                        }
                         continue;
                     }
                     Incoming::Up { gap, resent } => {
@@ -761,6 +776,7 @@ async fn carry(link: &mut Resumable, track: &Track, rx: &mut mpsc::Receiver<Comm
                         if let Ok(mut s) = track.state.lock() {
                             s.phase = Phase::Open;
                             s.gap = None;
+                            s.redial = None;
                             s.resumes += 1;
                         }
                         track.note(journal::session_resumed(gap.as_secs(), resent));

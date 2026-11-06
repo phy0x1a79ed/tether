@@ -279,6 +279,44 @@ async fn input_sent_through_an_operator_side_gap_arrives_after_the_resume() {
     relay.stop();
 }
 
+/// A redial that keeps failing says why, once per reason, so the operator's
+/// log names what the path answers instead of going quiet for the window.
+#[tokio::test]
+async fn a_failing_redial_says_why_once_per_reason() {
+    let relay = start(config(0)).await.unwrap();
+    let (op_path, ow_path) = (Proxy::to(relay.addr).await, Proxy::to(relay.addr).await);
+    let Pair {
+        mut operator,
+        owner: _owner,
+    } = pair(&op_path, &ow_path).await;
+
+    op_path.cut();
+    let mut reasons = Vec::new();
+    let until = tokio::time::Instant::now() + Duration::from_secs(6);
+    while let Ok(event) = tokio::time::timeout_at(until, operator.recv()).await {
+        match event {
+            Incoming::Redialling { why } => reasons.push(why),
+            Incoming::Ended(e) => panic!("{e}"),
+            _ => {}
+        }
+    }
+    assert!(!reasons.is_empty(), "no failed redial was reported");
+    assert!(
+        reasons.windows(2).all(|w| w[0] != w[1]),
+        "a reason was reported twice in a row: {reasons:?}"
+    );
+
+    op_path.restore();
+    loop {
+        match next(&mut operator, Duration::from_secs(30)).await {
+            Incoming::Up { .. } => break,
+            Incoming::Ended(e) => panic!("{e}"),
+            _ => {}
+        }
+    }
+    relay.stop();
+}
+
 /// A restarted relay remembers nothing. The operator puts its slot back, and
 /// the owner finds it there.
 #[tokio::test]

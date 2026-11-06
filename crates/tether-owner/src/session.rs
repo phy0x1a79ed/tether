@@ -344,6 +344,8 @@ pub async fn run(
                 Incoming::Frame(frame) => Next::In(Ok(frame)),
                 Incoming::Down { why, gives_up_at } => Next::Down(why, gives_up_at),
                 Incoming::Up { gap, .. } => Next::Up(gap),
+                // The gap's own line already says the link is down and until when.
+                Incoming::Redialling { .. } => Next::Tick,
                 Incoming::Ended(e) => Next::In(Err(e)),
             },
             Some(frame) = out_rx.recv(), if room => Next::Out(frame),

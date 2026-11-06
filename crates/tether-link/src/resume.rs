@@ -87,6 +87,9 @@ pub enum Incoming {
         why: String,
         gives_up_at: SystemTime,
     },
+    /// A redial failed for a reason the session has not been told yet. The
+    /// gap goes on.
+    Redialling { why: String },
     /// The link is back. `resent` frames went again.
     Up {
         gap: Duration,
@@ -373,6 +376,9 @@ impl Actor {
                 Stop::Exit => break,
                 Stop::Down(why) => why,
             };
+            // A dead leg kept through the gap holds its socket half-closed
+            // until the next one replaces it.
+            drop(link);
             if !self.resumable() {
                 self.end(LinkError::Closed).await;
                 break;
@@ -515,8 +521,8 @@ impl Actor {
     async fn reconnect(&mut self, why: String) -> Option<Link> {
         self.shared.up.store(false, Ordering::Relaxed);
         let window = self.rejoin.as_ref().map_or(RESUME_WINDOW, |r| r.window());
-        let dropped = Instant::now();
-        let deadline = dropped + window;
+        let since = Instant::now();
+        let deadline = since + window;
         let gives_up_at = SystemTime::now() + window;
         if let Ok(mut g) = self.shared.gives_up_at.lock() {
             *g = Some(gives_up_at);
@@ -533,6 +539,7 @@ impl Actor {
         let keys = self.keys.clone()?;
         let mut tries = 0usize;
         let mut wait = Duration::ZERO;
+        let mut told: Option<String> = None;
         loop {
             let rejoin = self.rejoin.as_mut()?;
             let dial = rejoin.dial(&keys);
@@ -575,7 +582,7 @@ impl Actor {
                         }
                         self.shared.up.store(true, Ordering::Relaxed);
                         let up = Incoming::Up {
-                            gap: dropped.elapsed(),
+                            gap: since.elapsed(),
                             resent,
                         };
                         if self.events.send(up).await.is_err() {
@@ -583,7 +590,8 @@ impl Actor {
                         }
                         return Some(link);
                     }
-                    Err(Resent::Again) => {
+                    Err(Resent::Again(why)) => {
+                        self.redial_failed(&mut told, why).await;
                         wait = BACKOFF[tries.min(BACKOFF.len() - 1)];
                         tries += 1;
                     }
@@ -599,13 +607,27 @@ impl Actor {
                 }
                 // Waited in the chair and nobody came. Take it again at once:
                 // waiting is the right thing to be doing.
-                Err(LinkError::NobodyThere) => wait = Duration::ZERO,
-                Err(_) => {
+                Err(LinkError::NobodyThere) => {
+                    self.redial_failed(&mut told, LinkError::NobodyThere.to_string()).await;
+                    wait = Duration::ZERO;
+                }
+                Err(e) => {
+                    self.redial_failed(&mut told, dropped(&e)).await;
                     wait = BACKOFF[tries.min(BACKOFF.len() - 1)];
                     tries += 1;
                 }
             }
         }
+    }
+
+    /// Tell the session why a redial failed, once per reason in a row: a path
+    /// that answers the same refusal for the whole window says so once.
+    async fn redial_failed(&mut self, told: &mut Option<String>, why: String) {
+        if told.as_deref() == Some(why.as_str()) {
+            return;
+        }
+        *told = Some(why.clone());
+        let _ = self.events.send(Incoming::Redialling { why }).await;
     }
 
     /// Trade `Resume` frames on a fresh link and resend what the peer missed.
@@ -614,7 +636,7 @@ impl Actor {
             received: self.received,
         })
         .await
-        .map_err(|_| Resent::Again)?;
+        .map_err(|e| Resent::Again(dropped(&e)))?;
         let theirs = match timeout(RESUME_TIMEOUT, link.recv()).await {
             Ok(Ok(Frame::Resume { received })) => received,
             Ok(Ok(_)) => {
@@ -622,7 +644,8 @@ impl Actor {
                     tether_proto::HandshakeError::OutOfStep,
                 )))
             }
-            Ok(Err(_)) | Err(_) => return Err(Resent::Again),
+            Ok(Err(e)) => return Err(Resent::Again(dropped(&e))),
+            Err(_) => return Err(Resent::Again("the other end did not resume in time".into())),
         };
         let oldest = self
             .unacked
@@ -637,15 +660,15 @@ impl Actor {
         self.acked(theirs);
         let again: Vec<Frame> = self.unacked.iter().map(|(_, f)| f.clone()).collect();
         for frame in &again {
-            link.send(frame).await.map_err(|_| Resent::Again)?;
+            link.send(frame).await.map_err(|e| Resent::Again(dropped(&e)))?;
         }
         Ok(again.len() as u64)
     }
 }
 
 enum Resent {
-    /// The new link failed before the resend finished. Redial.
-    Again,
+    /// The new link failed before the resend finished, for this reason. Redial.
+    Again(String),
     /// The two ends disagree about what was sent. The session cannot go on.
     Fatal(LinkError),
 }
