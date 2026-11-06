@@ -1,6 +1,6 @@
 [package]
 name = "tether-relay"
-version = "0.3.0"
+version = "0.4.0"
 edition = "2021"
 description = "tether's relay: pairs two sockets by slot and pumps bytes it cannot read."
 
