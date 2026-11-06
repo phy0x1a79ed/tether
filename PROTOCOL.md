@@ -379,7 +379,10 @@ No session content and no key material. State lives in memory. A restart
 forgets every slot, and an invite not yet consented to ends with it. A held
 session survives because its daemon has its issuer put the slot back: a bearer
 `/issue` that names the slot and both seat tokens recreates it, and the owner's redial finds
-it there. The only record of a finished session is a held slot's tombstone,
+it there. **CAUTION** The daemon calls its issuer only when a redial's upgrade gets the
+relay's own `404`. Every hop in front of the relay must pass that status through. An edge
+that turns a refused upgrade into a `403` leaves the operator redialling a slot that no
+longer exists until the window ends. The only record of a finished session is a held slot's tombstone,
 which lasts the window. The log records that a slot was issued, held and
 released, and which leg of a pairing ended first and how. It says nothing else
 about the session.
