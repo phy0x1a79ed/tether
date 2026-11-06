@@ -513,9 +513,8 @@ impl Sessions {
         session.deadline = now
             + match seat {
                 // A slot is the address of an operator waiting at it, so it
-                // must not outlive one by much. The operator's chair does cycle
-                // — each dial gets ninety seconds and is retaken the instant it
-                // ends — so this grace covers that gap and little else.
+                // must not outlive one by much. The grace is for a lost leg the
+                // operator is already redialling.
                 //
                 // Before this, an operator that had finished left a slot that
                 // still minted tickets for five more minutes. The next person
@@ -916,6 +915,34 @@ mod tests {
             1
         );
         assert_eq!(s.live(), 0);
+    }
+
+    /// A waiting leg the path dropped, redialled inside the grace, keeps its
+    /// slot through a second loss and on to the owner's arrival.
+    #[test]
+    fn an_operator_back_inside_the_grace_keeps_its_slot_for_the_owner() {
+        let s = sessions();
+        let now = Instant::now();
+        let issued = s.issue(now).unwrap();
+        let grace = s.limits.operator_grace;
+        assert!(grace >= Duration::from_secs(30), "too short for a redial");
+
+        let mut at = now;
+        let mut leg = s.join(issued.slot, issued.token, chan(), at).unwrap();
+        for _ in 0..2 {
+            at += Duration::from_secs(90);
+            assert!(!s.leave(issued.slot, Seat::Operator, id(&leg), at));
+            at += grace - Duration::from_secs(1);
+            leg = s
+                .join(issued.slot, issued.token, chan(), at)
+                .expect("a leg back inside the grace finds its slot");
+        }
+
+        let (ticket, _) = s.claim(issued.slot, at).expect("the slot still hands out tickets");
+        assert!(matches!(
+            s.join(issued.slot, ticket, chan(), at),
+            Ok(Join::Paired { seat: Seat::Owner, .. })
+        ));
     }
 
     /// The bug this was all for. A session ends, and the next person to run the

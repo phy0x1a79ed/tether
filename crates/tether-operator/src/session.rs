@@ -16,12 +16,12 @@
 //!
 //! # Why the session waits by redialling
 //!
-//! The invite lives for minutes, and a socket that has paired with nobody gives
-//! up in ninety seconds — the owner may still be walking to the machine. So the
-//! dial is a loop against the invite's own deadline rather than one attempt. A
-//! socket that waits and times out costs the slot nothing; only a *pairing*
-//! spends from the relay's budget, and that budget is the failure limit that
-//! makes a spoken phrase safe.
+//! The invite lives for minutes, and the waiting socket crosses hops that can
+//! drop it — the owner may still be walking to the machine. So the dial is a
+//! loop against the invite's own deadline rather than one attempt, and a lost
+//! leg is taken again inside the relay's grace for it. Losing a leg costs the
+//! slot nothing; only a *pairing* spends from the relay's budget, and that
+//! budget is the failure limit that makes a spoken phrase safe.
 //!
 //! # Why an open session survives a drop
 //!
@@ -387,6 +387,55 @@ async fn serve(
     }
 }
 
+/// What the operator does after a dial ends without an owner.
+#[derive(Debug, PartialEq, Eq)]
+enum Redial {
+    /// Take the chair again after this pause.
+    After(Duration),
+    /// The slot is gone, or the relay will never seat us. Stop.
+    Never,
+}
+
+/// The pauses between redials of a lost leg, the last repeated.
+///
+/// The relay keeps the slot for `operator_grace` (thirty seconds) after the
+/// chair empties. The first few redials land well inside it, so a path that
+/// blinks costs the slot nothing.
+const REDIAL: [Duration; 4] = [
+    Duration::from_millis(250),
+    Duration::from_secs(1),
+    Duration::from_secs(3),
+    Duration::from_secs(5),
+];
+
+/// Decide whether a dial that ended with `e` is worth repeating.
+///
+/// Only the relay's own answers end the wait: no such slot, or a session ended
+/// on purpose. Anything the path did — a dropped socket, a 403 or 502 from a
+/// hop in front of the relay, a dial that failed — is a lost leg. The relay is
+/// holding the slot for it, so the operator comes back for it.
+fn redial(e: &LinkError, losses: usize) -> Redial {
+    match e {
+        LinkError::NoSuchSession
+        | LinkError::Ended
+        | LinkError::Relay(_)
+        | LinkError::Transport(_) => Redial::Never,
+        // The last pairing is still giving the chair back.
+        LinkError::Taken => Redial::After(REDIAL[0]),
+        _ => Redial::After(REDIAL[losses.min(REDIAL.len() - 1)]),
+    }
+}
+
+/// The losses that still count toward the backoff: none, once a leg had
+/// stayed up for longer than the relay's grace.
+fn recent(losses: usize, dialled_at: Instant) -> usize {
+    if dialled_at.elapsed() >= Duration::from_secs(30) {
+        0
+    } else {
+        losses
+    }
+}
+
 /// Hold the operator's chair until the owner arrives, or the invite expires.
 async fn connect(
     cfg: &Config,
@@ -396,16 +445,18 @@ async fn connect(
     track: &Track,
     rx: &mut mpsc::Receiver<Command>,
 ) -> Option<Link> {
+    let mut losses = 0;
+    let mut pause = Duration::ZERO;
     while Instant::now() < deadline {
-        // The dial gets whatever is left of the invite, never more. Its own
-        // ninety-second patience is the right budget for one attempt and the
-        // wrong one for the last attempt: without this, an invite nobody
-        // redeems is declared expired a minute and a half after it was.
+        // The dial gets whatever is left of the invite, never more: it waits
+        // for the owner for as long as the invite lives and no longer.
         let remaining = deadline.saturating_duration_since(Instant::now());
-        let dial = tokio::time::timeout(
-            remaining,
-            Link::dial_operator(&cfg.relay, code.slot, seat, &code.phrase),
-        );
+        let wait = pause;
+        let dialled_at = Instant::now();
+        let dial = tokio::time::timeout(remaining, async move {
+            tokio::time::sleep(wait).await;
+            Link::dial_operator(&cfg.relay, code.slot, seat, &code.phrase).await
+        });
         tokio::pin!(dial);
 
         loop {
@@ -413,15 +464,6 @@ async fn connect(
                 dialled = &mut dial => match dialled {
                     Err(_) => break,
                     Ok(Ok(link)) => return Some(link),
-                    // Nobody has run the launcher yet. Take the chair again.
-                    Ok(Err(LinkError::NobodyThere)) => break,
-                    // The last pairing is still giving the chair back, which
-                    // takes the relay a moment after an owner leaves to
-                    // confirm. Take it again once it has.
-                    Ok(Err(LinkError::Taken)) => {
-                        tokio::time::sleep(Duration::from_millis(250)).await;
-                        break;
-                    }
                     // Somebody arrived with the wrong words. They will very
                     // likely try again, so wait for them — and count it,
                     // because the relay is counting it too.
@@ -434,12 +476,25 @@ async fn connect(
                             Err(_) => 0,
                         };
                         track.note(journal::session_miss(misses));
+                        losses = 0;
+                        pause = Duration::ZERO;
                         break;
                     }
-                    Ok(Err(e)) => {
-                        finish(track, format!("the session could not be held open: {e}"));
-                        return None;
-                    }
+                    Ok(Err(e)) => match redial(&e, recent(losses, dialled_at)) {
+                        Redial::After(wait) => {
+                            crate::log::info(format_args!(
+                                "slot {} lost its waiting leg ({e}); taking the chair again",
+                                code.slot
+                            ));
+                            losses = recent(losses, dialled_at) + 1;
+                            pause = wait;
+                            break;
+                        }
+                        Redial::Never => {
+                            finish(track, format!("the session could not be held open: {e}"));
+                            return None;
+                        }
+                    },
                 },
                 command = rx.recv() => match command {
                     None => {
@@ -1124,6 +1179,31 @@ pub fn bootstrap(relay: &tether_link::Relay, slot: Slot, phrase: &Phrase) -> Str
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Slot 651 died this way: a hop in front of the relay answered one
+    /// redial with 403, and the operator released a slot its guest was a
+    /// second away from.
+    #[test]
+    fn a_path_that_refuses_one_dial_is_redialled_rather_than_released() {
+        let refused = LinkError::Socket("the path answered 403".into());
+        assert_eq!(redial(&refused, 0), Redial::After(REDIAL[0]));
+        assert_eq!(redial(&LinkError::Closed, 1), Redial::After(REDIAL[1]));
+        assert_eq!(redial(&LinkError::NobodyThere, 0), Redial::After(REDIAL[0]));
+    }
+
+    #[test]
+    fn the_redial_backoff_stays_inside_the_relays_grace() {
+        let last = *REDIAL.last().unwrap();
+        assert_eq!(redial(&LinkError::Closed, 99), Redial::After(last));
+        let spent: Duration = REDIAL.iter().sum();
+        assert!(spent < Duration::from_secs(30), "{spent:?} outlasts the grace");
+    }
+
+    #[test]
+    fn only_the_relays_own_answer_ends_the_wait() {
+        assert_eq!(redial(&LinkError::NoSuchSession, 0), Redial::Never);
+        assert_eq!(redial(&LinkError::Ended, 0), Redial::Never);
+    }
 
     #[test]
     fn the_owners_line_has_nothing_to_quote_and_nothing_to_punctuate() {

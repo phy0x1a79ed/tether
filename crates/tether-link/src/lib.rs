@@ -56,12 +56,12 @@ pub use net::{DialError, Route};
 pub use relay::{Relay, RelayError};
 pub use resume::{Incoming, Resumable};
 
-/// How long the opening exchange may take.
+/// How long the owner's opening exchange, and either end's resume, may take.
 ///
-/// Generous, because the relay opens a socket the moment a chair is taken and
-/// the other end may not be there yet: the owner can be reading the code out
-/// while the operator's side waits. Bounded, because a socket that pairs and
-/// then says nothing is not somebody having trouble typing.
+/// Generous, because the other end may not be in its chair yet. Bounded,
+/// because a socket that pairs and then says nothing is not somebody having
+/// trouble typing. The operator's first exchange has no such bound: it waits
+/// for an owner for as long as the invite lives.
 pub const HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(90);
 
 type Socket = WebSocketStream<net::Stream>;
@@ -183,7 +183,7 @@ impl Transport {
     /// The next thing the peer actually said, skipping keepalives.
     async fn next(&mut self) -> Result<Vec<u8>, LinkError> {
         match self {
-            Self::Socket(socket) => next_binary(socket).await,
+            Self::Socket(socket) => next_binary(socket.as_mut()).await,
             Self::Poll(polled) => polled.next().await,
         }
     }
@@ -419,12 +419,16 @@ impl Link {
         phrase: &Phrase,
         role: Role,
     ) -> Result<Self, LinkError> {
-        let channel = tokio::time::timeout(
-            HANDSHAKE_TIMEOUT,
-            exchange(&mut transport, slot, phrase, role),
-        )
-        .await
-        .map_err(|_| LinkError::NobodyThere)??;
+        let exchanged = exchange(&mut transport, slot, phrase, role);
+        // The operator's wait is for somebody to run the launcher, which takes
+        // as long as it takes; its caller bounds it by the invite's own life.
+        // Cutting it sooner only dropped a leg the slot depends on.
+        let channel = match role {
+            Role::Operator => exchanged.await?,
+            Role::Owner => tokio::time::timeout(HANDSHAKE_TIMEOUT, exchanged)
+                .await
+                .map_err(|_| LinkError::NobodyThere)??,
+        };
         Ok(Self {
             transport,
             channel,
@@ -580,10 +584,50 @@ async fn finish_exchange(
     Ok(confirming.confirm(&their_tag)?)
 }
 
-/// Read the next thing the peer actually said, skipping keepalives.
-async fn next_binary(socket: &mut Socket) -> Result<Vec<u8>, LinkError> {
+/// How often a socket this end is reading from sends its own ping.
+///
+/// The relay pings every leg too, but a waiting leg crosses Cloudflare, nginx
+/// and a bridge before it reaches the relay, and a ping from one end proves
+/// nothing to a hop that times out on the other direction. Both ends speaking
+/// keeps every hop on the path awake, well under Cloudflare's 100 s idle cut.
+pub const SOCKET_KEEPALIVE: Duration = Duration::from_secs(20);
+
+/// How long a socket may go without saying anything at all, a pong included,
+/// before this end calls the leg lost.
+///
+/// The relay answers our pings and sends its own every thirty seconds, so a
+/// live leg is never this quiet. A dead one can be: a path that drops a socket
+/// without a close leaves this end reading forever, and the redial that would
+/// keep the slot never starts.
+pub const SOCKET_SILENCE: Duration = Duration::from_secs(60);
+
+/// Read the next thing the peer actually said, skipping keepalives and sending
+/// our own.
+async fn next_binary<S>(socket: &mut S) -> Result<Vec<u8>, LinkError>
+where
+    S: futures_util::Stream<Item = Result<Message, WsError>>
+        + futures_util::Sink<Message>
+        + Unpin,
+{
+    let mut beat = tokio::time::interval(SOCKET_KEEPALIVE);
+    beat.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+    beat.tick().await;
+    let mut heard = tokio::time::Instant::now();
     loop {
-        match socket.next().await {
+        let silence = tokio::time::sleep_until(heard + SOCKET_SILENCE);
+        let message = tokio::select! {
+            message = socket.next() => message,
+            _ = beat.tick() => {
+                socket
+                    .send(Message::Ping(Default::default()))
+                    .await
+                    .map_err(|_| LinkError::Closed)?;
+                continue;
+            }
+            _ = silence => return Err(LinkError::Closed),
+        };
+        heard = tokio::time::Instant::now();
+        match message {
             Some(Ok(Message::Binary(bytes))) => return Ok(bytes.to_vec()),
             Some(Ok(Message::Ping(_))) | Some(Ok(Message::Pong(_))) => continue,
             Some(Ok(Message::Frame(_))) | Some(Ok(Message::Text(_))) => {
@@ -592,5 +636,45 @@ async fn next_binary(socket: &mut Socket) -> Result<Vec<u8>, LinkError> {
             Some(Ok(Message::Close(_))) | None => return Err(LinkError::Closed),
             Some(Err(_)) => return Err(LinkError::Closed),
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use tokio_tungstenite::tungstenite::protocol::Role as WsRole;
+
+    async fn pair() -> (
+        WebSocketStream<tokio::io::DuplexStream>,
+        WebSocketStream<tokio::io::DuplexStream>,
+    ) {
+        let (a, b) = tokio::io::duplex(1 << 16);
+        (
+            WebSocketStream::from_raw_socket(a, WsRole::Client, None).await,
+            WebSocketStream::from_raw_socket(b, WsRole::Server, None).await,
+        )
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_waiting_socket_pings_its_path() {
+        let (mut ours, mut relay) = pair().await;
+        let waiting = tokio::spawn(async move { next_binary(&mut ours).await });
+
+        let started = tokio::time::Instant::now();
+        let first = relay.next().await.unwrap().unwrap();
+        assert!(matches!(first, Message::Ping(_)), "{first:?}");
+        assert!(started.elapsed() >= SOCKET_KEEPALIVE);
+        assert!(SOCKET_KEEPALIVE < Duration::from_secs(100) / 3);
+
+        relay.send(Message::Binary(vec![7].into())).await.unwrap();
+        assert_eq!(waiting.await.unwrap().unwrap(), vec![7]);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_socket_that_stops_answering_is_a_lost_leg() {
+        let (mut ours, _relay) = pair().await;
+        let started = tokio::time::Instant::now();
+        assert!(matches!(next_binary(&mut ours).await, Err(LinkError::Closed)));
+        assert!(started.elapsed() >= SOCKET_SILENCE);
     }
 }

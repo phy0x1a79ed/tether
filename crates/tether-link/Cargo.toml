@@ -17,5 +17,6 @@ tokio-tungstenite = { workspace = true }
 webpki-roots = { workspace = true }
 
 [dev-dependencies]
+tokio = { workspace = true, features = ["test-util"] }
 # The resume tests stand a real relay up behind a proxy they can cut.
 tether-relay = { path = "../tether-relay" }

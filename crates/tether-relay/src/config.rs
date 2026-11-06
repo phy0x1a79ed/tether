@@ -93,14 +93,14 @@ pub struct Limits {
     /// How long a slot outlives the operator's chair going empty.
     ///
     /// A slot exists to be the address of an operator who is waiting at it, so
-    /// it should not outlive one. But the operator's socket cycles: each dial
-    /// gets ninety seconds, and when nobody has redeemed the invite yet the
-    /// chair is dropped and retaken immediately. That gap is microseconds, so
-    /// this only has to be long enough to cover it — and short enough that a
-    /// daemon which died without saying so leaves a door that shuts on its own.
+    /// it should not outlive one by much. But the waiting leg crosses
+    /// Cloudflare, nginx and a bridge, and any of them can drop it. The
+    /// operator redials a lost leg at once and backs off to a few seconds
+    /// between tries, so this covers several redials: a leg that comes back
+    /// inside it keeps its slot, and the owner on the way never notices.
     ///
-    /// The deliberate release is what handles the ordinary case. This is the
-    /// backstop for the case where nothing got to say anything.
+    /// The deliberate release is what handles the ordinary ending. This is the
+    /// backstop for an operator that died without saying so.
     pub operator_grace: Duration,
 
     /// How long a held slot outlives an empty chair, either chair.
@@ -148,7 +148,7 @@ impl Default for Limits {
             keepalive: Duration::from_secs(30),
             drain_grace: Duration::from_secs(5),
             max_pairings: 5,
-            operator_grace: Duration::from_secs(10),
+            operator_grace: Duration::from_secs(30),
             resume_grace: tether_proto::RESUME_WINDOW,
             rate_window: Duration::from_secs(60),
             rate_burst: 30,

@@ -90,8 +90,20 @@ Step 12 has to be the operator's to take. The relay pumps sealed bytes and holds
 no key, so a refusal and a mistyped phrase are the same event from where it
 stands — and one must end the slot while the other must leave it open for the
 retry. Only the daemon knows which happened. If it never says, an unheld slot
-expires on its own a few seconds after its chair goes empty, and a held slot
+expires on its own 30 seconds after its chair goes empty, and a held slot
 after 10 minutes.
+
+The operator's waiting leg can sit for minutes before anybody runs the
+launcher, and it crosses Cloudflare, nginx and a bridge on the way. Two things
+keep it, and they must agree:
+
+1. Both ends ping every socket they read. The client pings every 20 seconds
+   and the relay every 30, both well under Cloudflare's 100-second idle cut. A
+   client that hears nothing, not even a pong, for 60 seconds drops the leg.
+2. A lost leg is redialled at once, then at a few seconds' backoff. The
+   relay's 30-second grace covers several of those redials, so a leg that
+   comes back keeps its slot. Only the relay's own answer, `404` or `410`,
+   ends the operator's wait early.
 
 ## Through a dropped link
 
