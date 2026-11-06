@@ -1,6 +1,6 @@
 [package]
 name = "tether-link"
-version = "0.4.1"
+version = "0.4.2"
 edition = "2021"
 description = "tether's transport: reaching the relay, and the sealed channel that runs over it."
 
