@@ -38,7 +38,7 @@ fn main() -> ExitCode {
 
 async fn run(config: Config) -> ExitCode {
     let relay = config.relay.to_string();
-    let can_invite = config.issue_token.is_some();
+    let can_invite = config.issuer.is_some();
     let running = match tether_operator::start(config).await {
         Ok(running) => running,
         Err(e) => {
@@ -56,7 +56,7 @@ async fn run(config: Config) -> ExitCode {
         // and a daemon that exited here could not answer it.
         log::warn(format_args!(
             "no {} in the environment — this host can hold no sessions open",
-            tether_operator::config::TOKEN_ENV
+            tether_operator::issuer::ISSUER_ENV
         ));
     }
 

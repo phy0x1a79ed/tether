@@ -130,12 +130,6 @@ impl Relay {
         format!("{}/claim/{}", self.prefix, slot)
     }
 
-    /// The path the operator asks for a slot on. Authenticated, and the only
-    /// action at the relay that allocates anything.
-    pub fn issue_path(&self) -> String {
-        format!("{}/issue", self.prefix)
-    }
-
     /// The path that ends a slot early, carrying the seat token as its proof.
     ///
     /// The token is in the path rather than a header because it is the same

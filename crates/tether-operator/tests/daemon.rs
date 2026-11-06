@@ -25,6 +25,11 @@ use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 
 const BEARER: &str = "a-test-bearer";
 
+mod support {
+    pub mod issuer;
+}
+use support::issuer::RelayHost;
+
 struct Rig {
     relay: tether_relay::Running,
     operator: Arc<Operator>,
@@ -63,7 +68,7 @@ async fn rig(limits: Limits) -> Rig {
 fn config(relay: &Relay) -> Config {
     Config {
         relay: relay.clone(),
-        issue_token: Some(BEARER.into()),
+        issuer: Some(RelayHost::issuer(relay, BEARER)),
         socket: socket_path(),
         who: "awm as tony".into(),
         host: "altair".into(),

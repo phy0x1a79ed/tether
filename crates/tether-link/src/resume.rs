@@ -650,11 +650,26 @@ enum Resent {
     Fatal(LinkError),
 }
 
-/// How the operator gets back: its own seat token, and the relay's bearer to
+/// Puts a held slot back on a relay that restarted and forgot it.
+///
+/// The relay restores a slot only for its issuer, so the operator's end does
+/// not do this itself: whoever issued the slot does. `Ok` also when the slot is
+/// already back, [`LinkError::Taken`] when its number went to another session
+/// first, and [`LinkError::Ended`] when the session was ended.
+pub trait Restore: Send + Sync + 'static {
+    fn restore(
+        &self,
+        slot: tether_proto::Slot,
+        seat: &str,
+        owner: &str,
+    ) -> BoxFuture<'static, Result<(), LinkError>>;
+}
+
+/// How the operator gets back: its own seat token, and the slot's issuer to
 /// put the slot back when the relay restarted.
 pub struct OperatorRejoin {
     pub relay: crate::Relay,
-    pub bearer: Option<String>,
+    pub restore: Option<Arc<dyn Restore>>,
     pub slot: tether_proto::Slot,
     pub seat: String,
     /// [`RESUME_WINDOW`] outside tests.
@@ -667,9 +682,9 @@ impl Rejoin for OperatorRejoin {
     }
 
     fn dial(&mut self, keys: &HoldKeys) -> BoxFuture<'static, Result<Link, LinkError>> {
-        let (relay, bearer, slot, seat) = (
+        let (relay, restore, slot, seat) = (
             self.relay.clone(),
-            self.bearer.clone(),
+            self.restore.clone(),
             self.slot,
             self.seat.clone(),
         );
@@ -679,10 +694,10 @@ impl Rejoin for OperatorRejoin {
                 // A relay that restarted has forgotten every slot. Put this
                 // one back, then take the chair.
                 Err(LinkError::NoSuchSession) => {
-                    let Some(bearer) = bearer else {
+                    let Some(restore) = restore else {
                         return Err(LinkError::NoSuchSession);
                     };
-                    match crate::restore(&relay, &bearer, slot, &seat, &owner).await {
+                    match restore.restore(slot, &seat, &owner).await {
                         Ok(()) => {}
                         // The number went to somebody else first. This session
                         // has no address any more.

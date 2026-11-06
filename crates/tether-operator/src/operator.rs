@@ -24,7 +24,7 @@
 
 use std::collections::BTreeMap;
 use std::sync::{Arc, Mutex};
-use std::time::{Duration, Instant};
+use std::time::Instant;
 
 use serde_json::{json, Value};
 use tether_proto::invite::{InviteCode, Phrase, Slot, DEFAULT_WORDS, MAX_WORDS};
@@ -50,7 +50,7 @@ impl Operator {
         let (kind, body) = journal::daemon_started(
             &cfg.build,
             &cfg.relay.to_string(),
-            cfg.issue_token.is_some(),
+            cfg.issuer.is_some(),
         );
         journal.append(None, kind, body);
         Arc::new(Self {
@@ -159,41 +159,29 @@ impl Operator {
         }
     }
 
-    /// Ask the relay for a slot, mint a phrase for it, and start waiting.
+    /// Ask the issuer for a slot, mint a phrase for it, and start waiting.
     ///
-    /// The phrase is minted here and stays here. What goes to the relay is the
+    /// The phrase is minted here and stays here. What goes to the issuer is the
     /// request for a slot and nothing else — not the words, not a hash of them,
     /// not anything a twenty-bit space could be enumerated against.
     async fn invite(&self, words: usize) -> Result<Value, String> {
-        let bearer = self.cfg.issue_token.as_deref().ok_or_else(|| {
+        let issuer = self.cfg.issuer.clone().ok_or_else(|| {
             format!(
-                "this host has no bearer for {}, so it cannot open a session there; \
-                 set {} in the workspace env file and restart the service",
+                "this host has no issuer for {}, so it cannot open a session there; \
+                 its adapter sets {}",
                 self.cfg.relay,
-                crate::config::TOKEN_ENV
+                crate::issuer::ISSUER_ENV
             )
         })?;
         if !(1..=MAX_WORDS).contains(&words) {
             return Err(format!("a code is between 1 and {MAX_WORDS} words"));
         }
 
-        let answer = tether_link::http::post_json(
-            &self.cfg.relay,
-            &self.cfg.relay.issue_path(),
-            Some(bearer),
-        )
-        .await
-        .map_err(|e| e.to_string())?;
-        let slot = answer["slot"]
-            .as_u64()
-            .and_then(|n| u32::try_from(n).ok())
-            .and_then(|n| Slot::new(n).ok())
-            .ok_or("the relay issued no usable slot")?;
-        let seat = answer["token"]
-            .as_str()
-            .ok_or("the relay issued no seat token")?
-            .to_string();
-        let lifetime = Duration::from_secs(answer["expires_in"].as_u64().unwrap_or(300));
+        let crate::issuer::Issued {
+            slot,
+            seat,
+            lifetime,
+        } = issuer.issue().await?;
 
         let phrase = Phrase::mint(words).map_err(|e| e.to_string())?;
         let code = InviteCode { slot, phrase };
@@ -248,7 +236,7 @@ impl Operator {
             "build": self.cfg.build,
             "relay": self.cfg.relay.to_string(),
             "launcher": self.cfg.relay.launcher_url(),
-            "can_invite": self.cfg.issue_token.is_some(),
+            "can_invite": self.cfg.issuer.is_some(),
             "uptime_s": self.started.elapsed().as_secs(),
             "socket": self.cfg.socket.display().to_string(),
             // Where the stream stands, so one call tells a caller both what is
@@ -434,7 +422,7 @@ mod tests {
     fn operator() -> Arc<Operator> {
         Operator::new(Config {
             relay: tether_link::Relay::parse("http://127.0.0.1:1/tether").unwrap(),
-            issue_token: None,
+            issuer: None,
             socket: "/tmp/nowhere.sock".into(),
             who: "awm as tester".into(),
             host: "altair".into(),
@@ -444,12 +432,12 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn a_host_with_no_bearer_says_so_rather_than_failing_to_reach_the_relay() {
+    async fn a_host_with_no_issuer_says_so_rather_than_failing_to_reach_the_relay() {
         let err = operator()
             .handle("invite", &json!({}))
             .await
-            .expect_err("a host with no bearer cannot mint");
-        assert!(err.contains(crate::config::TOKEN_ENV), "{err}");
+            .expect_err("a host with no issuer cannot mint");
+        assert!(err.contains(crate::issuer::ISSUER_ENV), "{err}");
     }
 
     #[tokio::test]

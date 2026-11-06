@@ -1151,6 +1151,7 @@ dependencies = [
 name = "tether-operator"
 version = "0.3.0"
 dependencies = [
+ "futures-util",
  "serde",
  "serde_json",
  "tether-link",

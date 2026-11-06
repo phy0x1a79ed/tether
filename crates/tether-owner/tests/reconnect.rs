@@ -31,6 +31,10 @@ use tokio::task::JoinHandle;
 
 const BEARER: &str = "a-test-bearer";
 
+#[path = "../../tether-operator/tests/support/issuer.rs"]
+mod issuer;
+use issuer::RelayHost;
+
 /// A TCP proxy that can drop every connection and refuse new ones for a while.
 struct Proxy {
     addr: SocketAddr,
@@ -112,7 +116,7 @@ impl Rig {
         let owner_path = Proxy::to(relay.addr).await;
         let operator = Operator::new(Config {
             relay: operator_path.relay(),
-            issue_token: Some(BEARER.into()),
+            issuer: Some(RelayHost::issuer(&operator_path.relay(), BEARER)),
             socket: std::env::temp_dir().join("tether-reconnect-unused.sock"),
             who: "awm as tony".into(),
             host: "altair".into(),

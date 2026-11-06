@@ -2,28 +2,28 @@
 //!
 //! Everything arrives in the environment, because the adapter that spawns this
 //! process is the thing that knows the answers: which relay this fleet uses,
-//! which bearer reaches its authenticated half, and where the control socket
-//! belongs on this host.
+//! which issuer hands out its slots, and where the control socket belongs on
+//! this host.
 //!
-//! # A missing bearer is reportable, not fatal
+//! # A missing issuer is reportable, not fatal
 //!
-//! The relay refuses to start without its issue token, and that is right: a
-//! relay with no token would accept sessions from anyone. This daemon does the
-//! opposite and starts anyway. Without the token it can mint nothing, but it
-//! can still answer `status`, which is the one verb whose whole job is to say
-//! why the others will not work. A daemon that exits on a missing variable
-//! makes that answer unreachable exactly when it is needed.
+//! Without an issuer this daemon can mint nothing, but it can still answer
+//! `status`, which is the one verb whose whole job is to say why the others
+//! will not work. A daemon that exits on a missing variable makes that answer
+//! unreachable exactly when it is needed.
 
 use std::env;
 use std::path::PathBuf;
+use std::sync::Arc;
 use std::time::Duration;
 
-use tether_link::{Relay, RelayError};
+use tether_link::Relay;
 use tether_proto::frame::{Hello, Role, PROTOCOL_VERSION};
+
+use crate::issuer::{self, Issuer};
 
 /// Where the control socket goes when the adapter does not say.
 pub const SOCKET_ENV: &str = "TETHER_CONTROL_SOCKET";
-pub const TOKEN_ENV: &str = "AWM_TETHER_ISSUE_TOKEN";
 pub const WHO_ENV: &str = "TETHER_WHO";
 
 /// How long a command may run before the daemon stops it.
@@ -36,12 +36,12 @@ pub const WHO_ENV: &str = "TETHER_WHO";
 /// and is bounded by the session it lives in.
 pub const RUN_TIMEOUT: Duration = Duration::from_secs(3600);
 
-#[derive(Debug, Clone)]
+#[derive(Clone)]
 pub struct Config {
     pub relay: Relay,
-    /// The bearer for the relay's authenticated half. `None` means this host
-    /// was never given one and can mint nothing.
-    pub issue_token: Option<String>,
+    /// Where slots come from. `None` means this host was given no issuer and
+    /// can mint nothing.
+    pub issuer: Option<Arc<dyn Issuer>>,
     pub socket: PathBuf,
     pub who: String,
     pub host: String,
@@ -53,16 +53,13 @@ pub struct Config {
 }
 
 impl Config {
-    pub fn from_env() -> Result<Self, RelayError> {
+    pub fn from_env() -> Result<Self, String> {
         let user = env::var("USER")
             .or_else(|_| env::var("LOGNAME"))
             .unwrap_or_else(|_| "someone".into());
         Ok(Self {
-            relay: Relay::from_env()?,
-            issue_token: env::var(TOKEN_ENV)
-                .ok()
-                .map(|t| t.trim().to_string())
-                .filter(|t| !t.is_empty()),
+            relay: Relay::from_env().map_err(|e| e.to_string())?,
+            issuer: issuer::from_env()?,
             socket: env::var(SOCKET_ENV)
                 .map(PathBuf::from)
                 .unwrap_or_else(|_| PathBuf::from("/tmp/tether-operator.sock")),

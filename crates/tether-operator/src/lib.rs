@@ -17,6 +17,7 @@
 //! # The shape of it
 //!
 //! - [`config`] reads the environment the adapter set.
+//! - [`issuer`] is where each slot comes from.
 //! - [`operator`] is the table of sessions and the verbs over it.
 //! - [`session`] is one session's task, which owns its socket alone.
 //! - [`control`] is the local socket the adapter speaks to.
@@ -25,6 +26,7 @@
 
 pub mod config;
 pub mod control;
+pub mod issuer;
 pub mod journal;
 pub mod log;
 pub mod operator;

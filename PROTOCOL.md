@@ -53,8 +53,9 @@ hold the secret.
 
 ## A session, in order
 
-1. The operator's daemon posts to `/issue` with the bearer. The relay returns a
-   **slot** and the operator's **seat token**.
+1. The operator's daemon asks its issuer for a slot. The issuer, on the relay's
+   host, posts to `/issue` with the bearer and returns a **slot** and the
+   operator's **seat token**. The daemon holds no bearer.
 2. The daemon mints a phrase locally. The phrase never leaves that process
    except to the person reading it out.
 3. The daemon opens `/join/{slot}/{operator token}` and waits. Waiting costs
@@ -177,8 +178,10 @@ obvious arrangement, in which the machine needing help raises its hand, and the
 inversion is the point: session creation would otherwise be an unauthenticated
 public action on a public endpoint.
 
-`/issue` and `/status` require the relay's bearer. Everything the owner touches
-requires nothing. A stranger cannot bring a session into existence, so the
+`/issue` and `/status` require the relay's bearer, and only the relay's host
+holds it: an operator's daemon gets each slot from an issuer there
+(`TETHER_ISSUER`, see `crates/tether-operator/src/issuer.rs`). Everything the
+owner touches requires nothing. A stranger cannot bring a session into existence, so the
 flood surface is closed rather than throttled, which is a different and much
 better thing than a rate limit.
 
@@ -362,8 +365,8 @@ when standard input is. Both are the person, and neither is the pipe.
 
 No session content and no key material. State lives in memory. A restart
 forgets every slot, and an invite not yet consented to ends with it. A held
-session survives because its daemon puts the slot back: a bearer `/issue` that
-names the slot and both seat tokens recreates it, and the owner's redial finds
+session survives because its daemon has its issuer put the slot back: a bearer
+`/issue` that names the slot and both seat tokens recreates it, and the owner's redial finds
 it there. The only record of a finished session is a held slot's tombstone,
 which lasts the window. The log records that a slot was issued, held and
 released, and which leg of a pairing ended first and how. It says nothing else

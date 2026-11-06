@@ -62,7 +62,7 @@ impl std::error::Error for HttpError {}
 
 /// POST to a path on the relay and read the JSON back.
 ///
-/// The bearer is for the operator's two routes. The owner's claim carries
+/// The bearer is for the relay host's two routes. The owner's claim carries
 /// none — it is the public half of the service, and a credential on it would
 /// be a credential the owner had to be given.
 pub async fn post_json(

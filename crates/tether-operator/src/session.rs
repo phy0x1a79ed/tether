@@ -504,7 +504,7 @@ async fn carried(cfg: &Config, slot: Slot, seat: &str, link: Link, track: &Track
         keys,
         OperatorRejoin {
             relay: cfg.relay.clone(),
-            bearer: cfg.issue_token.clone(),
+            restore: cfg.issuer.clone().map(|i| i as Arc<dyn tether_link::resume::Restore>),
             slot,
             seat: seat.to_string(),
             window: cfg.resume_window,

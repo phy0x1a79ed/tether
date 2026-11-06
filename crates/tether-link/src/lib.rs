@@ -94,6 +94,8 @@ pub enum LinkError {
     GaveUp,
     /// `TETHER_TRANSPORT` names neither transport.
     Transport(String),
+    /// The slot's issuer did not answer. A redial asks it again.
+    Issuer(String),
 }
 
 impl std::fmt::Display for LinkError {
@@ -129,6 +131,7 @@ impl std::fmt::Display for LinkError {
                 f,
                 "TETHER_TRANSPORT is `{value}`, but it takes `socket` or `poll`"
             ),
+            Self::Issuer(e) => write!(f, "the slot's issuer did not answer: {e}"),
         }
     }
 }
@@ -258,31 +261,6 @@ pub async fn hold(
     let body = serde_json::json!({ "owner": owner_token }).to_string();
     http::post_json_body(relay, &relay.hold_path(slot, seat_token), None, &body).await?;
     Ok(())
-}
-
-/// Put a held slot back on a relay that restarted and forgot it.
-///
-/// `Ok` also when the slot is already back. A `409` means the number went to
-/// another session first, and a `410` that the session was ended.
-pub async fn restore(
-    relay: &Relay,
-    bearer: &str,
-    slot: Slot,
-    seat_token: &str,
-    owner_token: &str,
-) -> Result<(), LinkError> {
-    let body = serde_json::json!({
-        "slot": slot.to_string(),
-        "token": seat_token,
-        "owner": owner_token,
-    })
-    .to_string();
-    match http::post_json_body(relay, &relay.issue_path(), Some(bearer), &body).await {
-        Ok(_) => Ok(()),
-        Err(http::HttpError::Status(409)) => Err(LinkError::Taken),
-        Err(http::HttpError::Status(410)) => Err(LinkError::Ended),
-        Err(e) => Err(e.into()),
-    }
 }
 
 impl Link {

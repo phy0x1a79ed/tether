@@ -5,8 +5,10 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
 
-use tether_link::resume::{mint_keys, Incoming, OperatorRejoin, OwnerRejoin, Resumable};
-use tether_link::{hold, Carry, Link, Relay};
+use futures_util::future::BoxFuture;
+use tether_link::http::HttpError;
+use tether_link::resume::{mint_keys, Incoming, OperatorRejoin, OwnerRejoin, Restore, Resumable};
+use tether_link::{hold, Carry, Link, LinkError, Relay};
 use tether_proto::frame::{Frame, Stream};
 use tether_proto::invite::{InviteCode, Phrase, Slot};
 use tether_relay::config::{Config, Limits};
@@ -81,8 +83,27 @@ impl Proxy {
     }
 }
 
+/// What the relay's host does to put a slot back, with the bearer it alone holds.
+struct RelayHost(Relay);
+
+impl Restore for RelayHost {
+    fn restore(&self, slot: Slot, seat: &str, owner: &str) -> BoxFuture<'static, Result<(), LinkError>> {
+        let relay = self.0.clone();
+        let body = serde_json::json!({"slot": slot.to_string(), "token": seat, "owner": owner})
+            .to_string();
+        Box::pin(async move {
+            match tether_link::http::post_json_body(&relay, "/issue", Some(BEARER), &body).await {
+                Ok(_) => Ok(()),
+                Err(HttpError::Status(409)) => Err(LinkError::Taken),
+                Err(HttpError::Status(410)) => Err(LinkError::Ended),
+                Err(e) => Err(e.into()),
+            }
+        })
+    }
+}
+
 async fn issue(relay: &Relay) -> (Slot, String) {
-    let answer = tether_link::http::post_json(relay, &relay.issue_path(), Some(BEARER))
+    let answer = tether_link::http::post_json(relay, "/issue", Some(BEARER))
         .await
         .unwrap();
     let slot = Slot::new(answer["slot"].as_u64().unwrap() as u32).unwrap();
@@ -113,8 +134,8 @@ async fn pair(operator_path: &Proxy, owner_path: &Proxy) -> Pair {
         operator,
         keys,
         OperatorRejoin {
-            relay: op_relay,
-            bearer: Some(BEARER.into()),
+            relay: op_relay.clone(),
+            restore: Some(Arc::new(RelayHost(op_relay.clone()))),
             slot,
             seat,
             window: tether_proto::RESUME_WINDOW,
