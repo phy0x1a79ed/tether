@@ -36,7 +36,7 @@ use std::net::SocketAddr;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
-use axum::body::Bytes;
+use axum::body::{Body, Bytes};
 use axum::extract::ws::WebSocketUpgrade;
 use axum::extract::{DefaultBodyLimit, Path, Query, State};
 use axum::http::{header, HeaderMap, StatusCode};
@@ -50,6 +50,7 @@ use tokio::task::JoinHandle;
 
 pub mod assets;
 pub mod config;
+pub mod files;
 pub mod log;
 pub mod poll;
 pub mod pump;
@@ -59,6 +60,7 @@ pub mod session;
 pub mod token;
 
 use crate::config::{Config, MAX_MESSAGE};
+use crate::files::PutError;
 use crate::poll::{Polls, Recv, Sent};
 use crate::rate::Limiter;
 use crate::room::{Kind as RoomKind, Room, Rooms, SendError, Who, MAX_ROOM_MESSAGE};
@@ -171,6 +173,8 @@ pub fn router(relay: Arc<Relay>) -> Router {
         .route("/room/{name}/recv", get(room_recv))
         .route("/room/{name}/ws", get(room_ws))
         .route("/room/{name}/leave", post(room_leave))
+        .route("/room/{name}/file", post(room_file_new))
+        .route("/room/{name}/file/{id}", get(room_file_get).post(room_file_more))
         // A path that is not here answers exactly as a refusal does.
         .fallback(|| async { nothing_here() })
         .with_state(relay)
@@ -741,6 +745,109 @@ async fn room_leave(
     };
     room.end(why, Instant::now());
     Json(json!({ "ended": room.ended().unwrap_or(why).as_str() })).into_response()
+}
+
+#[derive(serde::Deserialize)]
+struct Part {
+    #[serde(default)]
+    offset: u64,
+    /// 1 when another part of the file follows.
+    #[serde(default)]
+    more: u8,
+}
+
+/// The first part of a new file, or the whole of it.
+async fn room_file_new(
+    State(relay): State<Arc<Relay>>,
+    Path(name): Path<String>,
+    Query(part): Query<Part>,
+    headers: HeaderMap,
+    body: Body,
+) -> Response {
+    let (room, _) = match room_for(&relay, &headers, &name) {
+        Ok(found) => found,
+        Err(refused) => return *refused,
+    };
+    match room.take_upload(Instant::now()) {
+        Ok(()) => {}
+        Err(SendError::Ended) => return room_ended(room.ended().expect("an ended room has a reason")),
+        Err(_) => {
+            return (StatusCode::TOO_MANY_REQUESTS, "this room is taking too many messages\n")
+                .into_response()
+        }
+    }
+    put_part(&relay, &room, None, 0, part.more != 0, body).await
+}
+
+/// A later part of a file whose first part said more would follow.
+async fn room_file_more(
+    State(relay): State<Arc<Relay>>,
+    Path((name, id)): Path<(String, String)>,
+    Query(part): Query<Part>,
+    headers: HeaderMap,
+    body: Body,
+) -> Response {
+    let (room, _) = match room_for(&relay, &headers, &name) {
+        Ok(found) => found,
+        Err(refused) => return *refused,
+    };
+    let Some(id) = files::parse_id(&id) else { return nothing_here() };
+    put_part(&relay, &room, Some(id), part.offset, part.more != 0, body).await
+}
+
+async fn put_part(relay: &Relay, room: &Room, id: Option<&str>, offset: u64, more: bool,
+                  body: Body) -> Response {
+    if let Some(why) = room.ended() {
+        return room_ended(why);
+    }
+    let floor = relay.config.limits.file_floor;
+    match room.files.put(id, offset, more, body, floor).await {
+        Ok((id, size)) => Json(json!({ "id": id, "size": size })).into_response(),
+        Err(PutError::NoSuchFile) => nothing_here(),
+        Err(PutError::Offset(size)) => (StatusCode::CONFLICT, Json(json!({ "size": size })))
+            .into_response(),
+        Err(PutError::Busy) => (
+            StatusCode::CONFLICT,
+            "another part of this file is still arriving\n",
+        )
+            .into_response(),
+        Err(PutError::Full) => (
+            StatusCode::INSUFFICIENT_STORAGE,
+            "the relay is short of disk for files right now\n",
+        )
+            .into_response(),
+        Err(PutError::Broken) => (
+            StatusCode::BAD_REQUEST,
+            "the part broke off. Send it again at the same offset\n",
+        )
+            .into_response(),
+    }
+}
+
+async fn room_file_get(
+    State(relay): State<Arc<Relay>>,
+    Path((name, id)): Path<(String, String)>,
+    headers: HeaderMap,
+) -> Response {
+    let (room, _) = match room_for(&relay, &headers, &name) {
+        Ok(found) => found,
+        Err(refused) => return *refused,
+    };
+    let Some((path, size)) = files::parse_id(&id).and_then(|id| room.files.get(id)) else {
+        return nothing_here();
+    };
+    match files::stream(&path).await {
+        Ok(body) => (
+            [
+                (header::CONTENT_TYPE, "application/octet-stream".to_string()),
+                (header::CONTENT_LENGTH, size.to_string()),
+                (header::CACHE_CONTROL, "no-store".to_string()),
+            ],
+            body,
+        )
+            .into_response(),
+        Err(_) => nothing_here(),
+    }
 }
 
 #[derive(serde::Deserialize)]

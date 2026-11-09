@@ -135,6 +135,11 @@ pub struct Limits {
 
     /// How many rooms may be open at once.
     pub max_rooms: usize,
+
+    /// The free disk, in bytes, below which the relay takes no more of a
+    /// room's files. Files have no size cap, so this is what keeps one guest
+    /// from filling the host.
+    pub file_floor: u64,
 }
 
 impl Default for Limits {
@@ -156,6 +161,7 @@ impl Default for Limits {
             room_life: Duration::from_secs(24 * 3600),
             room_linger: Duration::from_secs(30),
             max_rooms: 64,
+            file_floor: 2 * 1024 * 1024 * 1024,
         }
     }
 }

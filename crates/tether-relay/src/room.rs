@@ -23,6 +23,10 @@
 //! other field. A room that encrypts carries sealed text it has no key for, the
 //! same as a tether.
 //!
+//! Files either side uploads, on disk, until the room is forgotten. A message
+//! names a file by its id, and the relay reads no message to learn which. See
+//! [`crate::files`].
+//!
 //! A persistent room also keeps one file in the state directory, when the relay
 //! has one, so that it outlives a relay restart. The file holds the name, the
 //! digest of the host token and a sequence floor, never a message: a room that
@@ -57,6 +61,7 @@ use tether_proto::words::WORDS;
 use tokio::sync::Notify;
 
 use crate::config::Limits;
+use crate::files::Store;
 use crate::log;
 use crate::token::{Digest, Token};
 
@@ -185,6 +190,8 @@ pub struct Room {
     /// The room's file in the state directory. Only a persistent room on a
     /// relay with a state directory has one.
     file: Option<PathBuf>,
+    /// The files either side uploaded. See [`crate::files`].
+    pub files: Store,
     state: Mutex<State>,
     changed: Notify,
 }
@@ -203,14 +210,32 @@ struct State {
     window_used: u32,
 }
 
+impl State {
+    fn take_send(&mut self, now: Instant) -> Result<(), SendError> {
+        if self.ended.is_some() {
+            return Err(SendError::Ended);
+        }
+        if now.duration_since(self.window_start) >= SEND_WINDOW {
+            self.window_start = now;
+            self.window_used = 0;
+        }
+        if self.window_used >= SEND_BURST {
+            return Err(SendError::Busy);
+        }
+        self.window_used += 1;
+        Ok(())
+    }
+}
+
 impl Room {
-    fn new(name: String, kind: Kind, host: Digest, file: Option<PathBuf>, last: u64,
-           now: Instant) -> Self {
+    fn new(name: String, kind: Kind, host: Digest, file: Option<PathBuf>, files: Store,
+           last: u64, now: Instant) -> Self {
         Room {
             name,
             kind,
             host,
             file,
+            files,
             state: Mutex::new(State {
                 backlog: VecDeque::new(),
                 bytes: 0,
@@ -273,17 +298,7 @@ impl Room {
         }
 
         let mut st = self.state.lock().unwrap();
-        if st.ended.is_some() {
-            return Err(SendError::Ended);
-        }
-        if now.duration_since(st.window_start) >= SEND_WINDOW {
-            st.window_start = now;
-            st.window_used = 0;
-        }
-        if st.window_used >= SEND_BURST {
-            return Err(SendError::Busy);
-        }
-        st.window_used += 1;
+        st.take_send(now)?;
         if who == Who::Host {
             st.host_seen = now;
         }
@@ -306,6 +321,11 @@ impl Room {
         drop(st);
         self.changed.notify_waiters();
         Ok(seq)
+    }
+
+    /// Count a new upload against the room's send window, as a message is.
+    pub fn take_upload(&self, now: Instant) -> Result<(), SendError> {
+        self.state.lock().unwrap().take_send(now)
     }
 
     /// The messages after `after`, now. A reader further behind than the
@@ -371,27 +391,35 @@ pub struct Rooms {
     limits: Limits,
     /// Where persistent rooms keep their files, if anywhere.
     state: Option<PathBuf>,
+    /// Where each room keeps its uploads, one directory per room.
+    files: PathBuf,
 }
 
 impl Rooms {
     pub fn new(limits: Limits) -> Self {
-        Self {
-            inner: Mutex::default(),
-            limits,
-            state: None,
-        }
+        Self::with_state(limits, None)
     }
 
     /// Rooms whose persistent rooms keep a file in `state`, with every
     /// persistent room a file there names already open again.
+    ///
+    /// Uploads live under `state/files`, so a persistent room's files come
+    /// back with it and a task room's are swept. Without a state directory
+    /// they live in a fresh directory of this process's own.
     pub fn with_state(limits: Limits, state: Option<PathBuf>) -> Self {
+        let files = match &state {
+            Some(dir) => dir.join("files"),
+            None => std::env::temp_dir()
+                .join(format!("tether-room-files-{}", &Token::mint().to_hex()[..16])),
+        };
         let rooms = Self {
             inner: Mutex::default(),
             limits,
             state,
+            files,
         };
         if let Some(dir) = &rooms.state {
-            match restore(dir, Instant::now()) {
+            match restore(dir, &rooms.files, Instant::now()) {
                 Ok(found) => {
                     if !found.is_empty() {
                         log::info(format_args!("restored {} persistent room(s)", found.len()));
@@ -400,6 +428,7 @@ impl Rooms {
                     for room in found {
                         table.insert(room.name.clone(), Arc::new(room));
                     }
+                    sweep(&rooms.files, &table);
                 }
                 Err(e) => log::warn(format_args!(
                     "could not read the room state at {}: {e}",
@@ -429,7 +458,8 @@ impl Rooms {
             (Some(dir), Kind::Persistent) => Some(dir.join(format!("{name}.json"))),
             _ => None,
         };
-        let room = Arc::new(Room::new(name.clone(), kind, host.digest(), file, 0, now));
+        let files = Store::new(self.files.join(&name));
+        let room = Arc::new(Room::new(name.clone(), kind, host.digest(), file, files, 0, now));
         room.save(0);
         table.insert(name, Arc::clone(&room));
         Some((room, host))
@@ -467,7 +497,11 @@ impl Rooms {
                 (st.born, st.host_seen, st.ended)
             };
             match ended {
-                Some((_, at)) => now.duration_since(at) < self.limits.room_linger,
+                Some((_, at)) if now.duration_since(at) < self.limits.room_linger => true,
+                Some(_) => {
+                    room.files.remove_all();
+                    false
+                }
                 None if room.kind == Kind::Persistent => true,
                 None => {
                     if now.duration_since(born) >= self.limits.room_life {
@@ -485,7 +519,7 @@ impl Rooms {
 
 /// The persistent rooms whose files are in `dir`. A file that does not read
 /// as one is left alone and named in the log.
-fn restore(dir: &Path, now: Instant) -> io::Result<Vec<Room>> {
+fn restore(dir: &Path, files: &Path, now: Instant) -> io::Result<Vec<Room>> {
     let entries = match fs::read_dir(dir) {
         Ok(entries) => entries,
         Err(e) if e.kind() == io::ErrorKind::NotFound => return Ok(Vec::new()),
@@ -500,7 +534,8 @@ fn restore(dir: &Path, now: Instant) -> io::Result<Vec<Room>> {
         match read_room(&path) {
             Some((name, host, reserved)) => {
                 // Numbered from the floor, so no number is given out twice.
-                let room = Room::new(name, Kind::Persistent, host, Some(path), reserved, now);
+                let store = Store::restore(files.join(&name));
+                let room = Room::new(name, Kind::Persistent, host, Some(path), store, reserved, now);
                 found.push(room);
             }
             None => log::warn(format_args!(
@@ -510,6 +545,18 @@ fn restore(dir: &Path, now: Instant) -> io::Result<Vec<Room>> {
         }
     }
     Ok(found)
+}
+
+/// Delete the upload directory of every room that did not come back.
+fn sweep(files: &Path, table: &HashMap<String, Arc<Room>>) {
+    for entry in fs::read_dir(files).into_iter().flatten().flatten() {
+        let name = entry.file_name();
+        if !table.contains_key(&*name.to_string_lossy()) {
+            if let Err(e) = fs::remove_dir_all(entry.path()) {
+                log::warn(format_args!("could not sweep an ended room's files: {e}"));
+            }
+        }
+    }
 }
 
 fn read_room(path: &Path) -> Option<(String, Digest, u64)> {
@@ -612,6 +659,20 @@ RECEIVE BY WEBSOCKET
 LEAVE
   POST ROOM/leave
   This ends the room for both sides.
+
+FILES
+  POST ROOM/file
+  The body is the file's bytes, as they are. The answer is
+  {\"id\": \"<id>\", \"size\": <n>}. Then send a message that names it:
+  {\"from\": \"<your name>\", \"file\": {\"id\": \"<id>\", \"name\": \"<file name>\", \"size\": <n>}}
+  It may carry \"text\" too. A file has no size limit, but a proxy on the way
+  caps one request near 100 MB, so send a larger file in parts of at most
+  32 MiB: the first part to ROOM/file?more=1, each later part to
+  ROOM/file/<id>?offset=<bytes sent so far>&more=1, and the last part without
+  more=1. A part that fails can be sent again at the same offset. A wrong
+  offset answers 409 with the size the relay holds.
+  GET ROOM/file/<id> fetches a file a message names, once its last part is in.
+  A room keeps its newest 256 files, until it ends.
 
 When \"ended\" is not null, the room is over. Stop asking. Its address stops
 answering soon after.
@@ -885,6 +946,25 @@ mod tests {
         let _ = fs::remove_dir_all(&dir);
     }
 
+    #[tokio::test]
+    async fn a_room_s_files_go_when_its_linger_ends_and_the_oldest_go_past_the_cap() {
+        let r = Rooms::new(Limits { room_linger: Duration::ZERO, ..Limits::default() });
+        let t0 = Instant::now();
+        let (room, _) = r.open(Kind::Task, t0).unwrap();
+        let mut first = None;
+        for i in 0..=crate::files::MAX_FILES {
+            let body = axum::body::Body::from(format!("file {i}"));
+            let (id, _) = room.files.put(None, 0, false, body, 0).await.unwrap();
+            first.get_or_insert(id);
+        }
+        let dir = r.files.join(&room.name);
+        assert_eq!(fs::read_dir(&dir).unwrap().count(), crate::files::MAX_FILES);
+        assert!(room.files.get(first.as_deref().unwrap()).is_none(), "the oldest went");
+        room.end(Ended::HostClosed, t0);
+        assert_eq!(r.reap(t0), 1);
+        assert!(!dir.exists());
+    }
+
     #[test]
     fn a_file_that_is_not_a_persistent_room_is_skipped() {
         let dir = state_dir("skip");
@@ -981,6 +1061,8 @@ mod tests {
             "ROOM/recv",
             "ROOM/ws",
             "ROOM/leave",
+            "ROOM/file?more=1",
+            "ROOM/file/<id>?offset=",
             "tether-room:acre-anchor-kettle",
         ] {
             assert!(text.contains(needle), "{needle}");
