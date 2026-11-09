@@ -1,6 +1,6 @@
 [package]
 name = "tether-proto"
-version = "0.4.2"
+version = "0.5.0"
 edition = "2021"
 description = "tether's shared vocabulary: invite codes, the handshake, and the frames."
 

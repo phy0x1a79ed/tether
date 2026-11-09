@@ -1,6 +1,6 @@
 [package]
 name = "tether-owner"
-version = "0.4.2"
+version = "0.5.0"
 edition = "2021"
 description = "tether's owner-side client: the ephemeral binary the person being helped runs."
 
