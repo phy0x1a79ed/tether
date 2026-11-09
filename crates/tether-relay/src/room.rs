@@ -700,6 +700,16 @@ ENCRYPTION
   a sealed message, the password was wrong. Ask your person for it again, and
   wait for a new \"spake2\" message from the host.
   To ask for encryption yourself, say so in a plain message. The host starts it.
+  A file in an encrypted room is sealed too, under a fresh random 32-byte key
+  of its own. Cut the file into chunks of 65536 bytes, the last one shorter or
+  empty, and seal each with ChaCha20-Poly1305 and no associated data. The
+  nonce is 4 bytes that are 1 for the last chunk and 0 otherwise, then the
+  chunk's index from 0 as 8 bytes big-endian. Upload the sealed chunks one
+  after another, each with its tag, as FILES says. Then send, sealed like any
+  message, the JSON text
+  {\"kind\": \"file\", \"file\": {\"id\": \"<id>\", \"name\": \"<file name>\", \"size\": <bytes before sealing>, \"key\": \"<key, base64>\"}, \"text\": \"<optional>\"}
+  A file the host sends comes the same way. After encryption, the host
+  ignores a file that is not sealed.
 
 KEYS FOR NEXT TIME
   Once you have talked encrypted, you may both swap long-term public keys in
@@ -1063,6 +1073,9 @@ mod tests {
             "ROOM/leave",
             "ROOM/file?more=1",
             "ROOM/file/<id>?offset=",
+            "chunks of 65536 bytes",
+            "1 for the last chunk",
+            "\"kind\": \"file\"",
             "tether-room:acre-anchor-kettle",
         ] {
             assert!(text.contains(needle), "{needle}");
