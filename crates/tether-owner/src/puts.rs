@@ -1,10 +1,11 @@
 //! Files the operator puts on this machine, one `Put` part at a time.
 //!
-//! Each file goes into a fresh directory under the OS temporary directory, so
-//! two files with one name never meet and nothing outside that directory is
-//! touched. The bytes go to a `.part` name and take their own name only when
+//! Each file goes into a fresh directory inside this user's private one under
+//! the OS temporary directory, so two files with one name never meet and
+//! nothing outside that directory is touched. The bytes go to a `.part` name and take their own name only when
 //! the last part is in, so a file cut short never looks finished.
 
+use std::collections::hash_map::Entry;
 use std::collections::{HashMap, HashSet};
 use std::fs::File;
 use std::io::Write;
@@ -28,6 +29,7 @@ struct Open {
 
 /// What the owner should hear about a part: the frame to answer with, and a
 /// line for the screen. Both empty while a file is still coming in.
+#[derive(Default)]
 pub struct Took {
     pub reply: Option<Frame>,
     pub note: Option<String>,
@@ -36,23 +38,14 @@ pub struct Took {
 impl Puts {
     pub fn take(&mut self, file: u32, name: &str, offset: u64, data: &[u8], last: bool) -> Took {
         if self.refused.contains(&file) {
-            return Took {
-                reply: None,
-                note: None,
-            };
+            return Took::default();
         }
         match self.write(file, name, offset, data, last) {
-            Ok(None) => Took {
-                reply: None,
-                note: None,
-            },
-            Ok(Some(path)) => {
+            Ok(None) => Took::default(),
+            Ok(Some((path, size))) => {
                 let path = path.display().to_string();
                 Took {
-                    note: Some(format!(
-                        "the operator put a file at {path} ({} bytes)",
-                        offset + data.len() as u64
-                    )),
+                    note: Some(format!("the operator put a file at {path} ({size} bytes)")),
                     reply: Some(Frame::Placed { file, path }),
                 }
             }
@@ -76,14 +69,16 @@ impl Puts {
         offset: u64,
         data: &[u8],
         last: bool,
-    ) -> Result<Option<PathBuf>, String> {
-        if offset == 0 && !self.open.contains_key(&file) {
-            self.open.insert(file, Open::new(name)?);
-        }
-        let open = self
-            .open
-            .get_mut(&file)
-            .ok_or_else(|| format!("a part at offset {offset} came before the file's start"))?;
+    ) -> Result<Option<(PathBuf, u64)>, String> {
+        let open = match self.open.entry(file) {
+            Entry::Occupied(open) => open.into_mut(),
+            Entry::Vacant(slot) if offset == 0 => slot.insert(Open::new(name)?),
+            Entry::Vacant(_) => {
+                return Err(format!(
+                    "a part at offset {offset} came before the file's start"
+                ))
+            }
+        };
         if offset != open.written {
             return Err(format!(
                 "a part came at offset {offset}, expected {}",
@@ -96,10 +91,9 @@ impl Puts {
             return Ok(None);
         }
         let open = self.open.remove(&file).expect("checked above");
-        open.file.sync_all().map_err(|e| e.to_string())?;
         drop(open.file);
         std::fs::rename(&open.part, &open.dest).map_err(|e| e.to_string())?;
-        Ok(Some(open.dest))
+        Ok(Some((open.dest, open.written)))
     }
 }
 
@@ -107,8 +101,8 @@ impl Open {
     fn new(name: &str) -> Result<Self, String> {
         let mut tag = [0u8; 6];
         getrandom::getrandom(&mut tag).map_err(|e| e.to_string())?;
-        let dir = std::env::temp_dir().join(format!("tether-{}", hex::encode(tag)));
-        std::fs::create_dir_all(&dir).map_err(|e| format!("cannot make {}: {e}", dir.display()))?;
+        let dir = crate::confirm::private_dir()?.join(format!("put-{}", hex::encode(tag)));
+        std::fs::create_dir(&dir).map_err(|e| format!("cannot make {}: {e}", dir.display()))?;
         let name = safe_name(name);
         let part = dir.join(format!("{name}.part"));
         let file =

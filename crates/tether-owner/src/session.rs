@@ -322,6 +322,7 @@ pub async fn run(
     }
 
     let mut stops = Stops::new();
+    let freed = link.room();
 
     let outcome = loop {
         enum Next {
@@ -331,12 +332,13 @@ pub async fn run(
             Out(Frame),
             Term(crossterm::event::Event),
             Stop(&'static str),
+            Room,
             Tick,
         }
 
         // Task output waits while the link is keeping as much as it will for
         // a resend. The task then blocks on its own write, and nothing it
-        // prints is lost.
+        // prints is lost. The peer's ack frees room and wakes the loop.
         let room = link.has_room();
 
         // The select ends before anything acts, because two of these branches
@@ -351,12 +353,14 @@ pub async fn run(
                 Incoming::Ended(e) => Next::In(Err(e)),
             },
             Some(frame) = out_rx.recv(), if room => Next::Out(frame),
+            _ = freed.wait(), if !room => Next::Room,
             Some(Ok(ev)) = next_key(&mut keys) => Next::Term(ev),
             why = stops.next() => Next::Stop(why),
             _ = tick.tick() => Next::Tick,
         };
 
         match next {
+            Next::Room => {}
             Next::Down(why, gives_up_at) => ui.apply(Event::LinkDown {
                 why,
                 gives_up_in: gives_up_at

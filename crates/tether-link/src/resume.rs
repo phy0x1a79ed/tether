@@ -145,6 +145,17 @@ struct Shared {
     gives_up_at: Mutex<Option<SystemTime>>,
 }
 
+impl Shared {
+    fn has_room(&self) -> bool {
+        self.kept.load(Ordering::Relaxed) < KEEP
+    }
+
+    fn free(&self, bytes: usize) {
+        self.kept.fetch_sub(bytes, Ordering::Relaxed);
+        self.freed.notify_waiters();
+    }
+}
+
 /// Waits for a [`Resumable`] to have room, without borrowing it, so a session
 /// can wait on room and on the link's next frame in one `select!`.
 #[derive(Clone)]
@@ -156,7 +167,7 @@ impl Room {
             let freed = self.0.freed.notified();
             tokio::pin!(freed);
             freed.as_mut().enable();
-            if self.0.kept.load(Ordering::Relaxed) < KEEP {
+            if self.0.has_room() {
                 return;
             }
             freed.await;
@@ -274,7 +285,7 @@ impl Resumable {
     /// that can wait, such as the owner's task output, waits while this is
     /// false.
     pub fn has_room(&self) -> bool {
-        self.shared.kept.load(Ordering::Relaxed) < KEEP
+        self.shared.has_room()
     }
 
     /// A handle that waits until [`Self::has_room`] would be true.
@@ -434,23 +445,33 @@ impl Actor {
         if self.resume {
             self.unacked.push_back((seq, frame));
         } else {
-            self.shared
-                .kept
-                .fetch_sub(weight(&frame), Ordering::Relaxed);
-            self.shared.freed.notify_waiters();
+            self.shared.free(weight(&frame));
         }
     }
 
     /// Drop what the peer says it has.
     fn acked(&mut self, received: u64) {
+        let mut bytes = 0;
         while let Some((seq, frame)) = self.unacked.front() {
             if *seq >= received {
                 break;
             }
-            self.shared.kept.fetch_sub(weight(frame), Ordering::Relaxed);
+            bytes += weight(frame);
             self.unacked.pop_front();
         }
-        self.shared.freed.notify_waiters();
+        if bytes > 0 {
+            self.shared.free(bytes);
+        }
+    }
+
+    /// Tell the peer how much has arrived.
+    async fn ack(&mut self, link: &mut Link) -> Result<(), Stop> {
+        self.owed = 0;
+        link.send(&Frame::Ack {
+            received: self.received,
+        })
+        .await
+        .map_err(|e| Stop::Down(dropped(&e)))
     }
 
     async fn end(&mut self, why: LinkError) {
@@ -498,9 +519,8 @@ impl Actor {
                             return Stop::Exit;
                         }
                         if self.resumable() && self.owed >= KEEP / 4 {
-                            self.owed = 0;
-                            if let Err(e) = link.send(&Frame::Ack { received: self.received }).await {
-                                return Stop::Down(dropped(&e));
+                            if let Err(stop) = self.ack(link).await {
+                                return stop;
                             }
                         }
                     }
@@ -524,9 +544,8 @@ impl Actor {
                     if heard.elapsed() > QUIET {
                         return Stop::Down("the other end stopped answering".into());
                     }
-                    self.owed = 0;
-                    if let Err(e) = link.send(&Frame::Ack { received: self.received }).await {
-                        return Stop::Down(dropped(&e));
+                    if let Err(stop) = self.ack(link).await {
+                        return stop;
                     }
                 }
             }

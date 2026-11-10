@@ -221,14 +221,18 @@ fn now() -> u64 {
         .unwrap_or(0)
 }
 
-/// The record's path, making its directory if need be.
+fn file() -> Result<PathBuf, String> {
+    Ok(private_dir()?.join("confirm"))
+}
+
+/// This user's own directory under the OS temporary directory, made if need be.
 ///
 /// The temporary directory on Unix is shared by every user, so the directory
 /// is named for this one and must be theirs and closed to everyone else. A
 /// directory someone else made under that name is refused rather than used:
 /// they could otherwise plant a record and answer the prompt for this user.
 #[cfg(unix)]
-fn file() -> Result<PathBuf, String> {
+pub fn private_dir() -> Result<PathBuf, String> {
     use std::os::unix::fs::{DirBuilderExt, MetadataExt, PermissionsExt};
 
     // SAFETY: geteuid has no preconditions and cannot fail.
@@ -246,15 +250,15 @@ fn file() -> Result<PathBuf, String> {
             dir.display()
         ));
     }
-    Ok(dir.join("confirm"))
+    Ok(dir)
 }
 
 /// Windows gives each user a temporary directory of their own.
 #[cfg(not(unix))]
-fn file() -> Result<PathBuf, String> {
+pub fn private_dir() -> Result<PathBuf, String> {
     let dir = std::env::temp_dir().join("tether");
     std::fs::create_dir_all(&dir).map_err(|e| format!("{}: {e}", dir.display()))?;
-    Ok(dir.join("confirm"))
+    Ok(dir)
 }
 
 fn write_private(path: &std::path::Path, bytes: &[u8]) -> std::io::Result<()> {
