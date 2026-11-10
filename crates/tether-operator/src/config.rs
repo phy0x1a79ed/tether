@@ -89,6 +89,7 @@ impl Config {
             os: std::env::consts::OS.to_string(),
             build: self.build.clone(),
             resume: true,
+            files: false,
         }
     }
 }

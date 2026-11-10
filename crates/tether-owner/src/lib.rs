@@ -4,6 +4,7 @@ pub mod exec;
 pub mod layout;
 pub mod log;
 pub mod platform;
+pub mod puts;
 pub mod screen;
 pub mod session;
 pub mod ui;

@@ -202,6 +202,7 @@ async fn own(address: Relay, code: InviteCode, how: Owner) -> Seen {
         // An owner from before resuming, so these tests also cover a new
         // daemon with an old client.
         resume: false,
+        files: false,
     }))
     .await
     .unwrap();
@@ -274,6 +275,9 @@ fn name(frame: &Frame) -> String {
         Frame::Hold(_) => "hold",
         Frame::Ack { .. } => "ack",
         Frame::Resume { .. } => "resume",
+        Frame::Put { .. } => "put",
+        Frame::Placed { .. } => "placed",
+        Frame::Refused { .. } => "refused",
     }
     .into()
 }
@@ -600,6 +604,15 @@ async fn cutting_tells_the_owner_why_and_leaves_the_session_explained() {
     let (invite, owner) = invited(&rig, Owner::Report(0)).await;
     let slot = invite["slot"].as_u64().unwrap();
     until(&rig, slot, "open").await;
+
+    // This owner is from before files: a file is refused by name, and the
+    // session carries on.
+    let err = rig
+        .operator
+        .handle("file", &json!({"path": "/etc/hostname"}))
+        .await
+        .unwrap_err();
+    assert!(err.contains("too old to take files"), "{err}");
 
     rig.operator
         .handle("cut", &json!({"reason": "the backup is finished"}))

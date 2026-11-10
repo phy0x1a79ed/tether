@@ -141,7 +141,12 @@ impl Issuer for Command {
 }
 
 impl Restore for Command {
-    fn restore(&self, slot: Slot, seat: &str, owner: &str) -> BoxFuture<'static, Result<(), LinkError>> {
+    fn restore(
+        &self,
+        slot: Slot,
+        seat: &str,
+        owner: &str,
+    ) -> BoxFuture<'static, Result<(), LinkError>> {
         let (argv, request) = (self.argv.clone(), restore_request(slot, seat, owner));
         Box::pin(async move {
             let answer = Self::ask(argv, request).await.map_err(LinkError::Issuer)?;
@@ -171,7 +176,11 @@ mod tests {
         .unwrap();
         assert_eq!(
             (issued.slot.get(), issued.seat.as_str(), issued.lifetime),
-            (417, "00112233445566778899aabbccddeeff", Duration::from_secs(60))
+            (
+                417,
+                "00112233445566778899aabbccddeeff",
+                Duration::from_secs(60)
+            )
         );
     }
 
@@ -190,8 +199,14 @@ mod tests {
         let taken = script(r#"cat >/dev/null; echo '{"refused": "taken"}'"#);
         let ended = script(r#"cat >/dev/null; echo '{"refused": "ended"}'"#);
         let back = script(r#"grep -q '"slot":"12"' && echo '{"restored": true}'"#);
-        assert!(matches!(taken.restore(slot, "s", "o").await, Err(LinkError::Taken)));
-        assert!(matches!(ended.restore(slot, "s", "o").await, Err(LinkError::Ended)));
+        assert!(matches!(
+            taken.restore(slot, "s", "o").await,
+            Err(LinkError::Taken)
+        ));
+        assert!(matches!(
+            ended.restore(slot, "s", "o").await,
+            Err(LinkError::Ended)
+        ));
         back.restore(slot, "s", "o").await.unwrap();
     }
 

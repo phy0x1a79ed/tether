@@ -39,6 +39,7 @@ use crate::confirm::Pending;
 use crate::consent::{self, Answer, Ask};
 use crate::exec::Runner;
 use crate::log::Log;
+use crate::puts::Puts;
 use crate::ui::{self, Event, Facts, Typed, Ui};
 
 /// How often the header's clock is redrawn.
@@ -295,6 +296,7 @@ pub async fn run(
 
     let (out_tx, mut out_rx) = mpsc::channel::<Frame>(256);
     let mut runner = Runner::new(out_tx);
+    let mut puts = Puts::default();
 
     // Only on a terminal. Under `setsid`, in a pipe or in a test there is no
     // console to attach to, and the session still runs and is still visible.
@@ -475,6 +477,23 @@ pub async fn run(
                     runner.resize(task, cols, rows).await;
                 }
                 Frame::Close { task } => runner.close(task).await,
+                Frame::Put {
+                    file,
+                    name,
+                    offset,
+                    data,
+                    last,
+                } => {
+                    let took = puts.take(file, &name, offset, &data, last);
+                    if let Some(note) = took.note {
+                        ui.apply(Event::Note(note));
+                    }
+                    if let Some(reply) = took.reply {
+                        if link.send(&reply).is_err() {
+                            break Outcome::PeerLeft;
+                        }
+                    }
+                }
                 Frame::Say { text } => ui.apply(Event::Said {
                     from_operator: true,
                     text,
@@ -495,9 +514,13 @@ pub async fn run(
                 Frame::Pong { .. } | Frame::Hello(_) | Frame::Defer { .. } => {}
                 // The link's own frames. It never hands them up.
                 Frame::Hold(_) | Frame::Ack { .. } | Frame::Resume { .. } => {}
-                // Output and Exit are this side's to produce. A peer sending
-                // one is claiming something ran here that did not.
-                Frame::Output { .. } | Frame::Exit { .. } => {
+                // Output, Exit and a file's answer are this side's to produce.
+                // A peer sending one is claiming something happened here that
+                // did not.
+                Frame::Output { .. }
+                | Frame::Exit { .. }
+                | Frame::Placed { .. }
+                | Frame::Refused { .. } => {
                     let why = "the other end reported output from a program it is not running";
                     runner.shutdown().await;
                     ui.apply(Event::Cut { reason: why.into() });

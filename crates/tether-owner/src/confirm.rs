@@ -283,6 +283,7 @@ mod tests {
             os: "linux".into(),
             build: "9fda69b".into(),
             resume: false,
+            files: false,
         }
     }
 

@@ -30,6 +30,7 @@ pub mod issuer;
 pub mod journal;
 pub mod log;
 pub mod operator;
+pub mod outbox;
 pub mod session;
 pub mod watch;
 

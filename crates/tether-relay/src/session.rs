@@ -938,10 +938,15 @@ mod tests {
                 .expect("a leg back inside the grace finds its slot");
         }
 
-        let (ticket, _) = s.claim(issued.slot, at).expect("the slot still hands out tickets");
+        let (ticket, _) = s
+            .claim(issued.slot, at)
+            .expect("the slot still hands out tickets");
         assert!(matches!(
             s.join(issued.slot, ticket, chan(), at),
-            Ok(Join::Paired { seat: Seat::Owner, .. })
+            Ok(Join::Paired {
+                seat: Seat::Owner,
+                ..
+            })
         ));
     }
 

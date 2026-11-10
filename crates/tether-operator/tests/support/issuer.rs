@@ -40,7 +40,12 @@ impl Issuer for RelayHost {
 }
 
 impl Restore for RelayHost {
-    fn restore(&self, slot: Slot, seat: &str, owner: &str) -> BoxFuture<'static, Result<(), LinkError>> {
+    fn restore(
+        &self,
+        slot: Slot,
+        seat: &str,
+        owner: &str,
+    ) -> BoxFuture<'static, Result<(), LinkError>> {
         let (relay, bearer) = (self.relay.clone(), self.bearer.clone());
         let body = issuer::restore_request(slot, seat, owner).to_string();
         Box::pin(async move {

@@ -256,6 +256,7 @@ async fn own(relay: Relay, code: InviteCode, can_resume: bool, window: Duration)
         os: "linux".into(),
         build: "test".into(),
         resume: can_resume,
+        files: can_resume,
     };
     let mut link = match Link::dial_owner_via(&relay, &code, Carry::Socket).await {
         Ok(link) => link,
@@ -334,6 +335,48 @@ async fn a_command_running_through_an_owner_side_gap_comes_back_whole() {
         matches!(ended, Outcome::Cut(ref why) if why == "done here"),
         "{ended:?}"
     );
+    rig.relay.stop();
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_file_lands_whole_under_the_owners_temp_through_a_gap() {
+    let rig = Rig::new(RESUME_WINDOW).await;
+    let (slot, _, owner) = rig.open(true).await;
+    let source = std::env::temp_dir().join(format!("tether-put-{}.bin", std::process::id()));
+    let bytes: Vec<u8> = (0..24u32 << 20).map(|i| (i % 251) as u8).collect();
+    std::fs::write(&source, &bytes).unwrap();
+
+    let operator = Arc::clone(&rig.operator);
+    let path = source.display().to_string();
+    let put = tokio::spawn(async move {
+        operator
+            .handle("file", &json!({ "path": path, "name": "../a report.bin" }))
+            .await
+    });
+    tokio::time::sleep(Duration::from_millis(200)).await;
+    rig.owner_path.cut();
+    rig.until(slot, "reconnecting").await;
+    tokio::time::sleep(Duration::from_secs(1)).await;
+    rig.owner_path.restore();
+
+    let placed = tokio::time::timeout(Duration::from_secs(60), put)
+        .await
+        .expect("the owner should answer for the file")
+        .unwrap()
+        .expect("the owner should take the file");
+    let landed = std::path::PathBuf::from(placed["path"].as_str().unwrap());
+    assert!(landed.starts_with(std::env::temp_dir()), "{landed:?}");
+    assert_eq!(landed.file_name().unwrap(), "a report.bin");
+    assert_eq!(placed["bytes"], json!(bytes.len()));
+    assert!(
+        std::fs::read(&landed).unwrap() == bytes,
+        "the bytes should match"
+    );
+    std::fs::remove_dir_all(landed.parent().unwrap()).unwrap();
+    std::fs::remove_file(&source).unwrap();
+
+    rig.cut("done here").await;
+    outcome(owner, Duration::from_secs(20)).await;
     rig.relay.stop();
 }
 

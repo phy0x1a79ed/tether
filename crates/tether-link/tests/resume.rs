@@ -87,7 +87,12 @@ impl Proxy {
 struct RelayHost(Relay);
 
 impl Restore for RelayHost {
-    fn restore(&self, slot: Slot, seat: &str, owner: &str) -> BoxFuture<'static, Result<(), LinkError>> {
+    fn restore(
+        &self,
+        slot: Slot,
+        seat: &str,
+        owner: &str,
+    ) -> BoxFuture<'static, Result<(), LinkError>> {
         let relay = self.0.clone();
         let body = serde_json::json!({"slot": slot.to_string(), "token": seat, "owner": owner})
             .to_string();

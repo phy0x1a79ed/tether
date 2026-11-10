@@ -219,6 +219,7 @@ fn me() -> Hello {
         os: std::env::consts::OS.to_string(),
         build: build(),
         resume: true,
+        files: true,
     }
 }
 

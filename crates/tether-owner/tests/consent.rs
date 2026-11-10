@@ -125,6 +125,7 @@ async fn stage() -> Stage {
                         os: "linux".into(),
                         build: "test".into(),
                         resume: false,
+                        files: false,
                     }))
                     .await;
                 let answer = loop {

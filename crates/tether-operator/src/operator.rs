@@ -47,11 +47,8 @@ pub struct Operator {
 impl Operator {
     pub fn new(cfg: Config) -> Arc<Self> {
         let journal = Arc::new(Journal::new());
-        let (kind, body) = journal::daemon_started(
-            &cfg.build,
-            &cfg.relay.to_string(),
-            cfg.issuer.is_some(),
-        );
+        let (kind, body) =
+            journal::daemon_started(&cfg.build, &cfg.relay.to_string(), cfg.issuer.is_some());
         journal.append(None, kind, body);
         Arc::new(Self {
             cfg: Arc::new(cfg),
@@ -146,6 +143,20 @@ impl Operator {
                 let text = text(args, "text")?;
                 self.put(args, What::Say { text }).await
             }
+            "file" => {
+                let path = std::path::PathBuf::from(text(args, "path")?);
+                if !path.is_absolute() {
+                    return Err("`path` must be absolute".into());
+                }
+                self.put(
+                    args,
+                    What::File {
+                        path,
+                        name: optional(args, "name"),
+                    },
+                )
+                .await
+            }
             "cut" => {
                 let reason = optional(args, "reason")
                     .unwrap_or_else(|| "the operator ended the session".into());
@@ -153,8 +164,8 @@ impl Operator {
             }
             other => Err(format!(
                 "`{other}` is not a tether verb; this daemon answers invite, \
-                 status, run, shell, keys, resize, close, tasks, send, cut \
-                 and watch"
+                 status, run, shell, keys, resize, close, tasks, send, file, \
+                 cut and watch"
             )),
         }
     }

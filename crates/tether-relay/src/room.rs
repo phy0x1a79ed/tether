@@ -228,8 +228,15 @@ impl State {
 }
 
 impl Room {
-    fn new(name: String, kind: Kind, host: Digest, file: Option<PathBuf>, files: Store,
-           last: u64, now: Instant) -> Self {
+    fn new(
+        name: String,
+        kind: Kind,
+        host: Digest,
+        file: Option<PathBuf>,
+        files: Store,
+        last: u64,
+        now: Instant,
+    ) -> Self {
         Room {
             name,
             kind,
@@ -273,7 +280,9 @@ impl Room {
         if let Some(file) = &self.file {
             if let Err(e) = fs::remove_file(file) {
                 if e.kind() != io::ErrorKind::NotFound {
-                    log::warn(format_args!("could not remove a persistent room's file: {e}"));
+                    log::warn(format_args!(
+                        "could not remove a persistent room's file: {e}"
+                    ));
                 }
             }
         }
@@ -409,8 +418,10 @@ impl Rooms {
     pub fn with_state(limits: Limits, state: Option<PathBuf>) -> Self {
         let files = match &state {
             Some(dir) => dir.join("files"),
-            None => std::env::temp_dir()
-                .join(format!("tether-room-files-{}", &Token::mint().to_hex()[..16])),
+            None => std::env::temp_dir().join(format!(
+                "tether-room-files-{}",
+                &Token::mint().to_hex()[..16]
+            )),
         };
         let rooms = Self {
             inner: Mutex::default(),
@@ -459,7 +470,15 @@ impl Rooms {
             _ => None,
         };
         let files = Store::new(self.files.join(&name));
-        let room = Arc::new(Room::new(name.clone(), kind, host.digest(), file, files, 0, now));
+        let room = Arc::new(Room::new(
+            name.clone(),
+            kind,
+            host.digest(),
+            file,
+            files,
+            0,
+            now,
+        ));
         room.save(0);
         table.insert(name, Arc::clone(&room));
         Some((room, host))
@@ -535,7 +554,15 @@ fn restore(dir: &Path, files: &Path, now: Instant) -> io::Result<Vec<Room>> {
             Some((name, host, reserved)) => {
                 // Numbered from the floor, so no number is given out twice.
                 let store = Store::restore(files.join(&name));
-                let room = Room::new(name, Kind::Persistent, host, Some(path), store, reserved, now);
+                let room = Room::new(
+                    name,
+                    Kind::Persistent,
+                    host,
+                    Some(path),
+                    store,
+                    reserved,
+                    now,
+                );
                 found.push(room);
             }
             None => log::warn(format_args!(
@@ -929,7 +956,10 @@ mod tests {
             let body = format!(r#"{{"from":"h","text":"plain-{i}","sealed":"c2VhbGVk"}}"#);
             last = kept.post(Who::Host, body.as_bytes(), t0).unwrap();
         }
-        let files: Vec<_> = fs::read_dir(&dir).unwrap().map(|e| e.unwrap().path()).collect();
+        let files: Vec<_> = fs::read_dir(&dir)
+            .unwrap()
+            .map(|e| e.unwrap().path())
+            .collect();
         assert_eq!(files.len(), 1, "{files:?}");
         let text = fs::read_to_string(&files[0]).unwrap();
         for needle in ["plain-", "c2VhbGVk", "sealed", &host.to_hex()] {
@@ -938,11 +968,16 @@ mod tests {
         drop(before);
 
         let after = Rooms::with_state(Limits::default(), Some(dir.clone()));
-        let back = after.get(&kept.name, t0).expect("the persistent room is back");
+        let back = after
+            .get(&kept.name, t0)
+            .expect("the persistent room is back");
         assert_eq!(back.kind, Kind::Persistent);
         assert!(back.is_host(&host));
         assert!(!back.is_host(&Token::mint()));
-        assert!(after.get(&task.name, t0).is_none(), "a task room ends with the relay");
+        assert!(
+            after.get(&task.name, t0).is_none(),
+            "a task room ends with the relay"
+        );
         let batch = back.read(last);
         assert!(batch.messages.is_empty() && batch.ended.is_none());
         let seq = back.post(Who::Guest, br#"{"from":"g"}"#, t0).unwrap();
@@ -958,7 +993,10 @@ mod tests {
 
     #[tokio::test]
     async fn a_room_s_files_go_when_its_linger_ends_and_the_oldest_go_past_the_cap() {
-        let r = Rooms::new(Limits { room_linger: Duration::ZERO, ..Limits::default() });
+        let r = Rooms::new(Limits {
+            room_linger: Duration::ZERO,
+            ..Limits::default()
+        });
         let t0 = Instant::now();
         let (room, _) = r.open(Kind::Task, t0).unwrap();
         let mut first = None;
@@ -969,7 +1007,10 @@ mod tests {
         }
         let dir = r.files.join(&room.name);
         assert_eq!(fs::read_dir(&dir).unwrap().count(), crate::files::MAX_FILES);
-        assert!(room.files.get(first.as_deref().unwrap()).is_none(), "the oldest went");
+        assert!(
+            room.files.get(first.as_deref().unwrap()).is_none(),
+            "the oldest went"
+        );
         room.end(Ended::HostClosed, t0);
         assert_eq!(r.reap(t0), 1);
         assert!(!dir.exists());
@@ -979,9 +1020,11 @@ mod tests {
     fn a_file_that_is_not_a_persistent_room_is_skipped() {
         let dir = state_dir("skip");
         fs::create_dir_all(&dir).unwrap();
-        fs::write(dir.join("acre-anchor-kettle.json"),
-                  r#"{"name":"acre-anchor-kettle","kind":"persistent","host":"00","reserved":1}"#)
-            .unwrap();
+        fs::write(
+            dir.join("acre-anchor-kettle.json"),
+            r#"{"name":"acre-anchor-kettle","kind":"persistent","host":"00","reserved":1}"#,
+        )
+        .unwrap();
         fs::write(dir.join("junk.json"), "not json").unwrap();
         let rooms = Rooms::with_state(Limits::default(), Some(dir.clone()));
         assert_eq!(rooms.live(), 0);

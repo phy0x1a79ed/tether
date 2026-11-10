@@ -69,6 +69,7 @@ fn hello(role: Role, who: &str) -> Hello {
         os: "linux".into(),
         build: "test".into(),
         resume: false,
+        files: false,
     }
 }
 
@@ -210,6 +211,7 @@ async fn own_via(
     // every test here also covers a new client with an old daemon.
     let me = Hello {
         resume: true,
+        files: true,
         ..hello(Role::Owner, "the owner")
     };
     let mut link = match Link::dial_owner_via(&invite.relay, &invite.code, carry).await {

@@ -605,9 +605,7 @@ pub const SOCKET_SILENCE: Duration = Duration::from_secs(60);
 /// our own.
 async fn next_binary<S>(socket: &mut S) -> Result<Vec<u8>, LinkError>
 where
-    S: futures_util::Stream<Item = Result<Message, WsError>>
-        + futures_util::Sink<Message>
-        + Unpin,
+    S: futures_util::Stream<Item = Result<Message, WsError>> + futures_util::Sink<Message> + Unpin,
 {
     let mut beat = tokio::time::interval(SOCKET_KEEPALIVE);
     beat.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
@@ -674,7 +672,10 @@ mod tests {
     async fn a_socket_that_stops_answering_is_a_lost_leg() {
         let (mut ours, _relay) = pair().await;
         let started = tokio::time::Instant::now();
-        assert!(matches!(next_binary(&mut ours).await, Err(LinkError::Closed)));
+        assert!(matches!(
+            next_binary(&mut ours).await,
+            Err(LinkError::Closed)
+        ));
         assert!(started.elapsed() >= SOCKET_SILENCE);
     }
 }

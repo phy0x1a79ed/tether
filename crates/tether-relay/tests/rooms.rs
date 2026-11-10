@@ -180,7 +180,13 @@ async fn a_persistent_room_comes_back_after_a_relay_restart() {
     let before = json(&body)["seq"].as_u64().unwrap();
     let (_, body) = guest(r.addr, "POST", &format!("/room/{}/file", room.name), "kept").await;
     let kept = json(&body)["id"].as_str().unwrap().to_string();
-    guest(r.addr, "POST", &format!("/room/{}/file", task.name), "swept").await;
+    guest(
+        r.addr,
+        "POST",
+        &format!("/room/{}/file", task.name),
+        "swept",
+    )
+    .await;
     r.stop();
 
     let r = relay_with_state(Limits::default(), Some(dir.clone())).await;
@@ -190,17 +196,40 @@ async fn a_persistent_room_comes_back_after_a_relay_restart() {
     let (status, body) = host(r.addr, &room, "GET", &recv, "").await;
     assert_eq!(status, 200, "the host token still holds: {body}");
     assert!(json(&body)["ended"].is_null());
-    let (_, body) = host(r.addr, &room, "POST", &send, r#"{"from":"opal","text":"after"}"#).await;
+    let (_, body) = host(
+        r.addr,
+        &room,
+        "POST",
+        &send,
+        r#"{"from":"opal","text":"after"}"#,
+    )
+    .await;
     assert!(json(&body)["seq"].as_u64().unwrap() > before);
     let (_, body) = guest(r.addr, "GET", &recv, "").await;
     let got = json(&body);
     assert_eq!(got["messages"][0]["text"], "after");
     assert_eq!(got["messages"][0]["by"], "host");
-    let (status, body) = guest(r.addr, "GET", &format!("/room/{}/file/{kept}", room.name), "").await;
-    assert_eq!((status, body.as_str()), (200, "kept"), "a persistent room's files come back");
-    let left: Vec<_> = std::fs::read_dir(dir.join("files")).unwrap()
-        .map(|e| e.unwrap().file_name().into_string().unwrap()).collect();
-    assert_eq!(left, std::slice::from_ref(&room.name), "a task room's files are swept");
+    let (status, body) = guest(
+        r.addr,
+        "GET",
+        &format!("/room/{}/file/{kept}", room.name),
+        "",
+    )
+    .await;
+    assert_eq!(
+        (status, body.as_str()),
+        (200, "kept"),
+        "a persistent room's files come back"
+    );
+    let left: Vec<_> = std::fs::read_dir(dir.join("files"))
+        .unwrap()
+        .map(|e| e.unwrap().file_name().into_string().unwrap())
+        .collect();
+    assert_eq!(
+        left,
+        std::slice::from_ref(&room.name),
+        "a task room's files are swept"
+    );
     r.stop();
     let _ = std::fs::remove_dir_all(&dir);
 }
@@ -248,7 +277,13 @@ async fn a_guest_with_only_the_name_reads_the_how_to_and_talks_with_the_host() {
         r#"{"from":"opal","text":"hello guest"}"#,
     )
     .await;
-    let (_, body) = guest(r.addr, "GET", &format!("/room/{}/recv?after=1", room.name), "").await;
+    let (_, body) = guest(
+        r.addr,
+        "GET",
+        &format!("/room/{}/recv?after=1", room.name),
+        "",
+    )
+    .await;
     let got = json(&body);
     assert_eq!(got["messages"][0]["text"], "hello guest");
     assert_eq!(got["messages"][0]["by"], "host");
@@ -415,7 +450,13 @@ async fn a_room_whose_host_goes_quiet_ends() {
     let r = relay(limits).await;
     let room = open(r.addr).await;
     tokio::time::sleep(Duration::from_millis(300)).await;
-    let (status, body) = guest(r.addr, "GET", &format!("/room/{}/recv?after=0", room.name), "").await;
+    let (status, body) = guest(
+        r.addr,
+        "GET",
+        &format!("/room/{}/recv?after=0", room.name),
+        "",
+    )
+    .await;
     assert_eq!(status, 200);
     assert_eq!(json(&body)["ended"], "the host went quiet");
     r.stop();
@@ -541,7 +582,13 @@ async fn a_file_goes_up_in_parts_and_comes_down_whole_once_the_last_is_in() {
     let room = open(r.addr).await;
     // Larger than axum's default body limit, which the file routes must not apply.
     let first = "a".repeat(3 * 1024 * 1024);
-    let (status, body) = guest(r.addr, "POST", &format!("/room/{}/file?more=1", room.name), &first).await;
+    let (status, body) = guest(
+        r.addr,
+        "POST",
+        &format!("/room/{}/file?more=1", room.name),
+        &first,
+    )
+    .await;
     assert_eq!(status, 200, "{body}");
     let v = json(&body);
     let id = v["id"].as_str().unwrap().to_string();
@@ -554,20 +601,44 @@ async fn a_file_goes_up_in_parts_and_comes_down_whole_once_the_last_is_in() {
     assert_eq!(status, 409);
     assert_eq!(json(&body)["size"], first.len());
 
-    let (status, body) =
-        host(r.addr, &room, "POST", &format!("{file}?offset={}", first.len()), "tail").await;
+    let (status, body) = host(
+        r.addr,
+        &room,
+        "POST",
+        &format!("{file}?offset={}", first.len()),
+        "tail",
+    )
+    .await;
     assert_eq!(status, 200, "{body}");
     assert_eq!(json(&body)["size"], first.len() + 4);
     let (status, body) = guest(r.addr, "GET", &file, "").await;
     assert_eq!(status, 200);
     assert_eq!(body, format!("{first}tail"));
-    let (status, _) = guest(r.addr, "POST", &format!("{file}?offset={}", first.len() + 4), "x").await;
+    let (status, _) = guest(
+        r.addr,
+        "POST",
+        &format!("{file}?offset={}", first.len() + 4),
+        "x",
+    )
+    .await;
     assert_eq!(status, 404, "a finished file takes no more parts");
 
-    let (status, _) = guest(r.addr, "GET", &format!("/room/{}/file/{}", room.name, "0".repeat(32)), "").await;
+    let (status, _) = guest(
+        r.addr,
+        "GET",
+        &format!("/room/{}/file/{}", room.name, "0".repeat(32)),
+        "",
+    )
+    .await;
     assert_eq!(status, 404);
     let message = format!(r#"{{"from":"g","file":{{"id":"{id}","name":"a.txt","size":3}}}}"#);
-    let (status, _) = guest(r.addr, "POST", &format!("/room/{}/send", room.name), &message).await;
+    let (status, _) = guest(
+        r.addr,
+        "POST",
+        &format!("/room/{}/send", room.name),
+        &message,
+    )
+    .await;
     assert_eq!(status, 200, "a message names a file like any other field");
     r.stop();
 }

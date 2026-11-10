@@ -133,6 +133,11 @@ pub struct Hello {
     /// older peer's `Hello`, which reads as false.
     #[serde(default)]
     pub resume: bool,
+    /// This end takes [`Frame::Put`]. Absent from an older peer's `Hello`,
+    /// which reads as false, so an older owner is never sent a frame it
+    /// cannot decode.
+    #[serde(default)]
+    pub files: bool,
 }
 
 /// What lets the owner back into a session after a drop. See [`Frame::Hold`].
@@ -204,6 +209,31 @@ pub enum Frame {
     /// the operator says what they are about to do before doing it.
     Say {
         text: String,
+    },
+
+    /// Part of a file for the owner's machine, the operator to the owner.
+    ///
+    /// `file` names one transfer and is minted by the operator. Parts arrive
+    /// in order from offset zero. The owner writes them under its temporary
+    /// directory and answers the `last` part with `Placed`, or any part with
+    /// `Refused`, after which it ignores the rest of that file. A file is
+    /// never visible under its own name until its last part is in.
+    Put {
+        file: u32,
+        name: String,
+        offset: u64,
+        data: Vec<u8>,
+        last: bool,
+    },
+    /// The file is whole, at `path` on the owner's machine.
+    Placed {
+        file: u32,
+        path: String,
+    },
+    /// The owner could not take the file, and why.
+    Refused {
+        file: u32,
+        why: String,
     },
 
     /// End the session. Either end may send it, at any time, and the other end
@@ -311,6 +341,7 @@ mod tests {
             os: "linux".into(),
             build: "deadbeef".into(),
             resume: true,
+            files: true,
         })
     }
 
@@ -361,6 +392,21 @@ mod tests {
             }),
             Frame::Ack { received: 12 },
             Frame::Resume { received: 12 },
+            Frame::Put {
+                file: 1,
+                name: "notes.txt".into(),
+                offset: 0,
+                data: b"hello".to_vec(),
+                last: true,
+            },
+            Frame::Placed {
+                file: 1,
+                path: "/tmp/tether-1/notes.txt".into(),
+            },
+            Frame::Refused {
+                file: 1,
+                why: "disk full".into(),
+            },
         ];
         for f in frames {
             assert_eq!(Frame::decode(&f.encode().unwrap()).unwrap(), f);
@@ -420,7 +466,7 @@ mod tests {
             build: "v0.1.1".into(),
         });
         match Frame::decode(&rmp_serde::to_vec_named(&old).unwrap()).unwrap() {
-            Frame::Hello(hello) => assert!(!hello.resume),
+            Frame::Hello(hello) => assert!(!hello.resume && !hello.files),
             other => panic!("{other:?}"),
         }
     }

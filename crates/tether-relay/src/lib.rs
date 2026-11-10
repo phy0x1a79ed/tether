@@ -174,7 +174,10 @@ pub fn router(relay: Arc<Relay>) -> Router {
         .route("/room/{name}/ws", get(room_ws))
         .route("/room/{name}/leave", post(room_leave))
         .route("/room/{name}/file", post(room_file_new))
-        .route("/room/{name}/file/{id}", get(room_file_get).post(room_file_more))
+        .route(
+            "/room/{name}/file/{id}",
+            get(room_file_get).post(room_file_more),
+        )
         // A path that is not here answers exactly as a refusal does.
         .fallback(|| async { nothing_here() })
         .with_state(relay)
@@ -574,7 +577,10 @@ async fn room_open(State(relay): State<Arc<Relay>>, headers: HeaderMap, body: By
             log::info(format_args!("opened a {} room", kind.as_str()));
             let limits = &relay.config.limits;
             let (idle_s, life_s) = match kind {
-                RoomKind::Task => (Some(limits.room_idle.as_secs()), Some(limits.room_life.as_secs())),
+                RoomKind::Task => (
+                    Some(limits.room_idle.as_secs()),
+                    Some(limits.room_life.as_secs()),
+                ),
                 RoomKind::Persistent => (None, None),
             };
             Json(json!({
@@ -770,9 +776,14 @@ async fn room_file_new(
     };
     match room.take_upload(Instant::now()) {
         Ok(()) => {}
-        Err(SendError::Ended) => return room_ended(room.ended().expect("an ended room has a reason")),
+        Err(SendError::Ended) => {
+            return room_ended(room.ended().expect("an ended room has a reason"))
+        }
         Err(_) => {
-            return (StatusCode::TOO_MANY_REQUESTS, "this room is taking too many messages\n")
+            return (
+                StatusCode::TOO_MANY_REQUESTS,
+                "this room is taking too many messages\n",
+            )
                 .into_response()
         }
     }
@@ -791,12 +802,20 @@ async fn room_file_more(
         Ok(found) => found,
         Err(refused) => return *refused,
     };
-    let Some(id) = files::parse_id(&id) else { return nothing_here() };
+    let Some(id) = files::parse_id(&id) else {
+        return nothing_here();
+    };
     put_part(&relay, &room, Some(id), part.offset, part.more != 0, body).await
 }
 
-async fn put_part(relay: &Relay, room: &Room, id: Option<&str>, offset: u64, more: bool,
-                  body: Body) -> Response {
+async fn put_part(
+    relay: &Relay,
+    room: &Room,
+    id: Option<&str>,
+    offset: u64,
+    more: bool,
+    body: Body,
+) -> Response {
     if let Some(why) = room.ended() {
         return room_ended(why);
     }
@@ -804,8 +823,9 @@ async fn put_part(relay: &Relay, room: &Room, id: Option<&str>, offset: u64, mor
     match room.files.put(id, offset, more, body, floor).await {
         Ok((id, size)) => Json(json!({ "id": id, "size": size })).into_response(),
         Err(PutError::NoSuchFile) => nothing_here(),
-        Err(PutError::Offset(size)) => (StatusCode::CONFLICT, Json(json!({ "size": size })))
-            .into_response(),
+        Err(PutError::Offset(size)) => {
+            (StatusCode::CONFLICT, Json(json!({ "size": size }))).into_response()
+        }
         Err(PutError::Busy) => (
             StatusCode::CONFLICT,
             "another part of this file is still arriving\n",

@@ -40,7 +40,7 @@ use std::time::{Duration, SystemTime};
 use futures_util::future::BoxFuture;
 use tether_proto::frame::{Frame, HoldKeys, Role};
 use tether_proto::RESUME_WINDOW;
-use tokio::sync::{mpsc, oneshot};
+use tokio::sync::{mpsc, oneshot, Notify};
 use tokio::time::{sleep, sleep_until, timeout, Instant};
 
 use crate::{Link, LinkError};
@@ -89,7 +89,9 @@ pub enum Incoming {
     },
     /// A redial failed for a reason the session has not been told yet. The
     /// gap goes on.
-    Redialling { why: String },
+    Redialling {
+        why: String,
+    },
     /// The link is back. `resent` frames went again.
     Up {
         gap: Duration,
@@ -138,7 +140,28 @@ struct Shared {
     ended: AtomicBool,
     /// Bytes of counted frames sent and not yet acknowledged.
     kept: AtomicUsize,
+    /// Told whenever `kept` shrinks.
+    freed: Notify,
     gives_up_at: Mutex<Option<SystemTime>>,
+}
+
+/// Waits for a [`Resumable`] to have room, without borrowing it, so a session
+/// can wait on room and on the link's next frame in one `select!`.
+#[derive(Clone)]
+pub struct Room(Arc<Shared>);
+
+impl Room {
+    pub async fn wait(&self) {
+        loop {
+            let freed = self.0.freed.notified();
+            tokio::pin!(freed);
+            freed.as_mut().enable();
+            if self.0.kept.load(Ordering::Relaxed) < KEEP {
+                return;
+            }
+            freed.await;
+        }
+    }
 }
 
 /// A session's link, carried through drops when both ends can.
@@ -195,6 +218,7 @@ impl Resumable {
             up: AtomicBool::new(true),
             ended: AtomicBool::new(false),
             kept: AtomicUsize::new(0),
+            freed: Notify::new(),
             gives_up_at: Mutex::new(None),
         });
         let (out, out_rx) = mpsc::unbounded_channel();
@@ -207,6 +231,7 @@ impl Resumable {
             rejoin,
             sent: 0,
             received: 0,
+            owed: 0,
             unacked: VecDeque::new(),
             shared: Arc::clone(&shared),
             events: events_tx,
@@ -250,6 +275,11 @@ impl Resumable {
     /// false.
     pub fn has_room(&self) -> bool {
         self.shared.kept.load(Ordering::Relaxed) < KEEP
+    }
+
+    /// A handle that waits until [`Self::has_room`] would be true.
+    pub fn room(&self) -> Room {
+        Room(Arc::clone(&self.shared))
     }
 
     /// Queue a frame for the peer.
@@ -327,7 +357,9 @@ fn dropped(e: &LinkError) -> String {
 /// the encoding adds a few dozen bytes to the payload.
 fn weight(frame: &Frame) -> usize {
     64 + match frame {
-        Frame::Output { data, .. } | Frame::Input { data, .. } => data.len(),
+        Frame::Output { data, .. } | Frame::Input { data, .. } | Frame::Put { data, .. } => {
+            data.len()
+        }
         Frame::Say { text } => text.len(),
         _ => 0,
     }
@@ -358,6 +390,9 @@ struct Actor {
     sent: u64,
     /// How many counted frames have arrived.
     received: u64,
+    /// Bytes received since the last `Ack`. A quarter of [`KEEP`] sends one
+    /// early, so a peer sending fast is not held to one window per tick.
+    owed: usize,
     unacked: VecDeque<(u64, Frame)>,
     shared: Arc<Shared>,
     events: mpsc::Sender<Incoming>,
@@ -402,6 +437,7 @@ impl Actor {
             self.shared
                 .kept
                 .fetch_sub(weight(&frame), Ordering::Relaxed);
+            self.shared.freed.notify_waiters();
         }
     }
 
@@ -414,6 +450,7 @@ impl Actor {
             self.shared.kept.fetch_sub(weight(frame), Ordering::Relaxed);
             self.unacked.pop_front();
         }
+        self.shared.freed.notify_waiters();
     }
 
     async fn end(&mut self, why: LinkError) {
@@ -460,6 +497,12 @@ impl Actor {
                             link.close().await;
                             return Stop::Exit;
                         }
+                        if self.resumable() && self.owed >= KEEP / 4 {
+                            self.owed = 0;
+                            if let Err(e) = link.send(&Frame::Ack { received: self.received }).await {
+                                return Stop::Down(dropped(&e));
+                            }
+                        }
                     }
                     Err(e) => return Stop::Down(dropped(&e)),
                 },
@@ -481,6 +524,7 @@ impl Actor {
                     if heard.elapsed() > QUIET {
                         return Stop::Down("the other end stopped answering".into());
                     }
+                    self.owed = 0;
                     if let Err(e) = link.send(&Frame::Ack { received: self.received }).await {
                         return Stop::Down(dropped(&e));
                     }
@@ -511,6 +555,7 @@ impl Actor {
             frame => {
                 if self.counting_in && frame.counted() {
                     self.received += 1;
+                    self.owed += weight(&frame);
                 }
                 self.events.send(Incoming::Frame(frame)).await.is_ok()
             }
@@ -608,7 +653,8 @@ impl Actor {
                 // Waited in the chair and nobody came. Take it again at once:
                 // waiting is the right thing to be doing.
                 Err(LinkError::NobodyThere) => {
-                    self.redial_failed(&mut told, LinkError::NobodyThere.to_string()).await;
+                    self.redial_failed(&mut told, LinkError::NobodyThere.to_string())
+                        .await;
                     wait = Duration::ZERO;
                 }
                 Err(e) => {
@@ -660,7 +706,9 @@ impl Actor {
         self.acked(theirs);
         let again: Vec<Frame> = self.unacked.iter().map(|(_, f)| f.clone()).collect();
         for frame in &again {
-            link.send(frame).await.map_err(|e| Resent::Again(dropped(&e)))?;
+            link.send(frame)
+                .await
+                .map_err(|e| Resent::Again(dropped(&e)))?;
         }
         Ok(again.len() as u64)
     }

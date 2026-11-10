@@ -47,6 +47,7 @@ use tokio::sync::{mpsc, oneshot};
 
 use crate::config::{Config, RUN_TIMEOUT};
 use crate::journal::{self, Journal};
+use crate::outbox::Outbox;
 
 /// How long the daemon waits for consent once the two ends have paired.
 ///
@@ -113,6 +114,12 @@ pub enum What {
     /// to the program — see `Keys`.
     Say {
         text: String,
+    },
+    /// Put a file from this machine on the owner's. The answer is where it
+    /// landed, once the owner says.
+    File {
+        path: std::path::PathBuf,
+        name: Option<String>,
     },
     Cut {
         reason: String,
@@ -563,7 +570,10 @@ async fn carried(cfg: &Config, slot: Slot, seat: &str, link: Link, track: &Track
         keys,
         OperatorRejoin {
             relay: cfg.relay.clone(),
-            restore: cfg.issuer.clone().map(|i| i as Arc<dyn tether_link::resume::Restore>),
+            restore: cfg
+                .issuer
+                .clone()
+                .map(|i| i as Arc<dyn tether_link::resume::Restore>),
             slot,
             seat: seat.to_string(),
             window: cfg.resume_window,
@@ -714,6 +724,8 @@ const SILENCE: Duration = Duration::from_secs(3 * 45 + 30);
 async fn carry(link: &mut Resumable, track: &Track, rx: &mut mpsc::Receiver<Command>) {
     let mut tasks: BTreeMap<TaskId, Task> = BTreeMap::new();
     let mut next_task: TaskId = 1;
+    let mut outbox = Outbox::default();
+    let room = link.room();
     let mut nonce: u64 = 0;
     let mut heard = tokio::time::Instant::now();
     let mut beat = tokio::time::interval(KEEPALIVE);
@@ -837,6 +849,8 @@ async fn carry(link: &mut Resumable, track: &Track, rx: &mut mpsc::Receiver<Comm
                             break;
                         }
                     }
+                    Ok(Frame::Placed { file, path }) => outbox.answer(file, Ok(path)),
+                    Ok(Frame::Refused { file, why }) => outbox.answer(file, Err(why)),
                     Ok(_) => {}
                     Err(LinkError::GaveUp) => {
                         finish(track, LinkError::GaveUp.to_string());
@@ -860,7 +874,7 @@ async fn carry(link: &mut Resumable, track: &Track, rx: &mut mpsc::Receiver<Comm
                     return;
                 }
                 Some(Command { what, reply }) => {
-                    match run_verb(link, track, &mut tasks, &mut next_task, what, reply).await {
+                    match run_verb(link, track, &mut tasks, &mut next_task, &mut outbox, what, reply).await {
                         Carry::On => {}
                         Carry::Ended(why) => {
                             finish(track, why);
@@ -869,6 +883,17 @@ async fn carry(link: &mut Resumable, track: &Track, rx: &mut mpsc::Receiver<Comm
                     }
                 }
             },
+
+            // A part goes each turn the link has room, and the select's
+            // fairness keeps every other branch moving between parts.
+            _ = room.wait(), if outbox.has_parts() && link.is_up() => {
+                if let Some(part) = outbox.part() {
+                    if link.send(&part).is_err() {
+                        finish(track, "the session ended while sending a file");
+                        return;
+                    }
+                }
+            }
 
             _ = &mut overrun => {
                 let now = tokio::time::Instant::now();
@@ -935,6 +960,7 @@ async fn run_verb(
     track: &Track,
     tasks: &mut BTreeMap<TaskId, Task>,
     next_task: &mut TaskId,
+    outbox: &mut Outbox,
     what: What,
     reply: Ack,
 ) -> Carry {
@@ -959,6 +985,24 @@ async fn run_verb(
                 Ok(()) => Ok(json!({"ok": true, "said": true})),
                 Err(e) => Err(e.to_string()),
             });
+            Carry::On
+        }
+
+        What::File { path, name } => {
+            let takes = track
+                .state
+                .lock()
+                .is_ok_and(|s| s.owner.as_ref().is_some_and(|h| h.files));
+            if takes {
+                outbox.add(&path, name, reply);
+            } else {
+                let _ = reply.send(Err(
+                    "the owner's tether client is too old to take files; it needs v0.6.0 or \
+                     later. Write the file through a shell instead, or ask them to run the \
+                     launcher again for the current client"
+                        .into(),
+                ));
+            }
             Carry::On
         }
 
@@ -1212,7 +1256,10 @@ mod tests {
         let last = *REDIAL.last().unwrap();
         assert_eq!(redial(&LinkError::Closed, 99), Redial::After(last));
         let spent: Duration = REDIAL.iter().sum();
-        assert!(spent < Duration::from_secs(30), "{spent:?} outlasts the grace");
+        assert!(
+            spent < Duration::from_secs(30),
+            "{spent:?} outlasts the grace"
+        );
     }
 
     #[test]

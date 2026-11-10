@@ -63,7 +63,10 @@ pub struct Store {
 impl Store {
     /// An empty store in `dir`. The directory is made at the first upload.
     pub fn new(dir: PathBuf) -> Self {
-        Self { dir, entries: Mutex::default() }
+        Self {
+            dir,
+            entries: Mutex::default(),
+        }
     }
 
     /// The store a restarted relay finds in `dir`, oldest file first.
@@ -80,10 +83,21 @@ impl Store {
                 continue;
             }
             let at = meta.modified().unwrap_or(std::time::UNIX_EPOCH);
-            found.push((at, Entry { id, size: meta.len(), done, busy: false }));
+            found.push((
+                at,
+                Entry {
+                    id,
+                    size: meta.len(),
+                    done,
+                    busy: false,
+                },
+            ));
         }
         found.sort_by_key(|(at, _)| *at);
-        Self { dir, entries: Mutex::new(found.into_iter().map(|(_, e)| e).collect()) }
+        Self {
+            dir,
+            entries: Mutex::new(found.into_iter().map(|(_, e)| e).collect()),
+        }
     }
 
     /// The path and size of a finished file.
@@ -96,8 +110,14 @@ impl Store {
     /// Write one part of a file. `id` is `None` for the first part of a new
     /// file, and `more` says another part follows. Returns the id and the size
     /// the relay now holds.
-    pub async fn put(&self, id: Option<&str>, offset: u64, more: bool, body: Body,
-                     floor: u64) -> Result<(String, u64), PutError> {
+    pub async fn put(
+        &self,
+        id: Option<&str>,
+        offset: u64,
+        more: bool,
+        body: Body,
+        floor: u64,
+    ) -> Result<(String, u64), PutError> {
         let id = self.claim(id, offset)?;
         let part = self.dir.join(format!("{id}.part"));
         let written = write_part(&self.dir, &part, offset, body, floor).await;
@@ -134,7 +154,12 @@ impl Store {
         let mut entries = self.entries.lock().unwrap();
         let Some(id) = id else {
             let id = Token::mint().to_hex()[..32].to_string();
-            entries.push_back(Entry { id: id.clone(), size: 0, done: false, busy: true });
+            entries.push_back(Entry {
+                id: id.clone(),
+                size: 0,
+                done: false,
+                busy: true,
+            });
             while entries.len() > MAX_FILES {
                 let old = entries.pop_front().expect("more than MAX_FILES entries");
                 remove(&self.dir.join(&old.id));
@@ -170,8 +195,13 @@ impl Store {
 /// Append `body` to `part` at `offset`, and return the size it then has. On
 /// any failure the part is cut back to `offset`, so the same part can be sent
 /// again.
-async fn write_part(dir: &Path, part: &Path, offset: u64, body: Body,
-                    floor: u64) -> Result<u64, PutError> {
+async fn write_part(
+    dir: &Path,
+    part: &Path,
+    offset: u64,
+    body: Body,
+    floor: u64,
+) -> Result<u64, PutError> {
     let mut builder = tokio::fs::DirBuilder::new();
     builder.recursive(true);
     #[cfg(unix)]
@@ -186,7 +216,9 @@ async fn write_part(dir: &Path, part: &Path, offset: u64, body: Body,
         .map_err(|_| PutError::Broken)?;
     let result = async {
         file.set_len(offset).await.map_err(|_| PutError::Broken)?;
-        file.seek(io::SeekFrom::Start(offset)).await.map_err(|_| PutError::Broken)?;
+        file.seek(io::SeekFrom::Start(offset))
+            .await
+            .map_err(|_| PutError::Broken)?;
         if short_of_disk(dir, floor) {
             return Err(PutError::Full);
         }
@@ -226,7 +258,9 @@ fn remove(path: &Path) {
 #[cfg(unix)]
 fn short_of_disk(dir: &Path, floor: u64) -> bool {
     use std::os::unix::ffi::OsStrExt;
-    let Ok(path) = std::ffi::CString::new(dir.as_os_str().as_bytes()) else { return true };
+    let Ok(path) = std::ffi::CString::new(dir.as_os_str().as_bytes()) else {
+        return true;
+    };
     let mut stat: libc::statvfs = unsafe { std::mem::zeroed() };
     if unsafe { libc::statvfs(path.as_ptr(), &mut stat) } != 0 {
         return true;
