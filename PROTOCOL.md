@@ -134,7 +134,10 @@ Nothing sent is lost. Each end numbers the frames it sends, except `Ping`,
 A resumed channel starts with `Resume`, which says how many frames arrived, and
 each end then resends the rest in order. The kept frames are bounded at 8 MiB.
 When the bound is reached the owner stops reading a task's output, so the
-command blocks on its own write instead of losing it.
+command blocks on its own write instead of losing it, and the operator stops
+sending a file. The receiver acks on a 15-second timer and also as soon as a
+quarter of the bound has arrived since its last ack. Without that early ack a
+sender is held to 8 MiB per tick, about half a megabyte a second.
 
 An end notices a drop when its socket fails, when it hears nothing for a
 minute, or when its wall clock jumped past its monotonic clock, which is how a
@@ -216,7 +219,7 @@ The grammar therefore lives in two places that must match exactly.
 
 | Half | File | Owns |
 | --- | --- | --- |
-| the door | `awm/services/httpsfront/awm/httpsfront/tether.py` | which paths the edge forwards |
+| the door | `awm/core/plugins/auth/src/policy.rs`, module `tether` | which paths the edge forwards |
 | the parser | `tether-proto/src/invite.rs`, `tether-relay/src/token.rs` | which slots and tokens the relay accepts |
 
 A third name joins that family whenever a client is added. The launcher builds
@@ -235,8 +238,9 @@ and every session runs without resume, silently.
 Rooms sit beside the family, not inside it. The edge serves them at its own
 root, so a link spells out its kind: `/tether/` is a machine, `/room/` a room.
 The door carries `POST /room` for the operator, and `/room/{name}` with
-`/send`, `/recv`, `/ws` and `/leave` for the guest, all forwarded with the path
-unchanged. A name is three list words for a task room and six for a persistent
+`/send`, `/recv`, `/ws`, `/leave`, `/file` and `/file/{id}` for the guest, all
+forwarded with the path unchanged. A file id is 32 lowercase hex characters,
+the token shape. A name is three list words for a task room and six for a persistent
 one, lowercase and joined by hyphens. `room::parse_name` accepts those two
 shapes and no other, so the door's pattern can match them exactly. Without
 these routes the how-to a guest is sent to answers `404`.
@@ -246,8 +250,8 @@ their deadlines, the limits, and the how-to text that is the guest's whole proto
 A door looser than the parser forwards malformed input the door exists to
 refuse. A door tighter than the parser turns a legitimate invite into a `404`
 naming no cause, on the one path whose user has no account and no way to ask.
-`test_tether_paths.py` writes both boundaries out, so a change on either side
-has to change that file.
+`awm/core/plugins/auth/tests/it/policy.rs` writes both boundaries out, so a
+change on either side has to change that file.
 
 One more agreement, in the same family. The edge claims the `/tether` name on
 every node, and whether a relay is configured decides `404` versus proxy. An
@@ -332,6 +336,14 @@ silently. The owner's pane is now the authority: a grid they cannot see all of
 breaks the sentence they consented to, and the operator is the end that can
 afford to be letterboxed.
 
+A file travels the other way round from `Defer`. The operator sends it as
+`Put` parts, and the owner answers the last part with `Placed`, naming where
+the file landed, or any part with `Refused`. The owner writes into a fresh
+directory inside its private one under the OS temp directory, and renames on
+the last part, so a cut-short file never wears its own name. Only an owner whose `Hello` says `files` is sent
+a `Put`. An older client is refused by the daemon with a sentence, and its
+session carries on.
+
 **CAUTION** `Defer` is the exception to that argument. It travels from the
 owner to the operator, so the stale daemon is the end that has to decode it,
 and an operator older than the frame drops the session instead of waiting for
@@ -394,3 +406,9 @@ leaves nothing its key would open. After a restart the room answers again with
 an empty backlog, and its next message is numbered above every one it gave out,
 so a cursor from before the restart stays valid. A task room still ends with the
 relay.
+
+A room's files are the other thing on disk, under the same directory. They are
+the bytes a member uploaded, sealed when the room is encrypted. A persistent
+room's files survive a restart. Each room keeps its newest 256, the relay takes
+no upload while its disk is under a free-space floor, and the files go when the
+room ends. `tether-relay/src/files.rs` owns the store.
